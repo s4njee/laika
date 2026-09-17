@@ -1,0 +1,10 @@
+[package]
+name = "laika-export"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = "0.25"
+ravif = "0.13"
+resvg = "0.46"
+serde = { version = "1", features = ["derive"] }

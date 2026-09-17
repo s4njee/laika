@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#e8e5df;font-family:'IBM Plex Sans',system-ui,sans-serif}
+a{color:#007B12}a:hover{color:#005C0D}
+.dv-turn{padding:44px 48px 36px;border-bottom:1px solid rgba(0,0,0,.09)}
+.dv-thd{display:flex;align-items:baseline;gap:10px;margin:0 0 22px}
+.dv-tid{font:600 10px 'IBM Plex Mono',monospace;padding:3px 7px;background:#1a1816;color:#00C227;border-radius:4px;text-decoration:none}
+.dv-tname{font:600 13px/1.2 'IBM Plex Sans',sans-serif;color:#1a1816}
+.dv-opts{display:flex;flex-wrap:wrap;gap:34px;align-items:flex-start}
+.dv-opt{flex:none;display:flex;flex-direction:column;gap:9px;scroll-margin-top:16px}
+.dv-oid{font:600 10.5px 'IBM Plex Mono',monospace;padding:3px 7px;background:rgba(0,0,0,.09);color:#1a1816;border-radius:5px;text-decoration:none}
+.dv-olabel{display:flex;align-items:baseline;gap:8px;font:400 11px/1.3 'IBM Plex Sans',sans-serif;color:rgba(0,0,0,.55)}
+.dv-card{max-width:100%;background:#141312;border:1px solid rgba(0,0,0,.14);border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.14);overflow:hidden}
+.dv-opt:target .dv-oid{background:#007B12;color:#DFFFE4}
+.dv-next{margin:26px 0 0;font:12px/1.6 'IBM Plex Sans',sans-serif;color:rgba(0,0,0,.5)}
+</style>
+</helmet>
+
+<section class="dv-turn" id="t1">
+<div class="dv-thd"><a class="dv-tid" href="#t1">1</a><span class="dv-tname">Laika — core screens, dense pro / dark</span></div>
+<div class="dv-opts">
+
+<div class="dv-opt" id="1a">
+<div class="dv-olabel"><a class="dv-oid" href="#1a">1a</a>Library — grid browser, catalog rail, sync state per photo</div>
+<div class="dv-card" style="width:1440px">
+<div style="width:1440px;height:900px;display:flex;flex-direction:column;background:#141312;color:#E9E5DE;font-size:12px">
+
+  <div style="height:46px;flex:none;display:flex;align-items:center;gap:0;background:#0F0E0D;border-bottom:1px solid rgba(255,255,255,.07);padding:0 14px">
+    <div style="display:flex;align-items:center;gap:8px;width:226px">
+      <div style="width:9px;height:9px;border-radius:50%;background:#00C227"></div>
+      <div style="font:600 13px 'IBM Plex Mono',monospace;letter-spacing:.22em;color:#E9E5DE">LAIKA</div>
+      <div style="font:400 9px 'IBM Plex Mono',monospace;color:#6F6A62;letter-spacing:.06em;padding-top:2px">0.9.4</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:2px">
+      <div style="padding:6px 13px;border-radius:4px;background:#26241F;color:#E9E5DE;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">LIBRARY</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">DEVELOP</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">MAP</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">PUBLISH</div>
+    </div>
+    <div style="flex:1"></div>
+    <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid rgba(255,255,255,.09);border-radius:4px;margin-right:10px">
+      <div style="width:6px;height:6px;border-radius:50%;background:#00C227"></div>
+      <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#A8A29A">s3://laika-archive · synced 2m ago</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid rgba(255,255,255,.09);border-radius:4px;margin-right:10px">
+      <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#8B857C">LOCAL 2.1 TB / 4 TB</span>
+    </div>
+    <div style="width:24px;height:24px;border-radius:50%;background:#3A3630;border:1px solid rgba(255,255,255,.12)"></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+
+    <div style="width:226px;flex:none;background:#1A1816;border-right:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:14px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">CATALOGS</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:3px;background:#272420"><div style="width:5px;height:5px;background:#00C227;border-radius:1px"></div><span style="flex:1;font-size:11.5px">Weddings 2026</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">1284</span></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:3px"><div style="width:5px;height:5px;background:#4A453D;border-radius:1px"></div><span style="flex:1;font-size:11.5px;color:#A8A29A">Editorial</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">612</span></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:3px"><div style="width:5px;height:5px;background:#4A453D;border-radius:1px"></div><span style="flex:1;font-size:11.5px;color:#A8A29A">Personal</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">3097</span></div>
+      </div>
+      <div style="padding:18px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">FOLDERS</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <sc-for list="{{ folders }}" as="f" hint-placeholder-count="6">
+          <div style="display:flex;align-items:center;gap:8px;padding:4.5px 8px;border-radius:3px">
+            <span style="width:9px;text-align:center;font:400 9px 'IBM Plex Mono';color:#55504A">{{ f.tick }}</span>
+            <span style="flex:1;font-size:11.5px;color:#BDB7AE">{{ f.name }}</span>
+            <span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">{{ f.n }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="padding:18px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">COLLECTIONS</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <div style="display:flex;align-items:center;gap:8px;padding:4.5px 8px;border-radius:3px"><span style="flex:1;font-size:11.5px;color:#BDB7AE">Selects — Mori/Tan</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">84</span></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:4.5px 8px;border-radius:3px"><span style="flex:1;font-size:11.5px;color:#BDB7AE">Client proofs</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">210</span></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:4.5px 8px;border-radius:3px"><span style="flex:1;font-size:11.5px;color:#BDB7AE">Portfolio</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">36</span></div>
+      </div>
+      <div style="flex:1"></div>
+      <div style="border-top:1px solid rgba(255,255,255,.07);padding:12px 14px;display:flex;flex-direction:column;gap:9px">
+        <div style="display:flex;justify-content:space-between;font:400 9.5px 'IBM Plex Mono',monospace;letter-spacing:.1em;color:#6F6A62"><span>SYNC QUEUE</span><span style="color:#00C227">12</span></div>
+        <div style="height:3px;background:#2A2723;border-radius:2px;overflow:hidden"><div style="width:72%;height:100%;background:#00C227"></div></div>
+        <div style="font:400 10px 'IBM Plex Mono',monospace;color:#6F6A62">uploading DSC_4412.dng · 18 MB/s</div>
+      </div>
+    </div>
+
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0;background:#141312">
+      <div style="height:40px;flex:none;display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid rgba(255,255,255,.07)">
+        <div style="display:flex;gap:1px;background:#1F1D1A;border-radius:4px;padding:2px">
+          <div style="padding:4px 9px;border-radius:3px;background:#332F29;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em">GRID</div>
+          <div style="padding:4px 9px;border-radius:3px;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em;color:#8B857C">LOUPE</div>
+          <div style="padding:4px 9px;border-radius:3px;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em;color:#8B857C">COMPARE</div>
+        </div>
+        <div style="width:1px;height:18px;background:rgba(255,255,255,.08)"></div>
+        <div style="display:flex;gap:6px">
+          <div style="padding:4px 9px;border:1px solid rgba(255,255,255,.1);border-radius:3px;font-size:10.5px;color:#BDB7AE">★ 3+</div>
+          <div style="padding:4px 9px;border:1px solid #00C227;border-radius:3px;font-size:10.5px;color:#00C227">Picked</div>
+          <div style="padding:4px 9px;border:1px solid rgba(255,255,255,.1);border-radius:3px;font-size:10.5px;color:#BDB7AE">RAW only</div>
+          <div style="padding:4px 9px;border:1px solid rgba(255,255,255,.1);border-radius:3px;font-size:10.5px;color:#BDB7AE">Unsynced</div>
+        </div>
+        <div style="flex:1"></div>
+        <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#6F6A62">SORT capture time</span>
+        <div style="width:1px;height:18px;background:rgba(255,255,255,.08)"></div>
+        <div style="display:flex;align-items:center;gap:7px"><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">SIZE</span><div style="width:70px;height:3px;background:#2A2723;border-radius:2px;position:relative"><div style="width:58%;height:100%;background:#7E786E;border-radius:2px"></div><div style="position:absolute;left:58%;top:50%;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:#E9E5DE"></div></div></div>
+      </div>
+
+      <div style="flex:1;overflow:hidden;padding:12px;display:grid;grid-template-columns:repeat(6,1fr);gap:10px;align-content:start">
+        <sc-for list="{{ grid }}" as="p" hint-placeholder-count="24">
+          <div style="position:relative;border-radius:2px;overflow:hidden;border:1px solid rgba(255,255,255,.07)">
+            <div style="aspect-ratio:3/2;background:#2A2723" style-hover="opacity:.9">
+              <div style="width:100%;height:100%;background:{{ p.bg }}"></div>
+            </div>
+            <div style="position:absolute;left:0;right:0;bottom:0;height:20px;display:flex;align-items:center;gap:5px;padding:0 6px;background:linear-gradient(transparent,rgba(0,0,0,.82))">
+              <span style="font:500 9px 'IBM Plex Mono',monospace;color:#C9C4BB;letter-spacing:.03em">{{ p.name }}</span>
+              <span style="flex:1"></span>
+              <span style="font:400 9px 'IBM Plex Mono',monospace;color:#E5C860">{{ p.stars }}</span>
+              <span style="width:5px;height:5px;border-radius:50%;background:{{ p.dot }}"></span>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="height:28px;flex:none;display:flex;align-items:center;gap:16px;padding:0 14px;border-top:1px solid rgba(255,255,255,.07);background:#0F0E0D;font:400 10px 'IBM Plex Mono',monospace;color:#6F6A62">
+        <span>1,284 photos</span><span style="color:#00C227">14 selected</span><span>412 picked</span><span>1,272 synced · 12 pending</span>
+        <span style="flex:1"></span><span>Weddings 2026 / 2026-06-14 Mori–Tan</span>
+      </div>
+    </div>
+
+    <div style="width:290px;flex:none;background:#1A1816;border-left:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column">
+      <div style="padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,.07)">
+        <div style="height:74px;background:#121110;border:1px solid rgba(255,255,255,.07);border-radius:3px;display:flex;align-items:flex-end;gap:1px;padding:5px">
+          <sc-for list="{{ histo }}" as="h" hint-placeholder-count="48">
+            <div style="flex:1;background:#615C54;border-radius:1px 1px 0 0;height:{{ h }}"></div>
+          </sc-for>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px;font:400 9.5px 'IBM Plex Mono',monospace;color:#6F6A62"><span>ƒ/1.8</span><span>1/400</span><span>ISO 400</span><span>35mm</span></div>
+      </div>
+      <div style="padding:14px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">QUICK DEVELOP</div>
+      <div style="padding:0 14px 12px;display:flex;flex-direction:column;gap:9px">
+        <sc-for list="{{ quick }}" as="s" hint-placeholder-count="4">
+          <div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:5px"><span style="font-size:11px;color:#A8A29A">{{ s.name }}</span><span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#E9E5DE">{{ s.val }}</span></div>
+            <div style="height:2px;background:#2A2723;position:relative"><div style="position:absolute;left:50%;top:-2px;width:1px;height:6px;background:#413C36"></div><div style="position:absolute;top:50%;left:{{ s.pct }};width:9px;height:9px;margin:-4.5px 0 0 -4.5px;border-radius:50%;background:#E9E5DE"></div></div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="padding:8px 14px;border-top:1px solid rgba(255,255,255,.07);font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">METADATA</div>
+      <div style="padding:0 14px 12px;display:flex;flex-direction:column;gap:4px">
+        <sc-for list="{{ meta }}" as="m" hint-placeholder-count="7">
+          <div style="display:flex;justify-content:space-between;gap:10px;font-size:11px"><span style="color:#6F6A62">{{ m.k }}</span><span style="color:#BDB7AE;font-family:'IBM Plex Mono',monospace;font-size:10.5px;text-align:right">{{ m.v }}</span></div>
+        </sc-for>
+      </div>
+      <div style="padding:8px 14px;border-top:1px solid rgba(255,255,255,.07);font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">KEYWORDS</div>
+      <div style="padding:0 14px;display:flex;flex-wrap:wrap;gap:5px">
+        <div style="padding:3px 7px;background:#26241F;border-radius:2px;font-size:10.5px;color:#BDB7AE">ceremony</div>
+        <div style="padding:3px 7px;background:#26241F;border-radius:2px;font-size:10.5px;color:#BDB7AE">golden hour</div>
+        <div style="padding:3px 7px;background:#26241F;border-radius:2px;font-size:10.5px;color:#BDB7AE">Mori–Tan</div>
+        <div style="padding:3px 7px;background:#26241F;border-radius:2px;font-size:10.5px;color:#BDB7AE">Presidio</div>
+      </div>
+      <div style="flex:1"></div>
+      <div style="padding:12px 14px;border-top:1px solid rgba(255,255,255,.07);display:flex;gap:8px">
+        <div style="flex:1;text-align:center;padding:7px;background:#007B12;color:#DFFFE4;border-radius:3px;font:600 11px 'IBM Plex Sans';letter-spacing:.04em">Publish gallery</div>
+        <div style="padding:7px 12px;border:1px solid rgba(255,255,255,.14);border-radius:3px;font:500 11px 'IBM Plex Sans';color:#BDB7AE">Export</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+<div class="dv-opt" id="1b">
+<div class="dv-olabel"><a class="dv-oid" href="#1b">1b</a>Develop — loupe, edit stack, filmstrip</div>
+<div class="dv-card" style="width:1440px">
+<div style="width:1440px;height:900px;display:flex;flex-direction:column;background:#0F0E0D;color:#E9E5DE;font-size:12px">
+
+  <div style="height:46px;flex:none;display:flex;align-items:center;background:#0F0E0D;border-bottom:1px solid rgba(255,255,255,.07);padding:0 14px">
+    <div style="display:flex;align-items:center;gap:8px;width:226px">
+      <div style="width:9px;height:9px;border-radius:50%;background:#00C227"></div>
+      <div style="font:600 13px 'IBM Plex Mono',monospace;letter-spacing:.22em">LAIKA</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:2px">
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">LIBRARY</div>
+      <div style="padding:6px 13px;border-radius:4px;background:#26241F;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">DEVELOP</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">MAP</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">PUBLISH</div>
+    </div>
+    <div style="flex:1"></div>
+    <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#8B857C;margin-right:14px">DSC_4418.dng · edits stored locally · .xmp sidecar</span>
+    <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid rgba(255,255,255,.09);border-radius:4px"><div style="width:6px;height:6px;border-radius:50%;background:#E5C860"></div><span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#A8A29A">edit queued for sync</span></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <div style="width:210px;flex:none;background:#1A1816;border-right:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column">
+      <div style="padding:14px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">PRESETS</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <sc-for list="{{ presets }}" as="p" hint-placeholder-count="8">
+          <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:3px;background:{{ p.bg }}">
+            <div style="width:18px;height:12px;border-radius:1px;background:{{ p.chip }}"></div>
+            <span style="flex:1;font-size:11.5px;color:{{ p.fg }}">{{ p.name }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="padding:18px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">HISTORY</div>
+      <div style="padding:0 14px;display:flex;flex-direction:column;gap:6px">
+        <sc-for list="{{ history }}" as="h" hint-placeholder-count="7">
+          <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:{{ h.fg }}">{{ h.k }}</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">{{ h.v }}</span></div>
+        </sc-for>
+      </div>
+      <div style="flex:1"></div>
+      <div style="padding:12px 14px;border-top:1px solid rgba(255,255,255,.07);font:400 10px 'IBM Plex Mono',monospace;color:#6F6A62;line-height:1.6">non-destructive<br>original untouched on disk</div>
+    </div>
+
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0;background:#0B0A0A">
+      <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:26px;min-height:0;min-width:0;overflow:hidden">
+        <div style="position:relative;height:100%;max-width:100%;max-height:100%;aspect-ratio:3/2;background:linear-gradient(118deg,#6E5C46 0%,#3B342C 46%,#191715 100%);border:1px solid rgba(255,255,255,.08)">
+          <div style="position:absolute;inset:0;border:1px solid rgba(0,194,39,.0)"></div>
+          <div style="position:absolute;left:0;top:0;bottom:0;width:38%;background:linear-gradient(118deg,#4C4238 0%,#2B2723 60%,#121110 100%);border-right:1px solid rgba(0,194,39,.75)"></div>
+          <div style="position:absolute;left:14px;top:12px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.12em;color:rgba(255,255,255,.62)">BEFORE</div>
+          <div style="position:absolute;left:calc(38% + 14px);top:12px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.12em;color:rgba(255,255,255,.62)">AFTER</div>
+          <div style="position:absolute;right:12px;bottom:12px;padding:4px 8px;background:rgba(0,0,0,.55);font:400 9.5px 'IBM Plex Mono',monospace;color:rgba(255,255,255,.72)">image placeholder · 6048 × 4024</div>
+        </div>
+      </div>
+      <div style="height:38px;flex:none;display:flex;align-items:center;gap:10px;padding:0 16px;border-top:1px solid rgba(255,255,255,.07);background:#0F0E0D">
+        <div style="display:flex;gap:4px">
+          <div style="padding:4px 9px;border-radius:3px;background:#332F29;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em">CROP</div>
+          <div style="padding:4px 9px;border-radius:3px;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em;color:#8B857C">HEAL</div>
+          <div style="padding:4px 9px;border-radius:3px;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em;color:#8B857C">MASK</div>
+          <div style="padding:4px 9px;border-radius:3px;font:500 10.5px 'IBM Plex Mono';letter-spacing:.06em;color:#8B857C">RED-EYE</div>
+        </div>
+        <div style="width:1px;height:16px;background:rgba(255,255,255,.08)"></div>
+        <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#6F6A62">FIT · 1:1 · 2:1</span>
+        <div style="flex:1"></div>
+        <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#6F6A62">\ before/after · Y split · P pick</span>
+      </div>
+      <div style="height:96px;flex:none;border-top:1px solid rgba(255,255,255,.07);background:#141312;display:flex;align-items:center;gap:6px;padding:0 10px;overflow:hidden">
+        <sc-for list="{{ strip }}" as="s" hint-placeholder-count="16">
+          <div style="flex:none;width:106px;height:72px;position:relative;border:1px solid {{ s.border }};border-radius:2px;overflow:hidden">
+            <div style="width:100%;height:100%;background:{{ s.bg }}"></div>
+            <div style="position:absolute;left:4px;bottom:3px;font:500 8.5px 'IBM Plex Mono',monospace;color:rgba(255,255,255,.75)">{{ s.name }}</div>
+            <div style="position:absolute;right:4px;bottom:3px;font:400 8.5px 'IBM Plex Mono',monospace;color:#E5C860">{{ s.stars }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <div style="width:306px;flex:none;background:#1A1816;border-left:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,.07)">
+        <div style="height:78px;background:#121110;border:1px solid rgba(255,255,255,.07);border-radius:3px;display:flex;align-items:flex-end;gap:1px;padding:5px">
+          <sc-for list="{{ histo }}" as="h" hint-placeholder-count="48">
+            <div style="flex:1;background:#6B655C;border-radius:1px 1px 0 0;height:{{ h }}"></div>
+          </sc-for>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px 8px"><span style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#00C227">BASIC</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">reset</span></div>
+      <div style="padding:0 14px 10px;display:flex;flex-direction:column;gap:10px">
+        <sc-for list="{{ basic }}" as="s" hint-placeholder-count="10">
+          <div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:5px"><span style="font-size:11px;color:#A8A29A">{{ s.name }}</span><span style="font:400 10.5px 'IBM Plex Mono',monospace;color:{{ s.fg }}">{{ s.val }}</span></div>
+            <div style="height:2px;background:#2A2723;position:relative">
+              <div style="position:absolute;left:50%;top:-2px;width:1px;height:6px;background:#413C36"></div>
+              <div style="position:absolute;top:50%;left:{{ s.pct }};width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:{{ s.knob }}"></div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="border-top:1px solid rgba(255,255,255,.07);padding:11px 14px;display:flex;justify-content:space-between"><span style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">TONE CURVE</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">+</span></div>
+      <div style="border-top:1px solid rgba(255,255,255,.07);padding:11px 14px;display:flex;justify-content:space-between"><span style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">COLOR MIX</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">+</span></div>
+      <div style="border-top:1px solid rgba(255,255,255,.07);padding:11px 14px;display:flex;justify-content:space-between"><span style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">DETAIL</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">+</span></div>
+      <div style="border-top:1px solid rgba(255,255,255,.07);padding:11px 14px;display:flex;justify-content:space-between"><span style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">OPTICS</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">+</span></div>
+      <div style="flex:1"></div>
+      <div style="padding:12px 14px;border-top:1px solid rgba(255,255,255,.07);display:flex;gap:8px">
+        <div style="flex:1;text-align:center;padding:7px;border:1px solid rgba(255,255,255,.14);border-radius:3px;font:500 11px 'IBM Plex Sans';color:#BDB7AE">Copy settings</div>
+        <div style="flex:1;text-align:center;padding:7px;background:#007B12;color:#DFFFE4;border-radius:3px;font:600 11px 'IBM Plex Sans'">Paste to 14</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+<div class="dv-opt" id="1c">
+<div class="dv-olabel"><a class="dv-oid" href="#1c">1c</a>Publish — export destinations + static gallery deploy</div>
+<div class="dv-card" style="width:1440px">
+<div style="width:1440px;height:900px;position:relative;background:#141312;color:#E9E5DE;font-size:12px;overflow:hidden">
+  <div style="position:absolute;inset:0;display:grid;grid-template-columns:repeat(8,1fr);gap:10px;padding:12px;opacity:.22">
+    <sc-for list="{{ grid }}" as="p" hint-placeholder-count="24">
+      <div style="aspect-ratio:3/2;border-radius:2px;background:{{ p.bg }}"></div>
+    </sc-for>
+  </div>
+  <div style="position:absolute;inset:0;background:rgba(10,9,9,.78)"></div>
+
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:1020px;background:#1A1816;border:1px solid rgba(255,255,255,.1);border-radius:6px;box-shadow:0 30px 80px rgba(0,0,0,.6);display:flex;overflow:hidden">
+    <div style="width:250px;flex:none;background:#151412;border-right:1px solid rgba(255,255,255,.07);padding:16px 0;display:flex;flex-direction:column">
+      <div style="padding:0 16px 12px;font:600 12px 'IBM Plex Sans'">Publish 84 photos</div>
+      <div style="padding:8px 16px 6px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">DESTINATION</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:3px;background:#272420"><div style="width:5px;height:5px;border-radius:50%;background:#00C227"></div><span style="font-size:11.5px">Static gallery</span></div>
+        <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:3px"><div style="width:5px;height:5px;border-radius:50%;background:#4A453D"></div><span style="font-size:11.5px;color:#A8A29A">Local disk</span></div>
+        <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:3px"><div style="width:5px;height:5px;border-radius:50%;background:#4A453D"></div><span style="font-size:11.5px;color:#A8A29A">S3 bucket</span></div>
+        <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:3px"><div style="width:5px;height:5px;border-radius:50%;background:#4A453D"></div><span style="font-size:11.5px;color:#A8A29A">Client proof link</span></div>
+      </div>
+      <div style="padding:18px 16px 6px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">SAVED RECIPES</div>
+      <div style="padding:0 16px;display:flex;flex-direction:column;gap:7px">
+        <div style="font-size:11.5px;color:#BDB7AE">Wedding proofs — 2048px</div>
+        <div style="font-size:11.5px;color:#BDB7AE">Portfolio — full res</div>
+        <div style="font-size:11.5px;color:#BDB7AE">Instagram — 1350 sq</div>
+      </div>
+      <div style="flex:1"></div>
+      <div style="padding:14px 16px 0;border-top:1px solid rgba(255,255,255,.07);font:400 10px 'IBM Plex Mono',monospace;color:#6F6A62;line-height:1.7">est. 612 MB<br>≈ 2 min 10 s</div>
+    </div>
+
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+      <div style="padding:18px 22px 0;display:flex;align-items:baseline;gap:10px">
+        <div style="font:600 15px 'IBM Plex Sans'">Static gallery</div>
+        <div style="font:400 11px 'IBM Plex Mono',monospace;color:#6F6A62">builds HTML + resized JPEGs, deploys to your host</div>
+      </div>
+
+      <div style="padding:18px 22px 0;display:grid;grid-template-columns:1fr 1fr;gap:18px 26px">
+        <div>
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62;margin-bottom:7px">GALLERY TITLE</div>
+          <div style="padding:8px 10px;background:#121110;border:1px solid rgba(255,255,255,.1);border-radius:3px;font-size:12px">Mori &amp; Tan — 14 June 2026</div>
+        </div>
+        <div>
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62;margin-bottom:7px">URL</div>
+          <div style="display:flex;align-items:center;padding:8px 10px;background:#121110;border:1px solid rgba(255,255,255,.1);border-radius:3px;font:400 11.5px 'IBM Plex Mono',monospace"><span style="color:#6F6A62">galleries.studio.com/</span><span style="color:#00C227">mori-tan</span></div>
+        </div>
+        <div>
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62;margin-bottom:7px">TEMPLATE</div>
+          <div style="display:flex;gap:8px">
+            <div style="flex:1;padding:9px;border:1px solid #00C227;border-radius:3px;text-align:center;font-size:11px;color:#00C227">Masonry</div>
+            <div style="flex:1;padding:9px;border:1px solid rgba(255,255,255,.1);border-radius:3px;text-align:center;font-size:11px;color:#A8A29A">Full-bleed</div>
+            <div style="flex:1;padding:9px;border:1px solid rgba(255,255,255,.1);border-radius:3px;text-align:center;font-size:11px;color:#A8A29A">Contact sheet</div>
+          </div>
+        </div>
+        <div>
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62;margin-bottom:7px">SIZES EMITTED</div>
+          <div style="display:flex;gap:6px">
+            <div style="padding:6px 10px;border:1px solid #00C227;border-radius:3px;font:400 10.5px 'IBM Plex Mono';color:#00C227">640</div>
+            <div style="padding:6px 10px;border:1px solid #00C227;border-radius:3px;font:400 10.5px 'IBM Plex Mono';color:#00C227">1280</div>
+            <div style="padding:6px 10px;border:1px solid #00C227;border-radius:3px;font:400 10.5px 'IBM Plex Mono';color:#00C227">2048</div>
+            <div style="padding:6px 10px;border:1px solid rgba(255,255,255,.1);border-radius:3px;font:400 10.5px 'IBM Plex Mono';color:#6F6A62">4096</div>
+            <div style="padding:6px 10px;border:1px solid rgba(255,255,255,.1);border-radius:3px;font:400 10.5px 'IBM Plex Mono';color:#6F6A62">AVIF</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding:18px 22px 0;display:flex;gap:26px">
+        <div style="display:flex;flex-direction:column;gap:9px">
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">OPTIONS</div>
+          <sc-for list="{{ toggles }}" as="t" hint-placeholder-count="4">
+            <div style="display:flex;align-items:center;gap:9px">
+              <div style="width:26px;height:14px;border-radius:8px;background:{{ t.track }};position:relative"><div style="position:absolute;top:2px;left:{{ t.x }};width:10px;height:10px;border-radius:50%;background:{{ t.knob }}"></div></div>
+              <span style="font-size:11.5px;color:#BDB7AE">{{ t.name }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="flex:1;min-width:0">
+          <div style="font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62;margin-bottom:9px">PREVIEW</div>
+          <div style="height:128px;background:#0F0E0D;border:1px solid rgba(255,255,255,.08);border-radius:3px;padding:9px;display:flex;flex-direction:column;gap:7px">
+            <div style="font:500 9px 'IBM Plex Mono',monospace;color:#7E786E;letter-spacing:.1em">MORI &amp; TAN — 14 JUNE 2026</div>
+            <div style="flex:1;display:grid;grid-template-columns:repeat(6,1fr);grid-template-rows:1fr 1fr;gap:5px">
+              <sc-for list="{{ previewTiles }}" as="p" hint-placeholder-count="12">
+                <div style="border-radius:1px;background:{{ p }}"></div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin:18px 22px 0;padding:10px 12px;background:#0F0E0D;border:1px solid rgba(255,255,255,.08);border-radius:3px;font:400 10.5px/1.75 'IBM Plex Mono',monospace;color:#7E786E">
+        <div><span style="color:#00C227">→</span> laika build --gallery mori-tan --sizes 640,1280,2048</div>
+        <div><span style="color:#00C227">→</span> laika deploy --target cloudflare-pages --project studio-galleries</div>
+      </div>
+
+      <div style="flex:1"></div>
+      <div style="padding:16px 22px;border-top:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:12px;margin-top:18px">
+        <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#6F6A62">last deploy 3 days ago · 612 files</span>
+        <div style="flex:1"></div>
+        <div style="padding:9px 16px;border:1px solid rgba(255,255,255,.14);border-radius:3px;font:500 11.5px 'IBM Plex Sans';color:#BDB7AE">Build only</div>
+        <div style="padding:9px 20px;background:#007B12;color:#DFFFE4;border-radius:3px;font:600 11.5px 'IBM Plex Sans'">Build &amp; deploy</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+<div class="dv-opt" id="1d">
+<div class="dv-olabel"><a class="dv-oid" href="#1d">1d</a>Map &amp; metadata — geo-filtering, full EXIF inspector</div>
+<div class="dv-card" style="width:1440px">
+<div style="width:1440px;height:900px;display:flex;flex-direction:column;background:#141312;color:#E9E5DE;font-size:12px">
+  <div style="height:46px;flex:none;display:flex;align-items:center;background:#0F0E0D;border-bottom:1px solid rgba(255,255,255,.07);padding:0 14px">
+    <div style="display:flex;align-items:center;gap:8px;width:226px"><div style="width:9px;height:9px;border-radius:50%;background:#00C227"></div><div style="font:600 13px 'IBM Plex Mono',monospace;letter-spacing:.22em">LAIKA</div></div>
+    <div style="display:flex;align-items:center;gap:2px">
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">LIBRARY</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">DEVELOP</div>
+      <div style="padding:6px 13px;border-radius:4px;background:#26241F;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">MAP</div>
+      <div style="padding:6px 13px;border-radius:4px;color:#8B857C;font:500 11px 'IBM Plex Sans';letter-spacing:.09em">PUBLISH</div>
+    </div>
+    <div style="flex:1"></div>
+    <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#6F6A62">1,104 of 1,284 geotagged</span>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <div style="width:226px;flex:none;background:#1A1816;border-right:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column">
+      <div style="padding:14px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">PLACES</div>
+      <div style="padding:0 8px;display:flex;flex-direction:column;gap:1px">
+        <sc-for list="{{ places }}" as="p" hint-placeholder-count="6">
+          <div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:3px;background:{{ p.bg }}"><span style="flex:1;font-size:11.5px;color:{{ p.fg }}">{{ p.name }}</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">{{ p.n }}</span></div>
+        </sc-for>
+      </div>
+      <div style="padding:18px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">DATE RANGE</div>
+      <div style="padding:0 14px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;font:400 10.5px 'IBM Plex Mono',monospace;color:#A8A29A"><span>2026-06-14</span><span>2026-06-15</span></div>
+        <div style="height:2px;background:#2A2723;position:relative"><div style="position:absolute;left:22%;right:30%;top:0;height:2px;background:#00C227"></div><div style="position:absolute;top:-4px;left:22%;width:9px;height:9px;margin-left:-4.5px;border-radius:50%;background:#E9E5DE"></div><div style="position:absolute;top:-4px;left:70%;width:9px;height:9px;margin-left:-4.5px;border-radius:50%;background:#E9E5DE"></div></div>
+      </div>
+      <div style="padding:18px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">CAMERA</div>
+      <div style="padding:0 14px;display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:#BDB7AE"><span>Sony A7 IV</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">802</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:#BDB7AE"><span>Leica Q3</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">302</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:#BDB7AE"><span>Fujifilm X100VI</span><span style="font:400 10px 'IBM Plex Mono';color:#6F6A62">180</span></div>
+      </div>
+      <div style="flex:1"></div>
+    </div>
+
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+      <div style="flex:1;position:relative;background:#101413;min-height:0;overflow:hidden">
+        <div style="position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:56px 56px"></div>
+        <div style="position:absolute;left:8%;top:18%;width:44%;height:52%;background:#181D1B;border:1px solid rgba(255,255,255,.05);border-radius:40% 55% 35% 60%"></div>
+        <div style="position:absolute;left:46%;top:44%;width:42%;height:46%;background:#1A1F1C;border:1px solid rgba(255,255,255,.05);border-radius:60% 35% 55% 40%"></div>
+        <sc-for list="{{ pins }}" as="p" hint-placeholder-count="7">
+          <div style="position:absolute;left:{{ p.x }};top:{{ p.y }};transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;width:{{ p.d }};height:{{ p.d }};border-radius:50%;background:rgba(0,194,39,.18);border:1px solid #00C227;font:500 10px 'IBM Plex Mono',monospace;color:#00C227">{{ p.n }}</div>
+        </sc-for>
+        <div style="position:absolute;left:16px;top:16px;padding:6px 10px;background:rgba(15,14,13,.85);border:1px solid rgba(255,255,255,.1);border-radius:3px;font:400 10px 'IBM Plex Mono',monospace;color:#7E786E;letter-spacing:.06em">BASEMAP PLACEHOLDER — real tiles on request</div>
+        <div style="position:absolute;right:16px;bottom:16px;display:flex;flex-direction:column;gap:1px">
+          <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:rgba(15,14,13,.9);border:1px solid rgba(255,255,255,.1);color:#BDB7AE">+</div>
+          <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:rgba(15,14,13,.9);border:1px solid rgba(255,255,255,.1);color:#BDB7AE">−</div>
+        </div>
+      </div>
+      <div style="height:96px;flex:none;border-top:1px solid rgba(255,255,255,.07);background:#141312;display:flex;align-items:center;gap:6px;padding:0 10px;overflow:hidden">
+        <sc-for list="{{ strip }}" as="s" hint-placeholder-count="16">
+          <div style="flex:none;width:106px;height:72px;position:relative;border:1px solid {{ s.border }};border-radius:2px;overflow:hidden">
+            <div style="width:100%;height:100%;background:{{ s.bg }}"></div>
+            <div style="position:absolute;left:4px;bottom:3px;font:500 8.5px 'IBM Plex Mono',monospace;color:rgba(255,255,255,.75)">{{ s.name }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <div style="width:306px;flex:none;background:#1A1816;border-left:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column">
+      <div style="padding:14px 14px 10px;border-bottom:1px solid rgba(255,255,255,.07)">
+        <div style="aspect-ratio:3/2;background:linear-gradient(126deg,#6E5C46,#221F1C);border:1px solid rgba(255,255,255,.07)"></div>
+        <div style="margin-top:8px;font:500 11px 'IBM Plex Mono',monospace;color:#E9E5DE">DSC_4418.dng</div>
+      </div>
+      <div style="padding:12px 14px 8px;font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">EXIF</div>
+      <div style="padding:0 14px 12px;display:flex;flex-direction:column;gap:5px">
+        <sc-for list="{{ exif }}" as="m" hint-placeholder-count="14">
+          <div style="display:flex;justify-content:space-between;gap:10px;font-size:11px"><span style="color:#6F6A62">{{ m.k }}</span><span style="color:#BDB7AE;font-family:'IBM Plex Mono',monospace;font-size:10.5px;text-align:right">{{ m.v }}</span></div>
+        </sc-for>
+      </div>
+      <div style="padding:8px 14px;border-top:1px solid rgba(255,255,255,.07);font:500 9.5px 'IBM Plex Mono',monospace;letter-spacing:.14em;color:#6F6A62">STORAGE</div>
+      <div style="padding:0 14px 12px;display:flex;flex-direction:column;gap:7px">
+        <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:#6F6A62">Local</span><span style="font-family:'IBM Plex Mono';font-size:10.5px;color:#00C227">/Volumes/Archive/2026</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:#6F6A62">Remote</span><span style="font-family:'IBM Plex Mono';font-size:10.5px;color:#BDB7AE">s3://laika-archive</span></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:#6F6A62">Checksum</span><span style="font-family:'IBM Plex Mono';font-size:10.5px;color:#BDB7AE">blake3 · verified</span></div>
+      </div>
+      <div style="flex:1"></div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+</div>
+<p class="dv-next">Try next: "explore filmstrip and slider treatments for <a class="dv-oid" href="#1b">1b</a>" · "a light theme of <a class="dv-oid" href="#1a">1a</a>" · "add a culling/compare screen"</p>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1560,&quot;height&quot;:1040}}">
+const TONES = [
+  ["#6E5C46","#241F1A"],["#4A4F4A","#1A1C1A"],["#7A6450","#2A221C"],["#3F4652","#16191D"],
+  ["#5E5044","#201C18"],["#6A5B63","#221E20"],["#4C5448","#181A17"],["#7C6A52","#2C251E"],
+  ["#565049","#1C1A18"],["#3A4048","#15181B"],["#6B5745","#231D18"],["#4E4A54","#1A181D"]
+];
+const g = (i, a) => `linear-gradient(${118 + (i % 5) * 13}deg, ${TONES[i % TONES.length][0]}, ${TONES[i % TONES.length][1]})`;
+
+class Component extends DCLogic {
+  renderVals() {
+    const grid = Array.from({ length: 30 }, (_, i) => ({
+      bg: g(i),
+      name: "DSC_4" + (401 + i),
+      stars: ["★★★★★","★★★★","★★★","★★","★"][i % 5],
+      dot: i % 7 === 3 ? "#E5C860" : "#00C227"
+    }));
+    const strip = Array.from({ length: 16 }, (_, i) => ({
+      bg: g(i + 3),
+      name: "4" + (411 + i),
+      stars: i % 3 === 0 ? "★★★★" : "★★★",
+      border: i === 7 ? "#00C227" : "rgba(255,255,255,.08)"
+    }));
+    const histo = Array.from({ length: 48 }, (_, i) => {
+      const v = Math.exp(-Math.pow((i - 22) / 12, 2)) * 86 + Math.exp(-Math.pow((i - 40) / 5, 2)) * 26 + 4;
+      return Math.round(Math.min(100, v)) + "%";
+    });
+    const mk = (name, val, pct, accent) => ({
+      name, val, pct: pct + "%",
+      fg: accent ? "#00C227" : "#E9E5DE",
+      knob: accent ? "#00C227" : "#E9E5DE"
+    });
+    return {
+      grid, strip, histo,
+      folders: [
+        { tick: "▾", name: "2026-06-14 Mori–Tan", n: "842" },
+        { tick: "·", name: "2026-05-30 Okonkwo", n: "196" },
+        { tick: "·", name: "2026-05-11 Bhatt", n: "141" },
+        { tick: "▸", name: "2026-04 Engagements", n: "64" },
+        { tick: "▸", name: "2026-03 Scouting", n: "41" }
+      ],
+      quick: [mk("Exposure", "+0.35", 62), mk("Contrast", "+12", 58), mk("Highlights", "−40", 30), mk("Shadows", "+28", 68)],
+      meta: [
+        { k: "File", v: "DSC_4418.dng" }, { k: "Captured", v: "14 Jun 2026 18:42" },
+        { k: "Camera", v: "Sony A7 IV" }, { k: "Lens", v: "35mm ƒ/1.4 GM" },
+        { k: "Size", v: "6048 × 4024 · 58 MB" }, { k: "Local", v: "/Archive/2026" },
+        { k: "Remote", v: "s3 · synced" }
+      ],
+      presets: [
+        { name: "Neutral RAW", chip: "linear-gradient(90deg,#8A8178,#2A2723)", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Portra warm", chip: "linear-gradient(90deg,#C99A6B,#3A2C21)", bg: "#272420", fg: "#E9E5DE" },
+        { name: "Ceremony low-light", chip: "linear-gradient(90deg,#6E7C8C,#1B1F24)", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Golden hour", chip: "linear-gradient(90deg,#E0A85A,#40301C)", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Mono contrast", chip: "linear-gradient(90deg,#E4E0DA,#131211)", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Reception tungsten", chip: "linear-gradient(90deg,#C4795A,#2A1C16)", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Editorial cool", chip: "linear-gradient(90deg,#8FA3AE,#1E2428)", bg: "transparent", fg: "#BDB7AE" }
+      ],
+      history: [
+        { k: "Paste settings", v: "now", fg: "#00C227" },
+        { k: "Shadows", v: "+28", fg: "#BDB7AE" },
+        { k: "Highlights", v: "−40", fg: "#BDB7AE" },
+        { k: "Temperature", v: "5480 K", fg: "#BDB7AE" },
+        { k: "Crop 3:2", v: "—", fg: "#BDB7AE" },
+        { k: "Portra warm", v: "preset", fg: "#BDB7AE" },
+        { k: "Import", v: "18:42", fg: "#7E786E" }
+      ],
+      basic: [
+        mk("Temperature", "5480 K", 56), mk("Tint", "+6", 53),
+        mk("Exposure", "+0.35", 62, true), mk("Contrast", "+12", 58),
+        mk("Highlights", "−40", 30, true), mk("Shadows", "+28", 68, true),
+        mk("Whites", "+8", 55), mk("Blacks", "−14", 43),
+        mk("Texture", "+10", 57), mk("Clarity", "+4", 53), mk("Vibrance", "+18", 61), mk("Saturation", "0", 50)
+      ],
+      toggles: [
+        { name: "Watermark", track: "#00C227", knob: "#141312", x: "14px" },
+        { name: "Allow downloads", track: "#00C227", knob: "#141312", x: "14px" },
+        { name: "Password protect", track: "#2E2B27", knob: "#7E786E", x: "2px" },
+        { name: "Strip GPS from EXIF", track: "#00C227", knob: "#141312", x: "14px" },
+        { name: "Lazy-load AVIF", track: "#2E2B27", knob: "#7E786E", x: "2px" }
+      ],
+      previewTiles: Array.from({ length: 12 }, (_, i) => g(i + 1)),
+      places: [
+        { name: "San Francisco", n: "612", bg: "#272420", fg: "#E9E5DE" },
+        { name: "Presidio", n: "284", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Marin Headlands", n: "141", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Oakland", n: "48", bg: "transparent", fg: "#BDB7AE" },
+        { name: "Point Reyes", n: "19", bg: "transparent", fg: "#BDB7AE" }
+      ],
+      pins: [
+        { x: "28%", y: "34%", d: "44px", n: "284" },
+        { x: "41%", y: "48%", d: "34px", n: "96" },
+        { x: "55%", y: "62%", d: "52px", n: "612" },
+        { x: "66%", y: "40%", d: "26px", n: "19" },
+        { x: "34%", y: "68%", d: "30px", n: "48" },
+        { x: "72%", y: "72%", d: "24px", n: "11" }
+      ],
+      exif: [
+        { k: "Camera", v: "Sony A7 IV" }, { k: "Lens", v: "FE 35mm ƒ/1.4 GM" },
+        { k: "Focal", v: "35 mm" }, { k: "Aperture", v: "ƒ/1.8" },
+        { k: "Shutter", v: "1/400 s" }, { k: "ISO", v: "400" },
+        { k: "Metering", v: "Multi" }, { k: "White bal.", v: "5480 K" },
+        { k: "Captured", v: "14 Jun 2026 18:42" }, { k: "GPS", v: "37.7989, −122.4662" },
+        { k: "Altitude", v: "58 m" }, { k: "Artist", v: "R. Vance" },
+        { k: "Copyright", v: "© 2026 Vance Studio" }, { k: "Rating", v: "★★★★" }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

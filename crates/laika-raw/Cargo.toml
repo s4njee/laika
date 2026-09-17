@@ -1,0 +1,12 @@
+[package]
+name = "laika-raw"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rawler = "0.8"
+image = "0.25"
+kamadak-exif = "0.6"
+half = "2"
+
+[dev-dependencies]

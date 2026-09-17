@@ -1,0 +1,29 @@
+[package]
+name = "laika-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "laika"
+path = "src/main.rs"
+
+[dependencies]
+laika-core = { path = "../laika-core" }
+laika-develop = { path = "../laika-develop" }
+laika-export = { path = "../laika-export" }
+laika-raw = { path = "../laika-raw" }
+gpui-kit = { workspace = true }
+gpui-pre = { workspace = true }
+gpui-pre-platform = { workspace = true }
+smallvec = "1"
+image = "0.25"
+ravif = "0.13"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString", "NSObject"] }
+
+[dev-dependencies]

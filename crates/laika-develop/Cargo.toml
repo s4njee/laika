@@ -1,0 +1,16 @@
+[package]
+name = "laika-develop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+laika-core = { path = "../laika-core" }
+laika-raw = { path = "../laika-raw" }
+wgpu = "=29.0.4"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+image = "0.25"
+
+[dev-dependencies]
+laika-export = { path = "../laika-export" }

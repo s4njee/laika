@@ -1,0 +1,52 @@
+[workspace]
+members = [
+  "crates/laika-core",
+  "crates/laika-raw",
+  "crates/laika-develop",
+  "crates/laika-export",
+  "crates/laika-app",
+]
+resolver = "2"
+
+# Keep application code debuggable while making the pixel and hashing
+# libraries run at production speed. Unoptimized JPEG resize/RAW work can be
+# an order of magnitude slower than the SD-card copy it accompanies.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.rawler]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+# Develop hot path. Every slider frame runs the readback copy + histogram
+# (laika-develop), wgpu's encode/submit/map bookkeeping (wgpu-core/hal),
+# and photo switches decode the f16 editing cache (laika-raw, half). Debug
+# builds of these made live Develop feedback dominated by CPU time that
+# release builds never pay. naga compiles the develop shader at startup.
+[profile.dev.package.laika-develop]
+opt-level = 3
+
+[profile.dev.package.laika-raw]
+opt-level = 3
+
+[profile.dev.package.half]
+opt-level = 3
+
+[profile.dev.package.wgpu-core]
+opt-level = 3
+
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+
+[profile.dev.package.naga]
+opt-level = 3
+
+[workspace.dependencies]
+gpui-kit = { version = "=0.6.1", features = ["profiler"] }
+gpui-pre = "=0.3.2"
+gpui-pre-platform = "=0.3.2"

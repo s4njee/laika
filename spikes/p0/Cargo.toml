@@ -1,0 +1,24 @@
+# Phase 0 spike (plan.md). Its own workspace so the real workspace starts clean.
+[workspace]
+
+[package]
+name = "laika-p0"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Same pin the foobar2001 G0 spike proved on macOS. gpui-kit re-exports GPUI.
+gpui-kit = { version = "=0.6.1", features = ["profiler"] }
+gpui-pre = "=0.3.2"
+gpui-pre-platform = "=0.3.2"
+wgpu = "=29.0.4"
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+# Frame times are measured in release; this keeps debug runs usable.
+[profile.dev.package."*"]
+opt-level = 2
