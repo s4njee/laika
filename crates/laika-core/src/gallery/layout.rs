@@ -214,7 +214,12 @@ impl Occupancy {
         }
         for r in row..row + sy {
             for c in col..col + sx {
-                if self.taken.get(r * self.columns + c).copied().unwrap_or(false) {
+                if self
+                    .taken
+                    .get(r * self.columns + c)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     return false;
                 }
             }
@@ -313,7 +318,13 @@ pub fn place_at(slots: &[Slot], target: usize, cell: Cell, columns: u8) -> Vec<O
 
 /// Change a slot's span; it keeps its cell when the new size fits there,
 /// otherwise it moves to the next fit. Siblings re-flow.
-pub fn set_span(slots: &[Slot], target: usize, span_x: u8, span_y: u8, columns: u8) -> Vec<Option<Cell>> {
+pub fn set_span(
+    slots: &[Slot],
+    target: usize,
+    span_x: u8,
+    span_y: u8,
+    columns: u8,
+) -> Vec<Option<Cell>> {
     let cols = columns.max(1);
     let mut work: Vec<Slot> = slots.to_vec();
     work[target].span_x = span_x.clamp(1, cols);
@@ -418,7 +429,11 @@ impl Breakpoint {
 /// Re-flow placed slots (in desktop reading order) for a narrower
 /// breakpoint: spans clamp to the column count. The desktop cells are not
 /// modified; returns (slot index, cell, span_x, span_y).
-pub fn at_breakpoint(slots: &[Slot], desktop_columns: u8, bp: Breakpoint) -> Vec<(usize, Cell, u8, u8)> {
+pub fn at_breakpoint(
+    slots: &[Slot],
+    desktop_columns: u8,
+    bp: Breakpoint,
+) -> Vec<(usize, Cell, u8, u8)> {
     let cols = bp.columns(desktop_columns);
     let cells: Vec<Option<Cell>> = slots.iter().map(|s| s.cell).collect();
     let order = reading_order(&cells);
@@ -428,7 +443,11 @@ pub fn at_breakpoint(slots: &[Slot], desktop_columns: u8, bp: Breakpoint) -> Vec
             let s = slots[i];
             let sx = s.span_x.min(cols);
             // A span wider than the new grid keeps its shape roughly.
-            let sy = if bp == Breakpoint::Phone { 1 } else { s.span_y.min(2) };
+            let sy = if bp == Breakpoint::Phone {
+                1
+            } else {
+                s.span_y.min(2)
+            };
             Slot {
                 span_x: sx,
                 span_y: sy,
@@ -461,7 +480,14 @@ pub fn metrics(page_inner_w: f32, columns: u8, gutter: f32, ratio: f32) -> (f32,
 }
 
 /// A tile's rectangle in page px (x, y, w, h).
-pub fn tile_rect(cell: Cell, sx: u8, sy: u8, col_w: f32, row_h: f32, gutter: f32) -> (f32, f32, f32, f32) {
+pub fn tile_rect(
+    cell: Cell,
+    sx: u8,
+    sy: u8,
+    col_w: f32,
+    row_h: f32,
+    gutter: f32,
+) -> (f32, f32, f32, f32) {
     (
         cell.col as f32 * (col_w + gutter),
         cell.row as f32 * (row_h + gutter),
@@ -585,7 +611,13 @@ mod tests {
                 slots = next;
                 let placed: Vec<(Cell, u8, u8)> = slots
                     .iter()
-                    .map(|s| (s.cell.expect("never unplaced"), s.span_x.min(columns), s.span_y))
+                    .map(|s| {
+                        (
+                            s.cell.expect("never unplaced"),
+                            s.span_x.min(columns),
+                            s.span_y,
+                        )
+                    })
                     .collect();
                 assert_eq!(placed.len(), 40);
                 assert!(!overlaps(&placed), "step {step} columns {columns}");
@@ -611,7 +643,13 @@ mod tests {
         let placed: Vec<(Cell, u8, u8)> = cells
             .iter()
             .enumerate()
-            .map(|(i, c)| (c.unwrap(), if i == 0 { 2 } else { 1 }, if i == 0 { 2 } else { 1 }))
+            .map(|(i, c)| {
+                (
+                    c.unwrap(),
+                    if i == 0 { 2 } else { 1 },
+                    if i == 0 { 2 } else { 1 },
+                )
+            })
             .collect();
         assert!(!overlaps(&placed));
         // Siblings keep their reading order: B, C, D, E, F wrap around A.
@@ -635,13 +673,24 @@ mod tests {
             });
             let cells = flow(&slots, 3);
             slots[i].cell = Some(cells[i]);
-            assert_eq!(cells[i], Cell { col: (i % 3) as u16, row: (i / 3) as u16 });
+            assert_eq!(
+                cells[i],
+                Cell {
+                    col: (i % 3) as u16,
+                    row: (i / 3) as u16
+                }
+            );
         }
         let before = slots.clone();
         let phone = at_breakpoint(&slots, 3, Breakpoint::Phone);
         assert_eq!(slots, before);
         assert_eq!(phone.len(), 20);
-        assert!(phone.iter().enumerate().all(|(k, (i, c, sx, _))| *i == k && c.row as usize == k && *sx == 1));
+        assert!(
+            phone
+                .iter()
+                .enumerate()
+                .all(|(k, (i, c, sx, _))| *i == k && c.row as usize == k && *sx == 1)
+        );
         let tablet = at_breakpoint(&slots, 3, Breakpoint::Tablet);
         assert!(tablet.iter().all(|(_, c, sx, _)| c.col as u8 + sx <= 2));
     }
@@ -653,7 +702,10 @@ mod tests {
         let (x, y, w, h) = tile_rect(Cell { col: 1, row: 1 }, 2, 1, cw, rh, 12.);
         assert!((x - (cw + 12.)).abs() < 0.01 && (y - (rh + 12.)).abs() < 0.01);
         assert!((w - (2. * cw + 12.)).abs() < 0.01 && (h - rh).abs() < 0.01);
-        assert_eq!(cell_at(x + 5., y + 5., 3, cw, rh, 12.), Cell { col: 1, row: 1 });
+        assert_eq!(
+            cell_at(x + 5., y + 5., 3, cw, rh, 12.),
+            Cell { col: 1, row: 1 }
+        );
         assert_eq!(cell_at(9999., -5., 3, cw, rh, 12.), Cell { col: 2, row: 0 });
         assert_eq!(quantize_span(w, cw, 12., 3), 2);
         assert_eq!(quantize_span(10., cw, 12., 3), 1);

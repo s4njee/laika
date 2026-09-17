@@ -81,7 +81,11 @@ impl BuildReport {
 /// (never upscale). Sizes apply to the long edge.
 pub fn derivative_edges(w: u32, h: u32, sizes: &[u32]) -> Vec<u32> {
     let long = w.max(h).max(1);
-    let mut out: Vec<u32> = sizes.iter().copied().filter(|s| *s > 0 && *s <= long).collect();
+    let mut out: Vec<u32> = sizes
+        .iter()
+        .copied()
+        .filter(|s| *s > 0 && *s <= long)
+        .collect();
     if sizes.iter().any(|s| *s > long) {
         out.push(long);
     }
@@ -95,9 +99,15 @@ pub fn derivative_edges(w: u32, h: u32, sizes: &[u32]) -> Vec<u32> {
 
 fn resized_dims(w: u32, h: u32, long_edge: u32) -> (u32, u32) {
     if w >= h {
-        (long_edge, ((h as u64 * long_edge as u64) / w.max(1) as u64).max(1) as u32)
+        (
+            long_edge,
+            ((h as u64 * long_edge as u64) / w.max(1) as u64).max(1) as u32,
+        )
     } else {
-        (((w as u64 * long_edge as u64) / h.max(1) as u64).max(1) as u32, long_edge)
+        (
+            ((w as u64 * long_edge as u64) / h.max(1) as u64).max(1) as u32,
+            long_edge,
+        )
     }
 }
 
@@ -109,7 +119,11 @@ pub fn plan(g: &Gallery, photos: &[SitePhoto]) -> Vec<(usize, SitePhoto, String)
         .filter_map(|(i, ..)| {
             let id = g.photos[i].photo_id;
             let sp = photos.iter().find(|p| p.photo_id == id)?;
-            Some((i, sp.clone(), manifest::photo_key(&sp.source_hash, &sp.edit_key)))
+            Some((
+                i,
+                sp.clone(),
+                manifest::photo_key(&sp.source_hash, &sp.edit_key),
+            ))
         })
         .collect()
 }
@@ -201,7 +215,9 @@ pub fn build(
     };
     let placement_of = |index: usize| {
         let p = &g.photos[index];
-        let cell = p.cell.unwrap_or(laika_core::gallery::layout::Cell { col: 0, row: 0 });
+        let cell = p
+            .cell
+            .unwrap_or(laika_core::gallery::layout::Cell { col: 0, row: 0 });
         (cell.col, cell.row, p.span_x, p.span_y)
     };
 
@@ -273,7 +289,8 @@ pub fn build(
         for edge in edges {
             let (dw, dh) = resized_dims(w, h, edge);
             if (dw, dh) != (base.width(), base.height()) {
-                base = image::imageops::resize(&base, dw, dh, image::imageops::FilterType::Lanczos3);
+                base =
+                    image::imageops::resize(&base, dw, dh, image::imageops::FilterType::Lanczos3);
             }
             let bytes = match encode_pixels(ExportFormat::Jpeg, &fopts, &base) {
                 Ok((b, _)) => b,
@@ -296,7 +313,9 @@ pub fn build(
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
-                    if cancel.load(Ordering::Relaxed) || fatal.lock().map(|f| f.is_some()).unwrap_or(true) {
+                    if cancel.load(Ordering::Relaxed)
+                        || fatal.lock().map(|f| f.is_some()).unwrap_or(true)
+                    {
                         return;
                     }
                     let k = next.fetch_add(1, Ordering::Relaxed);
@@ -350,7 +369,9 @@ pub fn build(
         .filter_map(|(n, m)| m.map(|m| (planned[n].0, m)))
         .collect();
     if cancel.load(Ordering::Relaxed) {
-        return Err(cleanup("build cancelled — the previous build is unchanged".to_string()));
+        return Err(cleanup(
+            "build cancelled — the previous build is unchanged".to_string(),
+        ));
     }
     if written.is_empty() {
         let why = report
@@ -382,7 +403,8 @@ pub fn build(
         for f in FONT_FILES {
             let src = fonts.join(f);
             if src.is_file() {
-                std::fs::copy(&src, assets.join("fonts").join(f)).map_err(|e| cleanup(e.to_string()))?;
+                std::fs::copy(&src, assets.join("fonts").join(f))
+                    .map_err(|e| cleanup(e.to_string()))?;
             }
         }
     }
@@ -407,7 +429,8 @@ pub fn build(
     // Swap: old build aside, staging in, old build removed.
     let old = parent.join(format!(".{name}.old-{}", std::process::id()));
     if out.exists() {
-        std::fs::rename(out, &old).map_err(|e| cleanup(format!("can't replace {}: {e}", out.display())))?;
+        std::fs::rename(out, &old)
+            .map_err(|e| cleanup(format!("can't replace {}: {e}", out.display())))?;
     }
     if let Err(e) = std::fs::rename(&staging, out) {
         if old.exists() {

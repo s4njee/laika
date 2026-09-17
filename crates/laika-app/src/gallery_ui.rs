@@ -177,11 +177,21 @@ impl Laika {
         }
         self.gal.fonts_loaded = true;
         let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
-            std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/IBMPlexSans-Medium.ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/IBMPlexSans-SemiBold.ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/IBMPlexMono-Regular.ttf")),
-            std::borrow::Cow::Borrowed(include_bytes!("../../../assets/fonts/IBMPlexMono-Medium.ttf")),
+            std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/IBMPlexSans-Regular.ttf"
+            )),
+            std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/IBMPlexSans-Medium.ttf"
+            )),
+            std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/IBMPlexSans-SemiBold.ttf"
+            )),
+            std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/IBMPlexMono-Regular.ttf"
+            )),
+            std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/IBMPlexMono-Medium.ttf"
+            )),
         ];
         if let Err(e) = cx.text_system().add_fonts(fonts) {
             eprintln!("[gallery] fonts: {e}");
@@ -278,12 +288,13 @@ impl Laika {
                 self.status_note = format!("gallery not saved — {e}");
             }
         }
-        if let Some(s) = self
-            .gal
-            .current
-            .as_ref()
-            .and_then(|g| self.gal.list.iter_mut().find(|s| s.id == g.id).map(|s| (s, g)))
-        {
+        if let Some(s) = self.gal.current.as_ref().and_then(|g| {
+            self.gal
+                .list
+                .iter_mut()
+                .find(|s| s.id == g.id)
+                .map(|s| (s, g))
+        }) {
             let (sum, g) = s;
             sum.title = g.title.clone();
             sum.slug = g.slug.clone();
@@ -411,7 +422,8 @@ impl Laika {
                 }
                 self.load_galleries();
                 self.open_gallery(id, cx);
-                self.status_note = "gallery created from the album's order and captions".to_string();
+                self.status_note =
+                    "gallery created from the album's order and captions".to_string();
             }
             Err(e) => self.status_note = e,
         }
@@ -423,8 +435,7 @@ impl Laika {
     pub(crate) fn gal_add_selection(&mut self, cx: &mut Context<Self>) {
         let ids = self.in_visible_order(self.state.selection.iter().copied().collect());
         if ids.is_empty() {
-            self.status_note =
-                "select photos in the Library first, then add them here".to_string();
+            self.status_note = "select photos in the Library first, then add them here".to_string();
             cx.notify();
             return;
         }
@@ -455,7 +466,11 @@ impl Laika {
         let Some(g) = self.gal.current.as_ref() else {
             return String::new();
         };
-        let photo = self.gal.selected.and_then(|pid| g.index_of(pid)).map(|i| &g.photos[i]);
+        let photo = self
+            .gal
+            .selected
+            .and_then(|pid| g.index_of(pid))
+            .map(|i| &g.photos[i]);
         match id {
             F::GalleryTitle => g.title.clone(),
             F::GalleryEyebrow => g.eyebrow.clone(),
@@ -511,18 +526,29 @@ impl Laika {
                 // The web address follows the title until it's hand-edited.
                 let follows = g.slug.is_empty() || g.slug == gallery::derive_slug(&g.title);
                 let slug = follows.then(|| self.unique_slug(&gallery::derive_slug(&text), gid));
-                self.gal_edit("Title", None, |g| {
-                    g.title = text;
-                    if let Some(s) = slug {
-                        g.slug = s;
-                    }
-                }, cx);
+                self.gal_edit(
+                    "Title",
+                    None,
+                    |g| {
+                        g.title = text;
+                        if let Some(s) = slug {
+                            g.slug = s;
+                        }
+                    },
+                    cx,
+                );
             }
             F::GallerySlug => {
                 if !text.is_empty() {
                     gallery::validate_slug(&text)?;
-                    if let Some((_, title)) = self.catalog.as_ref().and_then(|c| c.slug_owner(&text, gid)) {
-                        let who = if title.is_empty() { "another gallery".to_string() } else { format!("“{title}”") };
+                    if let Some((_, title)) =
+                        self.catalog.as_ref().and_then(|c| c.slug_owner(&text, gid))
+                    {
+                        let who = if title.is_empty() {
+                            "another gallery".to_string()
+                        } else {
+                            format!("“{title}”")
+                        };
                         return Err(format!("{who} already uses {text}"));
                     }
                 }
@@ -546,18 +572,30 @@ impl Laika {
                 self.gal_edit("Meta line", None, |g| g.meta_line = text, cx);
             }
             F::GalleryCaption | F::GalleryAlt => {
-                long(2000, if id == F::GalleryCaption { "caption" } else { "alt text" })?;
+                long(
+                    2000,
+                    if id == F::GalleryCaption {
+                        "caption"
+                    } else {
+                        "alt text"
+                    },
+                )?;
                 let pid = self.gal.selected.ok_or("select a photo first")?;
                 let is_caption = id == F::GalleryCaption;
-                self.gal_edit(if is_caption { "Caption" } else { "Alt text" }, None, |g| {
-                    if let Some(i) = g.index_of(pid) {
-                        if is_caption {
-                            g.photos[i].caption = text;
-                        } else {
-                            g.photos[i].alt_text = text;
+                self.gal_edit(
+                    if is_caption { "Caption" } else { "Alt text" },
+                    None,
+                    |g| {
+                        if let Some(i) = g.index_of(pid) {
+                            if is_caption {
+                                g.photos[i].caption = text;
+                            } else {
+                                g.photos[i].alt_text = text;
+                            }
                         }
-                    }
-                }, cx);
+                    },
+                    cx,
+                );
             }
             F::GalleryHex => {
                 if text.is_empty() && self.gal.swatch == Some(NEW_SWATCH) {
@@ -566,32 +604,39 @@ impl Laika {
                 }
                 let c = theme::parse_hex(&text).ok_or("use a hex color like #121517")?;
                 let slot = self.gal.swatch.ok_or("pick a swatch first")?;
-                self.gal_edit("Palette", None, |g| {
-                    let t = &mut g.theme;
-                    match slot {
-                        0 => t.page = c,
-                        1 => t.canvas = c,
-                        2 => t.ink = c,
-                        3 => t.accent = c,
-                        NEW_SWATCH => {
-                            if t.extras.len() < 8 {
-                                t.extras.push(c);
+                self.gal_edit(
+                    "Palette",
+                    None,
+                    |g| {
+                        let t = &mut g.theme;
+                        match slot {
+                            0 => t.page = c,
+                            1 => t.canvas = c,
+                            2 => t.ink = c,
+                            3 => t.accent = c,
+                            NEW_SWATCH => {
+                                if t.extras.len() < 8 {
+                                    t.extras.push(c);
+                                }
+                            }
+                            n => {
+                                if let Some(x) = t.extras.get_mut(n - 4) {
+                                    *x = c;
+                                }
                             }
                         }
-                        n => {
-                            if let Some(x) = t.extras.get_mut(n - 4) {
-                                *x = c;
-                            }
-                        }
-                    }
-                }, cx);
+                    },
+                    cx,
+                );
                 if slot == NEW_SWATCH {
                     self.gal.swatch = None;
                 }
             }
             F::GalleryOutputDir => {
                 let expanded = if let Some(rest) = text.strip_prefix("~/") {
-                    std::env::var("HOME").map(|h| format!("{h}/{rest}")).unwrap_or(text.clone())
+                    std::env::var("HOME")
+                        .map(|h| format!("{h}/{rest}"))
+                        .unwrap_or(text.clone())
                 } else {
                     text.clone()
                 };
@@ -603,9 +648,13 @@ impl Laika {
             }
             F::GalleryProject => {
                 if !text.is_empty()
-                    && !text.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !text
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
                 {
-                    return Err("Pages projects use lowercase letters, digits and dashes".to_string());
+                    return Err(
+                        "Pages projects use lowercase letters, digits and dashes".to_string()
+                    );
                 }
                 long(58, "project name")?;
                 self.gal_edit("Pages project", None, |g| g.deploy_project = text, cx);
@@ -618,7 +667,13 @@ impl Laika {
     // ---- keyboard ------------------------------------------------------------------
 
     /// Publish-module keys. Returns true when consumed.
-    pub(crate) fn gallery_key(&mut self, key: &str, shift: bool, cmd: bool, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn gallery_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        cmd: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.state.active_module != Module::Publish {
             return false;
         }
@@ -680,9 +735,14 @@ impl Laika {
                     return true;
                 };
                 if shift {
-                    self.gal_edit("Remove from gallery", None, |g| {
-                        g.remove_photos(&[id]);
-                    }, cx);
+                    self.gal_edit(
+                        "Remove from gallery",
+                        None,
+                        |g| {
+                            g.remove_photos(&[id]);
+                        },
+                        cx,
+                    );
                     self.gal.selected = None;
                 } else {
                     self.gal_edit("Remove from page", None, |g| g.unplace(id), cx);
@@ -720,7 +780,10 @@ impl Laika {
                 if c + sx > cols {
                     return true;
                 }
-                let to = GridCell { col: c as u16, row: r as u16 };
+                let to = GridCell {
+                    col: c as u16,
+                    row: r as u16,
+                };
                 self.gal_edit("Move", Some("arrow-move"), |g| g.place(id, to), cx);
             }
             "1" | "2" | "3" | "4" if editable => {
@@ -743,18 +806,29 @@ impl Laika {
             _ => (cols, 1),
         };
         let label = format!("Span {}×{}", sx.min(cols), sy);
-        self.gal_edit(&label, None, |g| {
-            if g.index_of(id).is_some_and(|i| g.photos[i].cell.is_none()) {
-                g.place_next(id);
-            }
-            g.set_span(id, sx.min(cols), sy)
-        }, cx);
+        self.gal_edit(
+            &label,
+            None,
+            |g| {
+                if g.index_of(id).is_some_and(|i| g.photos[i].cell.is_none()) {
+                    g.place_next(id);
+                }
+                g.set_span(id, sx.min(cols), sy)
+            },
+            cx,
+        );
     }
 
     // ---- pointer --------------------------------------------------------------------
 
     /// Window mouse-move while a gallery gesture is active. True = handled.
-    pub(crate) fn gallery_mouse_move(&mut self, pos: (f32, f32), pressed: bool, shift: bool, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn gallery_mouse_move(
+        &mut self,
+        pos: (f32, f32),
+        pressed: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.state.active_module != Module::Publish {
             return false;
         }
@@ -830,7 +904,11 @@ impl Laika {
         }
         if let Some(cell) = self.gal_drop_cell(&d, pos) {
             let id = d.photo;
-            let label = if d.from_tray { "Place photo" } else { "Move photo" };
+            let label = if d.from_tray {
+                "Place photo"
+            } else {
+                "Move photo"
+            };
             self.gal_edit(label, None, |g| g.place(id, cell), cx);
             self.gal.selected = Some(id);
         } else if !d.from_tray && in_bounds(self.gal.tray_box.get(), pos) {

@@ -68,7 +68,11 @@ impl PageGeom {
             Some(y) => *y,
             None => {
                 let last = self.row_y.len();
-                let base = if last == 0 { 0. } else { self.height + self.gutter };
+                let base = if last == 0 {
+                    0.
+                } else {
+                    self.height + self.gutter
+                };
                 base + (r - last) as f32 * (self.row_h + self.gutter)
             }
         }
@@ -100,7 +104,10 @@ impl PageGeom {
             let past = (y - (self.height + self.gutter)).max(0.);
             row += (past / (self.row_h + self.gutter)).floor() as usize;
         }
-        GridCell { col, row: row as u16 }
+        GridCell {
+            col,
+            row: row as u16,
+        }
     }
 }
 
@@ -168,7 +175,13 @@ fn eyebrow(text: &str) -> Div {
 }
 
 /// A photo drawn into a box honoring fit and the focal point.
-pub(crate) fn fitted_image(image: Arc<RenderImage>, w: f32, h: f32, fit: Fit, focal: (f32, f32)) -> Div {
+pub(crate) fn fitted_image(
+    image: Arc<RenderImage>,
+    w: f32,
+    h: f32,
+    fit: Fit,
+    focal: (f32, f32),
+) -> Div {
     let sz = image.size(0);
     let (iw, ih) = (sz.width.0.max(1) as f32, sz.height.0.max(1) as f32);
     let s = match fit {
@@ -177,7 +190,10 @@ pub(crate) fn fitted_image(image: Arc<RenderImage>, w: f32, h: f32, fit: Fit, fo
     };
     let (dw, dh) = (iw * s, ih * s);
     let (left, top) = match fit {
-        Fit::Fill => (-(dw - w) * focal.0.clamp(0., 1.), -(dh - h) * focal.1.clamp(0., 1.)),
+        Fit::Fill => (
+            -(dw - w) * focal.0.clamp(0., 1.),
+            -(dh - h) * focal.1.clamp(0., 1.),
+        ),
         Fit::Fit => ((w - dw) / 2., (h - dh) / 2.),
     };
     div()
@@ -277,7 +293,9 @@ impl Laika {
                             .h(px(140.))
                             .overflow_hidden()
                             .bg(rgb(bg_well()))
-                            .children(cover.map(|im| fitted_image(im, 220., 140., Fit::Fill, (0.5, 0.5)))),
+                            .children(
+                                cover.map(|im| fitted_image(im, 220., 140., Fit::Fill, (0.5, 0.5))),
+                            ),
                     )
                     .child(
                         div()
@@ -296,59 +314,69 @@ impl Laika {
                                         s.title.clone()
                                     }),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(TEXT_DIM))
-                                    .child(format!(
-                                        "{} photo{} · {status}",
-                                        s.photo_count,
-                                        if s.photo_count == 1 { "" } else { "s" }
-                                    )),
-                            )
+                            .child(div().text_size(px(10.5)).text_color(rgb(TEXT_DIM)).child(
+                                format!(
+                                    "{} photo{} · {status}",
+                                    s.photo_count,
+                                    if s.photo_count == 1 { "" } else { "s" }
+                                ),
+                            ))
                             .child(
                                 div()
                                     .flex()
                                     .gap(px(6.))
                                     .pt(px(6.))
                                     .child(
-                                        small_button(("gal-dup", id as usize), "Duplicate").on_click(
-                                            cx.listener(move |this, _, _, cx| {
+                                        small_button(("gal-dup", id as usize), "Duplicate")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
                                                 if let Some(cat) = this.catalog.as_ref() {
                                                     match cat.duplicate_gallery(id) {
-                                                        Ok(_) => this.status_note = "gallery duplicated".to_string(),
+                                                        Ok(_) => {
+                                                            this.status_note =
+                                                                "gallery duplicated".to_string()
+                                                        }
                                                         Err(e) => this.status_note = e,
                                                     }
                                                 }
                                                 this.load_galleries();
                                                 cx.notify();
-                                            }),
-                                        ),
+                                            })),
                                     )
                                     .child(
                                         small_button(
                                             ("gal-del", id as usize),
-                                            if confirming { "Confirm delete" } else { "Delete" },
+                                            if confirming {
+                                                "Confirm delete"
+                                            } else {
+                                                "Delete"
+                                            },
                                         )
                                         .when(confirming, |d| d.text_color(rgb(0xE56060)))
-                                        .on_hover(self.tip("Deletes the gallery (photos and built folders stay)"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if this.gal.confirm_delete == Some(id) {
-                                                if let Some(cat) = this.catalog.as_ref() {
-                                                    match cat.delete_gallery(id) {
-                                                        Ok(()) => this.status_note = "gallery deleted".to_string(),
-                                                        Err(e) => this.status_note = e,
+                                        .on_hover(self.tip(
+                                            "Deletes the gallery (photos and built folders stay)",
+                                        ))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if this.gal.confirm_delete == Some(id) {
+                                                    if let Some(cat) = this.catalog.as_ref() {
+                                                        match cat.delete_gallery(id) {
+                                                            Ok(()) => {
+                                                                this.status_note =
+                                                                    "gallery deleted".to_string()
+                                                            }
+                                                            Err(e) => this.status_note = e,
+                                                        }
                                                     }
+                                                    this.gal.confirm_delete = None;
+                                                    this.load_galleries();
+                                                } else {
+                                                    this.gal.confirm_delete = Some(id);
                                                 }
-                                                this.gal.confirm_delete = None;
-                                                this.load_galleries();
-                                            } else {
-                                                this.gal.confirm_delete = Some(id);
-                                            }
-                                            cx.notify();
-                                        })),
+                                                cx.notify();
+                                            }),
+                                        ),
                                     ),
                             ),
                     ),
@@ -512,13 +540,22 @@ impl Laika {
             (None, Some(t)) => (
                 format!(
                     "{} · saved {}",
-                    if g.status == Status::Published { "Published" } else { "Draft" },
+                    if g.status == Status::Published {
+                        "Published"
+                    } else {
+                        "Draft"
+                    },
                     Self::relative_time(t)
                 ),
                 accent_line(),
             ),
             (None, None) => (
-                if g.status == Status::Published { "Published" } else { "Draft" }.to_string(),
+                if g.status == Status::Published {
+                    "Published"
+                } else {
+                    "Draft"
+                }
+                .to_string(),
                 TEXT_TERTIARY,
             ),
         };
@@ -637,7 +674,9 @@ impl Laika {
             .map(|c| format!("Row {} · cell {}", c.row + 1, c.col + 1))
             .unwrap_or_default();
         let hint = match self.gal.breakpoint {
-            Breakpoint::Desktop => "Drag to place · corners resize, hold ⇧ to keep ratio · ⌫ removes from page · ⌘Z undo",
+            Breakpoint::Desktop => {
+                "Drag to place · corners resize, hold ⇧ to keep ratio · ⌫ removes from page · ⌘Z undo"
+            }
             _ => "Preview only — switch to Desktop to arrange",
         };
         div()
@@ -723,7 +762,9 @@ impl Laika {
                     .rounded(px(3.))
                     .overflow_hidden()
                     .bg(rgb(bg_well()))
-                    .when(p.cell.is_some(), |d| d.opacity(if lifted { 0.3 } else { 0.55 }))
+                    .when(p.cell.is_some(), |d| {
+                        d.opacity(if lifted { 0.3 } else { 0.55 })
+                    })
                     .when(lifted && p.cell.is_none(), |d| d.opacity(0.3))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -739,7 +780,9 @@ impl Laika {
                             cx.notify();
                         }),
                     )
-                    .children(thumb.map(|im| fitted_image(im, cell_w, cell_w, Fit::Fill, (0.5, 0.5))))
+                    .children(
+                        thumb.map(|im| fitted_image(im, cell_w, cell_w, Fit::Fill, (0.5, 0.5))),
+                    )
                     .child(
                         div()
                             .absolute()
@@ -751,7 +794,12 @@ impl Laika {
                             .font_family(PLEX_MONO)
                             .text_size(px(8.5))
                             .text_color(rgb(0xF2EFE6))
-                            .child(order.get(&i).map(|n| n.to_string()).unwrap_or_else(|| "–".to_string())),
+                            .child(
+                                order
+                                    .get(&i)
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "–".to_string()),
+                            ),
                     )
                     .when(selected, |d| {
                         d.child(
@@ -873,7 +921,11 @@ impl Laika {
         let t = &g.theme;
         let desktop = bp == Breakpoint::Desktop;
         let dragging = self.gal.drag.filter(|d| d.moved);
-        let spare = if desktop { if dragging.is_some() { 3 } else { 1 } } else { 0 };
+        let spare = if desktop {
+            if dragging.is_some() { 3 } else { 1 }
+        } else {
+            0
+        };
         let geom = PageGeom::new(g, bp, spare);
         let page_w = page_width(bp);
         let pad = page_pad(bp);
@@ -882,7 +934,11 @@ impl Laika {
             TypePairing::LightDisplay => (PLEX_SANS, FontWeight::NORMAL),
             _ => (PLEX_SANS, FontWeight::SEMIBOLD),
         };
-        let caption_family = if t.pairing == TypePairing::SansMono { PLEX_MONO } else { PLEX_SANS };
+        let caption_family = if t.pairing == TypePairing::SansMono {
+            PLEX_MONO
+        } else {
+            PLEX_SANS
+        };
         let title_px = match bp {
             Breakpoint::Phone => (t.title_size as f32 * CANVAS_SCALE).min(26.),
             _ => t.title_size as f32 * CANVAS_SCALE,
@@ -931,7 +987,8 @@ impl Laika {
             let selected = self.gal.selected == Some(pid);
             let lifted = dragging.is_some_and(|d| d.photo == pid);
             let thumb = self.thumbs.get(&pid).map(|t| t.image.clone());
-            let caption = (t.show_captions && !p.caption.trim().is_empty()).then(|| p.caption.trim().to_string());
+            let caption = (t.show_captions && !p.caption.trim().is_empty())
+                .then(|| p.caption.trim().to_string());
             let mut tile = div()
                 .id(("gal-tile", pid as usize))
                 .absolute()
@@ -967,7 +1024,11 @@ impl Laika {
                         .justify_center()
                         .text_size(px(9.))
                         .text_color(rgba((ink << 8) | 0x55))
-                        .child(self.find(pid).map(|r| r.filename.clone()).unwrap_or_default()),
+                        .child(
+                            self.find(pid)
+                                .map(|r| r.filename.clone())
+                                .unwrap_or_default(),
+                        ),
                 ),
             };
             grid = grid.child(tile);
@@ -987,7 +1048,17 @@ impl Laika {
                 );
             }
             if selected && !lifted {
-                grid = grid.child(self.selection_chrome(g, pid, cell, sx, sy, (x, y, w, h), desktop, window, cx));
+                grid = grid.child(self.selection_chrome(
+                    g,
+                    pid,
+                    cell,
+                    sx,
+                    sy,
+                    (x, y, w, h),
+                    desktop,
+                    window,
+                    cx,
+                ));
             }
         }
 
@@ -1131,7 +1202,11 @@ impl Laika {
                         geom.cols
                     ))
                     .child(div().flex_1())
-                    .child(format!("{} · {}px", bp.label().to_uppercase(), page_w as u32)),
+                    .child(format!(
+                        "{} · {}px",
+                        bp.label().to_uppercase(),
+                        page_w as u32
+                    )),
             )
             .child(
                 div()
@@ -1151,7 +1226,14 @@ impl Laika {
                             cx.notify();
                         }
                     }))
-                    .child(div().w_full().flex().justify_center().py(px(28.)).child(page)),
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .py(px(28.))
+                            .child(page),
+                    ),
             )
     }
 
@@ -1204,8 +1286,16 @@ impl Laika {
                 let hx = if right { w + 6. - 5. } else { -2. };
                 let hy = if bottom { h + 6. - 5. } else { -2. };
                 let anchor = GridCell {
-                    col: if right { cell.col } else { cell.col + sx as u16 - 1 },
-                    row: if bottom { cell.row } else { cell.row + sy as u16 - 1 },
+                    col: if right {
+                        cell.col
+                    } else {
+                        cell.col + sx as u16 - 1
+                    },
+                    row: if bottom {
+                        cell.row
+                    } else {
+                        cell.row + sy as u16 - 1
+                    },
                 };
                 chrome = chrome.child(
                     div()
@@ -1249,14 +1339,23 @@ impl Laika {
     }
 
     /// Where a drag would land: (top-left cell, span) on the Desktop grid.
-    pub(crate) fn gal_drop_target(&self, d: &GalDrag, pos: (f32, f32)) -> Option<(GridCell, u8, u8)> {
+    pub(crate) fn gal_drop_target(
+        &self,
+        d: &GalDrag,
+        pos: (f32, f32),
+    ) -> Option<(GridCell, u8, u8)> {
         let g = self.gal.current.as_ref()?;
         let b = self.gal.grid_box.get();
         let geom = PageGeom::new(g, Breakpoint::Desktop, 3);
         let (ox, oy) = (b.origin.x.as_f32(), b.origin.y.as_f32());
         let (lx, ly) = (pos.0 - ox, pos.1 - oy);
         let width = b.size.width.as_f32();
-        if width <= 1. || lx < -20. || lx > width + 20. || ly < -30. || ly > geom.height + 3. * (geom.row_h + geom.gutter) {
+        if width <= 1.
+            || lx < -20.
+            || lx > width + 20.
+            || ly < -30.
+            || ly > geom.height + 3. * (geom.row_h + geom.gutter)
+        {
             return None;
         }
         let i = g.index_of(d.photo)?;
@@ -1294,11 +1393,22 @@ impl Laika {
         };
         let b = self.gal.grid_box.get();
         let geom = PageGeom::new(&r.start, Breakpoint::Desktop, 3);
-        let p = geom.cell_at(pos.0 - b.origin.x.as_f32(), (pos.1 - b.origin.y.as_f32()).max(0.));
+        let p = geom.cell_at(
+            pos.0 - b.origin.x.as_f32(),
+            (pos.1 - b.origin.y.as_f32()).max(0.),
+        );
         let cols = r.start.columns.max(1) as u16;
         let a = r.anchor;
-        let (mut x0, mut x1) = if r.right { (a.col, p.col.max(a.col)) } else { (p.col.min(a.col), a.col) };
-        let (mut y0, mut y1) = if r.bottom { (a.row, p.row.max(a.row)) } else { (p.row.min(a.row), a.row) };
+        let (mut x0, mut x1) = if r.right {
+            (a.col, p.col.max(a.col))
+        } else {
+            (p.col.min(a.col), a.col)
+        };
+        let (mut y0, mut y1) = if r.bottom {
+            (a.row, p.row.max(a.row))
+        } else {
+            (p.row.min(a.row), a.row)
+        };
         x1 = x1.min(cols - 1);
         x0 = x0.min(x1);
         let mut sx = (x1 - x0 + 1) as u8;
@@ -1333,7 +1443,12 @@ impl Laika {
         cx.notify();
     }
 
-    pub(crate) fn gal_slider_to(&mut self, kind: GalSlider, pos: (f32, f32), cx: &mut Context<Self>) {
+    pub(crate) fn gal_slider_to(
+        &mut self,
+        kind: GalSlider,
+        pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
         let b = match kind {
             GalSlider::TitleSize => self.gal.title_box.get(),
             GalSlider::Radius => self.gal.radius_box.get(),
@@ -1349,11 +1464,21 @@ impl Laika {
         match kind {
             GalSlider::TitleSize => {
                 let v = (32. + fx * 40.).round() as u8;
-                self.gal_edit("Title size", Some("title-size"), |g| g.theme.title_size = v, cx);
+                self.gal_edit(
+                    "Title size",
+                    Some("title-size"),
+                    |g| g.theme.title_size = v,
+                    cx,
+                );
             }
             GalSlider::Radius => {
                 let v = (fx * 24.).round() as u8;
-                self.gal_edit("Rounded corners", Some("radius"), |g| g.theme.corner_radius = v, cx);
+                self.gal_edit(
+                    "Rounded corners",
+                    Some("radius"),
+                    |g| g.theme.corner_radius = v,
+                    cx,
+                );
             }
             GalSlider::Gutter => {
                 let v = (fx * 32.).round() as u8;
@@ -1364,11 +1489,16 @@ impl Laika {
                     return;
                 };
                 let (fx, fy) = ((fx * 100.).round() / 100., (fy * 100.).round() / 100.);
-                self.gal_edit("Focal point", Some("focal"), |g| {
-                    if let Some(i) = g.index_of(id) {
-                        g.photos[i].focal = (fx, fy);
-                    }
-                }, cx);
+                self.gal_edit(
+                    "Focal point",
+                    Some("focal"),
+                    |g| {
+                        if let Some(i) = g.index_of(id) {
+                            g.photos[i].focal = (fx, fy);
+                        }
+                    },
+                    cx,
+                );
             }
         }
     }

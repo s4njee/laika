@@ -37,7 +37,11 @@ fn value_text(v: &str, placeholder: &str) -> Div {
         .bg(rgb(bg_well()))
         .overflow_hidden()
         .text_size(px(11.5))
-        .text_color(rgb(if v.is_empty() { TEXT_DIMMER } else { TEXT_SECONDARY }))
+        .text_color(rgb(if v.is_empty() {
+            TEXT_DIMMER
+        } else {
+            TEXT_SECONDARY
+        }))
         .child(if v.is_empty() {
             placeholder.to_string()
         } else {
@@ -54,7 +58,9 @@ fn seg_button(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> 
         .py(px(5.))
         .rounded(px(4.))
         .text_size(px(11.))
-        .when(on, |d| d.bg(rgb(accent_fill())).text_color(rgb(accent_on_fill())))
+        .when(on, |d| {
+            d.bg(rgb(accent_fill())).text_color(rgb(accent_on_fill()))
+        })
         .when(!on, |d| {
             d.border_1()
                 .border_color(border_control())
@@ -71,7 +77,11 @@ fn hexs(c: u32) -> String {
 impl Laika {
     pub(crate) fn gallery_inspector(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let tab = self.gal.tab;
-        let width = if tab == InspectorTab::Page { 348. } else { 300. };
+        let width = if tab == InspectorTab::Page {
+            348.
+        } else {
+            300.
+        };
         let tabs = [
             ("Photo", InspectorTab::Photo),
             ("Layout", InspectorTab::Layout),
@@ -142,16 +152,23 @@ impl Laika {
             .items_center()
             .gap(px(8.))
             .child(row_label(label))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .child(self.field_cell(id, value_text(value, placeholder), false, tip, cx)),
-            )
+            .child(div().flex_1().min_w_0().flex().child(self.field_cell(
+                id,
+                value_text(value, placeholder),
+                false,
+                tip,
+                cx,
+            )))
     }
 
-    fn toggle_row(&self, id: &'static str, on: bool, label: &str, f: fn(&mut Gallery), cx: &mut Context<Self>) -> Stateful<Div> {
+    fn toggle_row(
+        &self,
+        id: &'static str,
+        on: bool,
+        label: &str,
+        f: fn(&mut Gallery),
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let label_s = label.to_string();
         div()
             .id(id)
@@ -192,7 +209,11 @@ impl Laika {
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                             this.gal.slider = Some(kind);
                             this.gal.history.seal();
-                            this.gal_slider_to(kind, (ev.position.x.as_f32(), ev.position.y.as_f32()), cx);
+                            this.gal_slider_to(
+                                kind,
+                                (ev.position.x.as_f32(), ev.position.y.as_f32()),
+                                cx,
+                            );
                         }),
                     )
                     .child(
@@ -267,7 +288,12 @@ impl Laika {
         let cols = g.columns;
         let (sx, sy) = (p.span_x, p.span_y);
         let placed = p.cell.is_some();
-        let presets = [("1×1", 1u8, sx == 1 && sy == 1), ("2×1", 2, sx == 2 && sy == 1), ("2×2", 3, sx == 2 && sy == 2), ("Full", 4, sx == cols && sy == 1 && cols > 2)];
+        let presets = [
+            ("1×1", 1u8, sx == 1 && sy == 1),
+            ("2×1", 2, sx == 2 && sy == 1),
+            ("2×2", 3, sx == 2 && sy == 2),
+            ("Full", 4, sx == cols && sy == 1 && cols > 2),
+        ];
 
         // Focal preview: the whole photo fitted, thirds, and the handle.
         let (bw, bh) = (272., 120.);
@@ -363,7 +389,9 @@ impl Laika {
                             .rounded(px(3.))
                             .overflow_hidden()
                             .bg(rgb(bg_well()))
-                            .children(thumb.map(|im| fitted_image(im, 56., 56., Fit::Fill, (0.5, 0.5)))),
+                            .children(
+                                thumb.map(|im| fitted_image(im, 56., 56., Fit::Fill, (0.5, 0.5))),
+                            ),
                     )
                     .child(
                         div()
@@ -385,14 +413,21 @@ impl Laika {
                                     .font_family(PLEX_MONO)
                                     .text_size(px(10.5))
                                     .text_color(rgb(TEXT_DIM))
-                                    .child(row.map(|r| format!("{} × {}", r.width, r.height)).unwrap_or_default()),
+                                    .child(
+                                        row.map(|r| format!("{} × {}", r.width, r.height))
+                                            .unwrap_or_default(),
+                                    ),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(rgb(if placed { TEXT_DIM } else { WARNING }))
                                     .child(match p.cell {
-                                        Some(c) => format!("on the page · row {} · cell {}", c.row + 1, c.col + 1),
+                                        Some(c) => format!(
+                                            "on the page · row {} · cell {}",
+                                            c.row + 1,
+                                            c.col + 1
+                                        ),
                                         None => "in the tray, not on the page".to_string(),
                                     }),
                             ),
@@ -400,11 +435,15 @@ impl Laika {
             )
             .child(section("Span"))
             .child(
-                div().flex().gap(px(5.)).children(presets.iter().map(|(label, n, on)| {
-                    let n = *n;
-                    seg_button(("gal-span", n as usize), label, *on && placed)
-                        .on_click(cx.listener(move |this, _, _, cx| this.gal_set_span_preset(pid, n, cx)))
-                })),
+                div()
+                    .flex()
+                    .gap(px(5.))
+                    .children(presets.iter().map(|(label, n, on)| {
+                        let n = *n;
+                        seg_button(("gal-span", n as usize), label, *on && placed).on_click(
+                            cx.listener(move |this, _, _, cx| this.gal_set_span_preset(pid, n, cx)),
+                        )
+                    })),
             )
             .child(section("Crop & focal point"))
             .child(preview)
@@ -412,28 +451,55 @@ impl Laika {
                 div()
                     .flex()
                     .gap(px(5.))
-                    .child(seg_button("gal-fill", "Fill", fit == Fit::Fill).on_click(cx.listener(move |this, _, _, cx| {
-                        this.gal_edit("Fill", None, |g| {
-                            if let Some(i) = g.index_of(pid) {
-                                g.photos[i].fit = Fit::Fill;
-                            }
-                        }, cx)
-                    })))
-                    .child(seg_button("gal-fit", "Fit", fit == Fit::Fit).on_click(cx.listener(move |this, _, _, cx| {
-                        this.gal_edit("Fit", None, |g| {
-                            if let Some(i) = g.index_of(pid) {
-                                g.photos[i].fit = Fit::Fit;
-                            }
-                        }, cx)
-                    })))
-                    .child(seg_button("gal-focal-reset", "Reset", false).on_click(cx.listener(move |this, _, _, cx| {
-                        this.gal_edit("Reset focal point", None, |g| {
-                            if let Some(i) = g.index_of(pid) {
-                                g.photos[i].focal = (0.5, 0.5);
-                                g.photos[i].fit = Fit::Fill;
-                            }
-                        }, cx)
-                    }))),
+                    .child(
+                        seg_button("gal-fill", "Fill", fit == Fit::Fill).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.gal_edit(
+                                    "Fill",
+                                    None,
+                                    |g| {
+                                        if let Some(i) = g.index_of(pid) {
+                                            g.photos[i].fit = Fit::Fill;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        seg_button("gal-fit", "Fit", fit == Fit::Fit).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.gal_edit(
+                                    "Fit",
+                                    None,
+                                    |g| {
+                                        if let Some(i) = g.index_of(pid) {
+                                            g.photos[i].fit = Fit::Fit;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
+                    .child(
+                        seg_button("gal-focal-reset", "Reset", false).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.gal_edit(
+                                    "Reset focal point",
+                                    None,
+                                    |g| {
+                                        if let Some(i) = g.index_of(pid) {
+                                            g.photos[i].focal = (0.5, 0.5);
+                                            g.photos[i].fit = Fit::Fill;
+                                        }
+                                    },
+                                    cx,
+                                )
+                            },
+                        )),
+                    ),
             )
             .child(section("Text"))
             .child(self.field_row(
@@ -456,11 +522,16 @@ impl Laika {
                 div()
                     .id("gal-open-full")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.gal_edit("Open full size", None, |g| {
-                            if let Some(i) = g.index_of(pid) {
-                                g.photos[i].open_full_size = !g.photos[i].open_full_size;
-                            }
-                        }, cx)
+                        this.gal_edit(
+                            "Open full size",
+                            None,
+                            |g| {
+                                if let Some(i) = g.index_of(pid) {
+                                    g.photos[i].open_full_size = !g.photos[i].open_full_size;
+                                }
+                            },
+                            cx,
+                        )
                     }))
                     .child(toggle::toggle(p.open_full_size, "Open full size on click")),
             )
@@ -470,28 +541,43 @@ impl Laika {
                     .gap(px(6.))
                     .pt(px(4.))
                     .child(
-                        seg_button("gal-unplace", if placed { "Remove from page" } else { "Place on page" }, false)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let placed = this
-                                    .gal
-                                    .current
-                                    .as_ref()
-                                    .and_then(|g| g.index_of(pid).map(|i| g.photos[i].cell.is_some()))
-                                    .unwrap_or(false);
-                                if placed {
-                                    this.gal_edit("Remove from page", None, |g| g.unplace(pid), cx);
-                                } else {
-                                    this.gal_edit("Place photo", None, |g| g.place_next(pid), cx);
-                                }
-                            })),
+                        seg_button(
+                            "gal-unplace",
+                            if placed {
+                                "Remove from page"
+                            } else {
+                                "Place on page"
+                            },
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let placed = this
+                                .gal
+                                .current
+                                .as_ref()
+                                .and_then(|g| g.index_of(pid).map(|i| g.photos[i].cell.is_some()))
+                                .unwrap_or(false);
+                            if placed {
+                                this.gal_edit("Remove from page", None, |g| g.unplace(pid), cx);
+                            } else {
+                                this.gal_edit("Place photo", None, |g| g.place_next(pid), cx);
+                            }
+                        })),
                     )
                     .child(
-                        seg_button("gal-remove", "Remove from gallery", false).on_click(cx.listener(move |this, _, _, cx| {
-                            this.gal_edit("Remove from gallery", None, |g| {
-                                g.remove_photos(&[pid]);
-                            }, cx);
-                            this.gal.selected = None;
-                        })),
+                        seg_button("gal-remove", "Remove from gallery", false).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.gal_edit(
+                                    "Remove from gallery",
+                                    None,
+                                    |g| {
+                                        g.remove_photos(&[pid]);
+                                    },
+                                    cx,
+                                );
+                                this.gal.selected = None;
+                            }),
+                        ),
                     ),
             )
     }
@@ -501,7 +587,13 @@ impl Laika {
     fn layout_tab(&self, cx: &mut Context<Self>) -> Div {
         let g = self.gal.current.as_ref().expect("open gallery");
         let t = layout::template(&g.template);
-        let ratios: [(&str, f32); 5] = [("2:1", 2.0), ("16:9", 16. / 9.), ("3:2", 1.5), ("1:1", 1.0), ("4:5", 0.8)];
+        let ratios: [(&str, f32); 5] = [
+            ("2:1", 2.0),
+            ("16:9", 16. / 9.),
+            ("3:2", 1.5),
+            ("1:1", 1.0),
+            ("4:5", 0.8),
+        ];
         let sizes = [640u32, 1280, 2048, 3200];
         div()
             .flex()
@@ -520,8 +612,18 @@ impl Laika {
                             .flex()
                             .flex_col()
                             .gap(px(3.))
-                            .child(div().text_size(px(12.5)).text_color(rgb(TEXT_PRIMARY)).child(t.name))
-                            .child(div().text_size(px(10.5)).text_color(rgb(TEXT_DIM)).child(t.description)),
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(t.name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(t.description),
+                            ),
                     ),
             )
             .child(
@@ -535,34 +637,61 @@ impl Laika {
                     .items_center()
                     .gap(px(8.))
                     .child(row_label("Columns"))
-                    .child(div().flex_1().flex().gap(px(4.)).children((1..=6u8).map(|n| {
-                        seg_button(("gal-cols", n as usize), &n.to_string(), g.columns == n)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.gal_edit(&format!("{n} columns"), None, |g| g.set_columns(n), cx)
-                            }))
-                    }))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .gap(px(4.))
+                            .children((1..=6u8).map(|n| {
+                                seg_button(("gal-cols", n as usize), &n.to_string(), g.columns == n)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.gal_edit(
+                                            &format!("{n} columns"),
+                                            None,
+                                            |g| g.set_columns(n),
+                                            cx,
+                                        )
+                                    }))
+                            })),
+                    ),
             )
-            .child(self.gal_slider_row("Gutter", format!("{} px", g.gutter), g.gutter as f32 / 32., GalSlider::Gutter, cx))
+            .child(self.gal_slider_row(
+                "Gutter",
+                format!("{} px", g.gutter),
+                g.gutter as f32 / 32.,
+                GalSlider::Gutter,
+                cx,
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
                     .child(row_label("Row shape"))
-                    .child(div().flex_1().flex().gap(px(4.)).children(ratios.iter().enumerate().map(|(k, (label, r))| {
-                        let r = *r;
-                        let on = (g.ratio - r).abs() < 0.01;
-                        seg_button(("gal-ratio", k), label, on).on_click(cx.listener(move |this, _, _, cx| {
-                            this.gal_edit("Row shape", None, |g| g.ratio = r, cx)
-                        }))
-                    }))),
+                    .child(div().flex_1().flex().gap(px(4.)).children(
+                        ratios.iter().enumerate().map(|(k, (label, r))| {
+                            let r = *r;
+                            let on = (g.ratio - r).abs() < 0.01;
+                            seg_button(("gal-ratio", k), label, on).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.gal_edit("Row shape", None, |g| g.ratio = r, cx)
+                                },
+                            ))
+                        }),
+                    )),
             )
             .child(
-                seg_button("gal-reflow", "Re-flow every photo with this template", false)
-                    .on_hover(self.tip("Places all photos in order with the template's spans (undoable)"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.gal_edit("Re-flow", None, |g| g.reflow_all(), cx)
-                    })),
+                seg_button(
+                    "gal-reflow",
+                    "Re-flow every photo with this template",
+                    false,
+                )
+                .on_hover(
+                    self.tip("Places all photos in order with the template's spans (undoable)"),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.gal_edit("Re-flow", None, |g| g.reflow_all(), cx)
+                })),
             )
             .child(section("Published images"))
             .child(
@@ -571,26 +700,46 @@ impl Laika {
                     .items_center()
                     .gap(px(8.))
                     .child(row_label("Sizes"))
-                    .child(div().flex_1().flex().gap(px(4.)).children(sizes.iter().map(|s| {
-                        let s = *s;
-                        let on = g.sizes.contains(&s);
-                        seg_button(("gal-size", s as usize), &s.to_string(), on).on_click(cx.listener(move |this, _, _, cx| {
-                            let only = this.gal.current.as_ref().is_some_and(|g| g.sizes == [s]);
-                            if only {
-                                this.status_note = "keep at least one image size".to_string();
-                                cx.notify();
-                                return;
-                            }
-                            this.gal_edit("Image sizes", None, |g| {
-                                if let Some(k) = g.sizes.iter().position(|x| *x == s) {
-                                    g.sizes.remove(k);
-                                } else {
-                                    g.sizes.push(s);
-                                    g.sizes.sort_unstable();
-                                }
-                            }, cx)
-                        }))
-                    }))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .gap(px(4.))
+                            .children(sizes.iter().map(|s| {
+                                let s = *s;
+                                let on = g.sizes.contains(&s);
+                                seg_button(("gal-size", s as usize), &s.to_string(), on).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        let only = this
+                                            .gal
+                                            .current
+                                            .as_ref()
+                                            .is_some_and(|g| g.sizes == [s]);
+                                        if only {
+                                            this.status_note =
+                                                "keep at least one image size".to_string();
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.gal_edit(
+                                            "Image sizes",
+                                            None,
+                                            |g| {
+                                                if let Some(k) =
+                                                    g.sizes.iter().position(|x| *x == s)
+                                                {
+                                                    g.sizes.remove(k);
+                                                } else {
+                                                    g.sizes.push(s);
+                                                    g.sizes.sort_unstable();
+                                                }
+                                            },
+                                            cx,
+                                        )
+                                    }),
+                                )
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -598,7 +747,13 @@ impl Laika {
                     .text_color(rgb(TEXT_DIM))
                     .child("Long edge in pixels; never upscaled. JPEG, sRGB, no EXIF or GPS."),
             )
-            .child(self.toggle_row("gal-downloads", g.allow_downloads, "Allow downloads", |g| g.allow_downloads = !g.allow_downloads, cx))
+            .child(self.toggle_row(
+                "gal-downloads",
+                g.allow_downloads,
+                "Allow downloads",
+                |g| g.allow_downloads = !g.allow_downloads,
+                cx,
+            ))
             .child(
                 div()
                     .id("gal-password")
@@ -649,7 +804,12 @@ impl Laika {
         let g = self.gal.current.as_ref().expect("open gallery");
         let t = &g.theme;
         use text_input::FieldId as F;
-        let mut swatches: Vec<(usize, &str, u32)> = vec![(0, "page", t.page), (1, "canvas", t.canvas), (2, "ink", t.ink), (3, "accent", t.accent)];
+        let mut swatches: Vec<(usize, &str, u32)> = vec![
+            (0, "page", t.page),
+            (1, "canvas", t.canvas),
+            (2, "ink", t.ink),
+            (3, "accent", t.accent),
+        ];
         for (k, c) in t.extras.iter().enumerate() {
             swatches.push((4 + k, "extra", *c));
         }
@@ -661,12 +821,54 @@ impl Laika {
             .flex_col()
             .gap(px(12.))
             .child(section("Gallery"))
-            .child(self.field_row("Title", F::GalleryTitle, &g.title, "Untitled gallery", "Page title (Enter applies)", cx))
-            .child(self.field_row("Eyebrow", F::GalleryEyebrow, &g.eyebrow, "TRAVEL · 2026", "Small line above the title", cx))
-            .child(self.field_row("Lede", F::GallerySubtitle, &g.subtitle, "A sentence about these photos", "Introduction beside the title", cx))
-            .child(self.field_row("Web address", F::GallerySlug, &g.slug, "hokkaido-2026", "Folder and URL name: lowercase letters, digits and dashes", cx))
-            .child(self.field_row("Site name", F::GallerySite, &g.site_name, "Your name", "Shown in the page header", cx))
-            .child(self.field_row("Meta line", F::GalleryMeta, &g.meta_line, "Sapporo, Otaru", "After the photo count, like “48 photographs · Sapporo”", cx))
+            .child(self.field_row(
+                "Title",
+                F::GalleryTitle,
+                &g.title,
+                "Untitled gallery",
+                "Page title (Enter applies)",
+                cx,
+            ))
+            .child(self.field_row(
+                "Eyebrow",
+                F::GalleryEyebrow,
+                &g.eyebrow,
+                "TRAVEL · 2026",
+                "Small line above the title",
+                cx,
+            ))
+            .child(self.field_row(
+                "Lede",
+                F::GallerySubtitle,
+                &g.subtitle,
+                "A sentence about these photos",
+                "Introduction beside the title",
+                cx,
+            ))
+            .child(self.field_row(
+                "Web address",
+                F::GallerySlug,
+                &g.slug,
+                "hokkaido-2026",
+                "Folder and URL name: lowercase letters, digits and dashes",
+                cx,
+            ))
+            .child(self.field_row(
+                "Site name",
+                F::GallerySite,
+                &g.site_name,
+                "Your name",
+                "Shown in the page header",
+                cx,
+            ))
+            .child(self.field_row(
+                "Meta line",
+                F::GalleryMeta,
+                &g.meta_line,
+                "Sapporo, Otaru",
+                "After the photo count, like “48 photographs · Sapporo”",
+                cx,
+            ))
             .child(section("Type pairing"))
             .children(TypePairing::ALL.iter().map(|p| {
                 let p = *p;
@@ -687,7 +889,10 @@ impl Laika {
                     .bg(rgb(t.page))
                     .border_1()
                     .when(on, |d| d.border_color(rgb(accent_line())))
-                    .when(!on, |d| d.border_color(hairline()).hover(|d| d.border_color(border_strong())))
+                    .when(!on, |d| {
+                        d.border_color(hairline())
+                            .hover(|d| d.border_color(border_strong()))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.gal_edit("Type pairing", None, |g| g.theme.pairing = p, cx)
                     }))
@@ -705,8 +910,18 @@ impl Laika {
                             .flex_1()
                             .flex()
                             .flex_col()
-                            .child(div().text_size(px(12.)).text_color(rgb(t.ink)).child(p.name()))
-                            .child(div().text_size(px(10.5)).text_color(rgba((t.ink << 8) | 0x80)).child(p.descriptor())),
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(t.ink))
+                                    .child(p.name()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgba((t.ink << 8) | 0x80))
+                                    .child(p.descriptor()),
+                            ),
                     )
                     .when(on, |d| {
                         d.child(
@@ -741,7 +956,11 @@ impl Laika {
                             .items_center()
                             .gap(px(3.))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.gal.swatch = if this.gal.swatch == Some(k) { None } else { Some(k) };
+                                this.gal.swatch = if this.gal.swatch == Some(k) {
+                                    None
+                                } else {
+                                    Some(k)
+                                };
                                 if this.gal.swatch.is_some() {
                                     this.focus_field(text_input::FieldId::GalleryHex, cx);
                                 }
@@ -756,7 +975,12 @@ impl Laika {
                                     .when(on, |d| d.border_2().border_color(rgb(accent_line())))
                                     .when(!on, |d| d.border_color(border_control())),
                             )
-                            .child(div().text_size(px(9.5)).text_color(rgb(TEXT_DIM)).child(name.to_string()))
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(name.to_string()),
+                            )
                     }))
                     .child(
                         div()
@@ -783,7 +1007,12 @@ impl Laika {
                                     .text_color(rgb(TEXT_DIM))
                                     .child("+"),
                             )
-                            .child(div().text_size(px(9.5)).text_color(rgb(TEXT_DIM)).child("add")),
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child("add"),
+                            ),
                     ),
             )
             .when_some(editing, |d, k| {
@@ -800,25 +1029,36 @@ impl Laika {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .child(self.field_row(
-                            if k == NEW_SWATCH { "New color" } else { "Hex" },
-                            F::GalleryHex,
-                            &hexs(current),
-                            "#RRGGBB",
-                            "Type a hex color like #121517 (Enter applies)",
-                            cx,
-                        ).flex_1())
+                        .child(
+                            self.field_row(
+                                if k == NEW_SWATCH { "New color" } else { "Hex" },
+                                F::GalleryHex,
+                                &hexs(current),
+                                "#RRGGBB",
+                                "Type a hex color like #121517 (Enter applies)",
+                                cx,
+                            )
+                            .flex_1(),
+                        )
                         .when(k >= 4 && k != NEW_SWATCH, |d| {
                             d.child(
-                                seg_button("gal-swatch-del", "Remove", false).flex_none().px(px(8.)).on_click(cx.listener(move |this, _, _, cx| {
-                                    this.gal_edit("Remove color", None, |g| {
-                                        if k - 4 < g.theme.extras.len() {
-                                            g.theme.extras.remove(k - 4);
-                                        }
-                                    }, cx);
-                                    this.gal.swatch = None;
-                                    this.defocus_field();
-                                })),
+                                seg_button("gal-swatch-del", "Remove", false)
+                                    .flex_none()
+                                    .px(px(8.))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.gal_edit(
+                                            "Remove color",
+                                            None,
+                                            |g| {
+                                                if k - 4 < g.theme.extras.len() {
+                                                    g.theme.extras.remove(k - 4);
+                                                }
+                                            },
+                                            cx,
+                                        );
+                                        this.gal.swatch = None;
+                                        this.defocus_field();
+                                    })),
                             )
                         }),
                 )
@@ -831,7 +1071,13 @@ impl Laika {
                         .gap(px(6.))
                         .text_size(px(10.5))
                         .text_color(rgb(TEXT_TERTIARY))
-                        .child(div().flex_none().size(px(10.)).rounded(px(2.)).bg(rgb(accent_text)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(10.))
+                                .rounded(px(2.))
+                                .bg(rgb(accent_text)),
+                        )
                         .child(div().flex_1().min_w_0().child(format!(
                             "Accent reads poorly as text on the page; eyebrows use {} instead",
                             hexs(accent_text)
@@ -839,8 +1085,20 @@ impl Laika {
                 )
             })
             .child(section("Behaviour"))
-            .child(self.toggle_row("gal-captions", t.show_captions, "Show captions", |g| g.theme.show_captions = !g.theme.show_captions, cx))
-            .child(self.toggle_row("gal-hover-zoom", t.hover_zoom, "Hover zoom", |g| g.theme.hover_zoom = !g.theme.hover_zoom, cx))
+            .child(self.toggle_row(
+                "gal-captions",
+                t.show_captions,
+                "Show captions",
+                |g| g.theme.show_captions = !g.theme.show_captions,
+                cx,
+            ))
+            .child(self.toggle_row(
+                "gal-hover-zoom",
+                t.hover_zoom,
+                "Hover zoom",
+                |g| g.theme.hover_zoom = !g.theme.hover_zoom,
+                cx,
+            ))
             .child(self.gal_slider_row(
                 "Corners",
                 format!("{} px", t.corner_radius),
@@ -868,7 +1126,12 @@ impl Laika {
             return;
         };
         let name = layout::template(p.choice).name;
-        self.gal_edit(&format!("Layout: {name}"), None, |g| g.apply_template(p.choice), cx);
+        self.gal_edit(
+            &format!("Layout: {name}"),
+            None,
+            |g| g.apply_template(p.choice),
+            cx,
+        );
         self.status_note = format!("layout set to {name} — captions and order kept");
         cx.notify();
     }
@@ -879,10 +1142,22 @@ impl Laika {
         let current = layout::template(&g.template).id;
         let cats: [(Option<Category>, String); 5] = [
             (None, format!("All {}", TEMPLATES.len())),
-            (Some(Category::Uniform), Category::Uniform.label().to_string()),
-            (Some(Category::Editorial), Category::Editorial.label().to_string()),
-            (Some(Category::SingleColumn), Category::SingleColumn.label().to_string()),
-            (Some(Category::ContactSheet), Category::ContactSheet.label().to_string()),
+            (
+                Some(Category::Uniform),
+                Category::Uniform.label().to_string(),
+            ),
+            (
+                Some(Category::Editorial),
+                Category::Editorial.label().to_string(),
+            ),
+            (
+                Some(Category::SingleColumn),
+                Category::SingleColumn.label().to_string(),
+            ),
+            (
+                Some(Category::ContactSheet),
+                Category::ContactSheet.label().to_string(),
+            ),
         ];
         let visible: Vec<&layout::Template> = TEMPLATES
             .iter()

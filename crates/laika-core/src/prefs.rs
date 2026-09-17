@@ -84,6 +84,8 @@ pub struct AppPrefs {
     pub import_workers: u8,
     /// Thumbnails decoded in parallel per batch.
     pub thumb_concurrency: u8,
+    /// V32: write a crash report beside the log (opt-in; never sent).
+    pub crash_reports: bool,
 }
 
 impl Default for AppPrefs {
@@ -107,6 +109,7 @@ impl Default for AppPrefs {
             gpu: GpuPreference::HighPerformance,
             import_workers: 0,
             thumb_concurrency: 8,
+            crash_reports: false,
         }
     }
 }

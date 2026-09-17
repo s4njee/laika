@@ -128,9 +128,8 @@ impl BuildDiff {
             return format!("first build · {} images", self.added.len());
         }
         let mut parts = Vec::new();
-        let plural = |n: usize, one: &str, many: &str| {
-            format!("{n} {}", if n == 1 { one } else { many })
-        };
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         if !self.added.is_empty() {
             parts.push(plural(self.added.len(), "new image", "new images"));
         }

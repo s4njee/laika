@@ -1151,7 +1151,54 @@ filmstrip and persisting to `library.json`, and the in-window menu bar
   stacked. The exported intermediate honors V27 metadata and profile choices.
 - **Depends on:** V27, V31, U13. **Touchpoints:** Export render, file watcher, stacks.
 
-### [ ] V32 — Diagnostics, logging, About, and first-run onboarding
+### [x] V32 — Diagnostics, logging, About, and first-run onboarding
+
+**Result: done 2026-09-17.** `cargo fmt`, workspace tests pass (new:
+`logging` unit tests for redaction/rotation/timestamps, a `crash_report`
+integration test, and the existing suites), verified live in a fresh
+isolated HOME.
+- Logging (`laika-core/src/logging.rs`): stderr is teed through a pipe, so
+  every existing `[area]` line lands in
+  `~/Library/Application Support/Laika/logs/laika.log` with a UTC
+  timestamp, still echoed to the terminal. Rotates at 5 MB, keeps 4
+  (`laika.1.log`…). `LAIKA_LOG=0` disables. Each launch writes a start
+  line (version, OS, arch, pid).
+- Support coverage: failures that were silent now log with file and
+  reason — export per-file failures and a run summary, Develop decode
+  failures (path, camera, type), gallery builds and per-photo failures,
+  wrangler deploy output and failures. Import, sync, rename/move, and
+  Apple Photos already logged.
+- Credentials never reach disk: the S3 secret is registered for scrubbing
+  when loaded (keychain or `LAIKA_S3_SECRET`); every line is also scrubbed
+  of URL userinfo, `secret|password|token|authorization|access_key=…`
+  values, and AWS key ids.
+- About (Laika/Help menu and Preferences → General): version, git build
+  and date, OS, GPU adapter, catalog path/size/count and root, cache,
+  rawler/wgpu/gpui versions, log path, crash-report state; Copy
+  Diagnostics, Show Log, Show Crash Reports. Help menu also has Show Log
+  in Finder and Welcome Screen.
+- Crash reports (opt-in toggle in About and Preferences, persisted in
+  `library.json`): the panic hook always logs the panic; when on it writes
+  `logs/crash-<time>.txt` with the message, location, backtrace, the
+  diagnostics block, and the last 200 log lines, all scrubbed. Nothing is
+  sent anywhere.
+- First run: a welcome screen when the library has never been welcomed
+  and the open catalog is empty (existing libraries are marked welcomed
+  silently). It explains local originals and the catalog, shows the
+  catalog path with Create Catalog Elsewhere (the V07 folder + name
+  flow), Try with sample photos (copies the bundled fixture NEFs to
+  `~/Pictures/Laika Samples` and imports them), Import your photos, and
+  Skip (Esc also skips).
+- Gates: a fresh HOME reached a populated 3-photo grid about 1 s after
+  clicking Try with sample photos (import 0.4 s); logs of that run show
+  the start, migration, catalog open, samples, and import lines.
+- Honest limits: the samples ship from `Resources/samples` in a bundle,
+  but no bundling script copies them there yet (development builds use
+  `fixtures/raw`, and the button disables with a reason when neither
+  exists). Log lines are the existing free-text `[area]` lines, not
+  key/value records. Panics in the render thread are logged and
+  reported like any other; a hard crash (signal, not a panic) writes no
+  report.
 
 - **Deliver:** Structured logs with rotation in the app support directory, a
   **Show Log** action, an About window with version, build, catalog path, GPU,

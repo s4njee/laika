@@ -91,6 +91,8 @@ pub(crate) enum Command {
     FullScreen,
     // Help
     Shortcuts,
+    ShowLog,
+    Welcome,
 }
 
 /// A menu entry: a command, a separator, or a submenu.
@@ -189,6 +191,8 @@ impl Command {
             C::HideChrome => (s("Hide Panels"), "⇧⇥"),
             C::FullScreen => (s("Full Screen"), "F"),
             C::Shortcuts => (s("Keyboard Shortcuts"), "?"),
+            C::ShowLog => (s("Show Log in Finder"), ""),
+            C::Welcome => (s("Welcome Screen"), ""),
         }
     }
 
@@ -322,7 +326,16 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
                 Cmd(C::FullScreen),
             ],
         ),
-        ("Help", vec![Cmd(C::Shortcuts)]),
+        (
+            "Help",
+            vec![
+                Cmd(C::Shortcuts),
+                Sep,
+                Cmd(C::Welcome),
+                Cmd(C::ShowLog),
+                Cmd(C::About),
+            ],
+        ),
     ]
 }
 
@@ -432,11 +445,12 @@ impl Laika {
     ) {
         self.menu_open = None;
         match cmd {
-            C::About => {
-                self.status_note = format!(
-                    "Laika {} — photo catalog and develop",
-                    env!("CARGO_PKG_VERSION")
-                );
+            C::About => self.open_about(cx),
+            C::ShowLog => self.show_log(cx),
+            C::Welcome => {
+                self.close_modals(cx);
+                self.diag.note.clear();
+                self.diag.welcome_open = true;
             }
             C::Preferences => self.open_settings(cx),
             C::Quit => {

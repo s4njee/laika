@@ -86,12 +86,16 @@ fn fonts_dir() -> Option<PathBuf> {
         return Some(bundled);
     }
     let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts"));
-    dev.join(site::build::FONT_FILES[0]).is_file().then_some(dev)
+    dev.join(site::build::FONT_FILES[0])
+        .is_file()
+        .then_some(dev)
 }
 
 /// GUI apps get a minimal PATH: look where npm and Homebrew install.
 pub(crate) fn find_wrangler() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/wrangler"),
         PathBuf::from("/usr/local/bin/wrangler"),
@@ -122,7 +126,9 @@ pub(crate) fn deploy_url(lines: &[String]) -> Option<String> {
 /// Parallel photos per build: half the cores, 2–4 (each holds a
 /// full-resolution decode, ~300 MB at 24 MP).
 fn build_workers() -> usize {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     (cores / 2).clamp(2, 4)
 }
 
@@ -165,7 +171,8 @@ fn render_photo(
     let frame = renderer
         .render_export(linear, job.params, 0., job.geom)
         .map_err(|e| format!("render failed: {e}"))?;
-    image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba).ok_or_else(|| "bad pixels".to_string())
+    image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+        .ok_or_else(|| "bad pixels".to_string())
 }
 
 impl Laika {
@@ -190,7 +197,11 @@ impl Laika {
             let params = self.effective_values(p.photo_id, base);
             let geom = self.acknowledged_export_geom(p.photo_id);
             let smart = self.offline.contains(&p.photo_id)
-                && self.cache_dir.join(&row.blake3).join("linear-2048.f16").exists();
+                && self
+                    .cache_dir
+                    .join(&row.blake3)
+                    .join("linear-2048.f16")
+                    .exists();
             let edit_key = format!("{params:?}|{geom:?}|{smart}");
             photos.push(SitePhoto {
                 photo_id: p.photo_id,
@@ -219,7 +230,9 @@ impl Laika {
     }
 
     fn preview_dir(&self, id: i64) -> PathBuf {
-        std::env::temp_dir().join("laika-gallery-preview").join(id.to_string())
+        std::env::temp_dir()
+            .join("laika-gallery-preview")
+            .join(id.to_string())
     }
 
     /// G22: build at 1280 only into a temp folder and open the browser.
@@ -312,14 +325,22 @@ impl Laika {
             return;
         };
         if g.slug.is_empty() && g.output_dir.trim().is_empty() {
-            self.set_publish_result(Err("set a web address (slug) on the Page tab first".to_string()));
+            self.set_publish_result(Err(
+                "set a web address (slug) on the Page tab first".to_string()
+            ));
             cx.notify();
             return;
         }
         if deploy {
-            if self.gal.publish.as_ref().is_some_and(|p| p.wrangler.is_none()) {
+            if self
+                .gal
+                .publish
+                .as_ref()
+                .is_some_and(|p| p.wrangler.is_none())
+            {
                 self.set_publish_result(Err(
-                    "wrangler isn't installed — run `npm install -g wrangler` and `wrangler login`".to_string(),
+                    "wrangler isn't installed — run `npm install -g wrangler` and `wrangler login`"
+                        .to_string(),
                 ));
                 cx.notify();
                 return;
@@ -347,7 +368,13 @@ impl Laika {
         }
     }
 
-    fn run_gallery_build(&mut self, kind: BuildKind, out: PathBuf, sizes: Option<Vec<u32>>, cx: &mut Context<Self>) {
+    fn run_gallery_build(
+        &mut self,
+        kind: BuildKind,
+        out: PathBuf,
+        sizes: Option<Vec<u32>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.gal.build.is_some() {
             self.status_note = "a gallery build is already running".to_string();
             cx.notify();
@@ -369,7 +396,9 @@ impl Laika {
         }
         self.ensure_dev(cx);
         let Some(renderer) = self.dev.as_ref().map(|d| d.renderer.clone()) else {
-            self.set_publish_result(Err("GPU unavailable — building needs the renderer".to_string()));
+            self.set_publish_result(Err(
+                "GPU unavailable — building needs the renderer".to_string()
+            ));
             self.status_note = "GPU unavailable — building needs the renderer".to_string();
             cx.notify();
             return;
@@ -457,12 +486,22 @@ impl Laika {
         cx.notify();
     }
 
-    fn finish_gallery_build(&mut self, kind: BuildKind, out: PathBuf, r: Result<BuildReport, String>, cx: &mut Context<Self>) {
+    fn finish_gallery_build(
+        &mut self,
+        kind: BuildKind,
+        out: PathBuf,
+        r: Result<BuildReport, String>,
+        cx: &mut Context<Self>,
+    ) {
         let run = self.gal.build.take();
         let gid = run.map(|r| r.gallery_id);
         let report = match r {
             Ok(rep) => rep,
             Err(e) => {
+                eprintln!(
+                    "[gallery] build FAILED ({kind:?}) at {}: {e}",
+                    out.display()
+                );
                 if kind == BuildKind::Preview {
                     self.status_note = format!("preview failed — {e}");
                 } else {
@@ -472,11 +511,22 @@ impl Laika {
             }
         };
         let failed = report.failures.len();
+        eprintln!(
+            "[gallery] built ({kind:?}) {} at {}",
+            report.summary(),
+            out.display()
+        );
+        for (name, reason) in &report.failures {
+            eprintln!("[gallery] FAILED {name}: {reason}");
+        }
         match kind {
             BuildKind::Preview => {
                 let index = out.join("index.html");
                 if let Err(e) = std::process::Command::new("open").arg(&index).spawn() {
-                    self.status_note = format!("preview built at {} but the browser didn't open ({e})", index.display());
+                    self.status_note = format!(
+                        "preview built at {} but the browser didn't open ({e})",
+                        index.display()
+                    );
                 } else {
                     self.status_note = if failed == 0 {
                         format!("preview opened · {}", report.summary())
@@ -535,7 +585,10 @@ impl Laika {
         let log = sheet.log.clone();
         if let Ok(mut l) = log.lock() {
             l.clear();
-            l.push(format!("$ wrangler pages deploy {} --project-name {project}", dir.display()));
+            l.push(format!(
+                "$ wrangler pages deploy {} --project-name {project}",
+                dir.display()
+            ));
         }
         let status: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
         {
@@ -559,7 +612,8 @@ impl Laika {
                 let mut child = match child {
                     Ok(c) => c,
                     Err(e) => {
-                        *status.lock().unwrap() = Some(Err(format!("couldn't start wrangler: {e}")));
+                        *status.lock().unwrap() =
+                            Some(Err(format!("couldn't start wrangler: {e}")));
                         return;
                     }
                 };
@@ -567,12 +621,14 @@ impl Laika {
                     let log = log.clone();
                     std::thread::spawn(move || {
                         for line in BufReader::new(e).lines().map_while(Result::ok) {
+                            eprintln!("[deploy] {line}");
                             log.lock().unwrap().push(line);
                         }
                     })
                 });
                 if let Some(out) = child.stdout.take() {
                     for line in BufReader::new(out).lines().map_while(Result::ok) {
+                        eprintln!("[deploy] {line}");
                         log.lock().unwrap().push(line);
                     }
                 }
@@ -604,7 +660,9 @@ impl Laika {
                             }
                             match r {
                                 Ok(()) => {
-                                    if let Some(g) = this.gal.current.as_mut().filter(|g| g.id == gid) {
+                                    if let Some(g) =
+                                        this.gal.current.as_mut().filter(|g| g.id == gid)
+                                    {
                                         g.last_deploy_at = unix_now();
                                         g.last_deploy_url = url.clone().unwrap_or_default();
                                         g.status = Status::Published;
@@ -615,10 +673,18 @@ impl Laika {
                                     }
                                     this.set_publish_result(Ok(match url {
                                         Some(u) => format!("deployed — live at {u}"),
-                                        None => "deployed (no URL in wrangler's output — see the log)".to_string(),
+                                        None => {
+                                            "deployed (no URL in wrangler's output — see the log)"
+                                                .to_string()
+                                        }
                                     }));
                                 }
-                                Err(e) => this.set_publish_result(Err(format!("deploy failed, the build is kept on disk — {e}"))),
+                                Err(e) => {
+                                    eprintln!("[deploy] FAILED: {e}");
+                                    this.set_publish_result(Err(format!(
+                                        "deploy failed, the build is kept on disk — {e}"
+                                    )))
+                                }
                             }
                         }
                         cx.notify();
@@ -638,7 +704,11 @@ impl Laika {
     pub(crate) fn publish_sheet(&self, cx: &mut Context<Self>) -> Div {
         let g = self.gal.current.as_ref().expect("open gallery");
         let s = self.gal.publish.as_ref().expect("sheet open");
-        let building = self.gal.build.as_ref().filter(|b| matches!(b.kind, BuildKind::Publish { .. }));
+        let building = self
+            .gal
+            .build
+            .as_ref()
+            .filter(|b| matches!(b.kind, BuildKind::Publish { .. }));
         let dir = self.publish_dir();
         let busy = building.is_some() || s.deploying;
         let label = |t: &str| {
@@ -656,8 +726,13 @@ impl Laika {
                 .py(px(5.))
                 .rounded(px(4.))
                 .text_size(px(11.5))
-                .when(on, |d| d.bg(rgb(bg_segment_active())).text_color(rgb(TEXT_PRIMARY)))
-                .when(!on, |d| d.text_color(rgb(TEXT_MUTED)).hover(|d| d.text_color(rgb(TEXT_PRIMARY))))
+                .when(on, |d| {
+                    d.bg(rgb(bg_segment_active())).text_color(rgb(TEXT_PRIMARY))
+                })
+                .when(!on, |d| {
+                    d.text_color(rgb(TEXT_MUTED))
+                        .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
+                })
                 .child(text.to_string())
         };
         let log_lines: Vec<String> = s
@@ -1044,7 +1119,13 @@ impl Laika {
                         .gal
                         .current
                         .as_ref()
-                        .map(|g| if g.slug.is_empty() { "gallery".to_string() } else { g.slug.clone() })
+                        .map(|g| {
+                            if g.slug.is_empty() {
+                                "gallery".to_string()
+                            } else {
+                                g.slug.clone()
+                            }
+                        })
                         .unwrap_or_default();
                     // A chosen folder that already holds a build is reused;
                     // otherwise the site goes in a subfolder named for it.
@@ -1080,9 +1161,13 @@ mod tests {
         let lines = vec![
             "Uploading... (12/12)".to_string(),
             "See https://developers.cloudflare.com/pages for help".to_string(),
-            "✨ Deployment complete! Take a peek over at https://1a2b3c.my-photos.pages.dev".to_string(),
+            "✨ Deployment complete! Take a peek over at https://1a2b3c.my-photos.pages.dev"
+                .to_string(),
         ];
-        assert_eq!(deploy_url(&lines).as_deref(), Some("https://1a2b3c.my-photos.pages.dev"));
+        assert_eq!(
+            deploy_url(&lines).as_deref(),
+            Some("https://1a2b3c.my-photos.pages.dev")
+        );
         assert_eq!(deploy_url(&["no url".to_string()]), None);
     }
 }

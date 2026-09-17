@@ -184,15 +184,19 @@ impl SyncSettings {
     }
 
     pub fn secret(&self) -> Option<String> {
+        // V32: whatever secret is in use is scrubbed from every log line.
         if let Ok(s) = std::env::var("LAIKA_S3_SECRET") {
             if !s.is_empty() {
+                crate::logging::register_secret(&s);
                 return Some(s);
             }
         }
-        keyring::Entry::new("laika", &format!("s3-secret/{}", self.access_key))
+        let s = keyring::Entry::new("laika", &format!("s3-secret/{}", self.access_key))
             .ok()?
             .get_password()
-            .ok()
+            .ok()?;
+        crate::logging::register_secret(&s);
+        Some(s)
     }
 
     pub fn store_secret(&self, secret: &str) -> Result<(), String> {

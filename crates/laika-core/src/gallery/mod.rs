@@ -163,7 +163,11 @@ fn rgb_to_hsl(rgb: u32) -> (f64, f64, f64) {
         return (0., 0., l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2. - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2. - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         (g - b) / d + if g < b { 6. } else { 0. }
     } else if max == g {
@@ -398,9 +402,8 @@ impl Gallery {
         self.photos[i].span_x = sx;
         self.photos[i].span_y = sy;
         // Flow only placed photos plus this one, in reading order.
-        let mut order: Vec<usize> = layout::reading_order(
-            &self.photos.iter().map(|p| p.cell).collect::<Vec<_>>(),
-        );
+        let mut order: Vec<usize> =
+            layout::reading_order(&self.photos.iter().map(|p| p.cell).collect::<Vec<_>>());
         order.push(i);
         let slots: Vec<Slot> = order.iter().map(|&k| self.photos[k].slot()).collect();
         let cells = layout::flow(&slots, self.columns);
@@ -483,7 +486,12 @@ impl Gallery {
                 .into_iter()
                 .map(|i| {
                     let p = &self.photos[i];
-                    (i, p.cell.expect("placed"), p.span_x.min(self.columns), p.span_y)
+                    (
+                        i,
+                        p.cell.expect("placed"),
+                        p.span_x.min(self.columns),
+                        p.span_y,
+                    )
                 })
                 .collect();
         }
@@ -583,7 +591,11 @@ mod tests {
             assert_eq!(g.photos[3].alt_text, "Boats at sunrise");
             assert_eq!((g.photos[3].focal, g.photos[3].fit), ((0.2, 0.8), Fit::Fit));
             // Reading order follows tray order.
-            let order: Vec<usize> = g.layout_at(Breakpoint::Desktop).iter().map(|r| r.0).collect();
+            let order: Vec<usize> = g
+                .layout_at(Breakpoint::Desktop)
+                .iter()
+                .map(|r| r.0)
+                .collect();
             assert_eq!(order, (0..12).collect::<Vec<_>>(), "{}", t.id);
         }
     }
@@ -604,7 +616,11 @@ mod tests {
         g.set_span(5, 3, 1);
         assert_eq!((g.photos[4].span_x, g.photos[4].span_y), (3, 1));
         g.set_columns(2);
-        assert!(g.photos.iter().all(|p| p.span_x <= 2 && p.cell.unwrap().col as u8 + p.span_x <= 2));
+        assert!(
+            g.photos
+                .iter()
+                .all(|p| p.span_x <= 2 && p.cell.unwrap().col as u8 + p.span_x <= 2)
+        );
         // Toggling breakpoints never mutates the model.
         let before = g.clone();
         let _ = g.layout_at(Breakpoint::Phone);
@@ -625,7 +641,13 @@ mod tests {
             match i % 3 {
                 0 => g.set_span(1 + (i % 6) as i64, 1 + (i % 2) as u8, 1),
                 1 => g.photos[(i % 6) as usize].caption = format!("c{i}"),
-                _ => g.place((i % 6) as i64 + 1, Cell { col: (i % 3) as u16, row: (i % 4) as u16 }),
+                _ => g.place(
+                    (i % 6) as i64 + 1,
+                    Cell {
+                        col: (i % 3) as u16,
+                        row: (i % 4) as u16,
+                    },
+                ),
             }
             states.push(g.clone());
         }
@@ -662,9 +684,16 @@ mod tests {
         assert!(Theme::contrast(text, t.page) >= 4.5, "{text:06X}");
         // Near the handoff's #9B93E8.
         let (r, g, b) = ((text >> 16) & 0xFF, (text >> 8) & 0xFF, text & 0xFF);
-        assert!(r.abs_diff(0x9B) < 24 && g.abs_diff(0x93) < 24 && b.abs_diff(0xE8) < 24, "{text:06X}");
+        assert!(
+            r.abs_diff(0x9B) < 24 && g.abs_diff(0x93) < 24 && b.abs_diff(0xE8) < 24,
+            "{text:06X}"
+        );
         // Light pages darken instead.
-        let light = Theme { page: 0xFFFDF8, accent: 0xE8E0FF, ..Theme::default() };
+        let light = Theme {
+            page: 0xFFFDF8,
+            accent: 0xE8E0FF,
+            ..Theme::default()
+        };
         assert!(Theme::contrast(light.accent_text(), light.page) >= 4.5);
         let json = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<Theme>(&json).unwrap(), t);

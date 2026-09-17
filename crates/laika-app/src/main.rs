@@ -26,6 +26,7 @@ mod albums;
 mod collections;
 mod commands;
 mod controls;
+mod diagnostics;
 mod gallery_canvas;
 mod gallery_inspector;
 mod gallery_publish;
@@ -1346,6 +1347,8 @@ struct Laika {
     coll: collections::CollState,
     /// G04: the Publish module's gallery editor.
     gal: gallery_ui::GalleryUi,
+    /// V32: About window and first-run welcome.
+    diag: diagnostics::DiagUi,
     /// V31: open in-window menu (index into the menu tree).
     menu_open: Option<usize>,
     /// V31: Preferences tab.
@@ -4185,6 +4188,11 @@ impl Laika {
 
     /// Close every modal and restore pre-modal slider focus.
     fn close_modals(&mut self, cx: &mut Context<Self>) {
+        self.diag.about_open = false;
+        // Esc on the welcome screen is "Skip for now".
+        if self.diag.welcome_open {
+            self.finish_welcome();
+        }
         self.publish_open = false;
         self.sync_open = false;
         self.help_open = false;
@@ -5990,6 +5998,15 @@ impl Laika {
                             this.submit_dev(cx);
                         }
                         Err(e) => {
+                            // V32: decode failures carry the file and camera.
+                            if let Some(p) = this.find(id) {
+                                eprintln!(
+                                    "[decode] FAILED {} ({} {}): {e}",
+                                    p.path,
+                                    p.camera,
+                                    p.filename.rsplit('.').next().unwrap_or("")
+                                );
+                            }
                             this.status_note = format!("decode failed: {e}");
                         }
                     }
@@ -7213,6 +7230,14 @@ impl Laika {
             return;
         }
         let total = plan.len();
+        eprintln!(
+            "[export] starting {total} file(s) · {} group(s) · {skipped} skipped · {} failed in planning",
+            validated.len(),
+            failed.len()
+        );
+        for (name, reason) in &failed {
+            eprintln!("[export] FAILED {name}: {reason}");
+        }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(d) = self.export_dialog.as_mut() {
             d.run = Some(ExportRun {
@@ -7315,6 +7340,7 @@ impl Laika {
                                     .push(item_path.clone());
                             }
                             Err((name, reason)) => {
+                                eprintln!("[export] FAILED {name}: {reason}");
                                 r.failed.push((name, reason));
                                 d.retry_ids.push((item_preset.clone(), iid));
                             }
@@ -20436,12 +20462,20 @@ impl Laika {
     /// exposure (ISO, aperture, shutter speed).
     fn develop_shot_info(&self) -> Div {
         let p = self.primary_photo();
-        let name = p.map(|p| p.filename.clone()).unwrap_or_else(|| "No photo".to_string());
+        let name = p
+            .map(|p| p.filename.clone())
+            .unwrap_or_else(|| "No photo".to_string());
         let kind = p
-            .and_then(|p| std::path::Path::new(&p.filename).extension().map(|e| e.to_string_lossy().to_uppercase()))
+            .and_then(|p| {
+                std::path::Path::new(&p.filename)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_uppercase())
+            })
             .unwrap_or_default();
         let value = |v: Option<&str>| {
-            v.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| "—".to_string())
+            v.filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "—".to_string())
         };
         let cell = |label: &str, v: String| {
             div()
@@ -20514,7 +20548,10 @@ impl Laika {
                 div()
                     .flex()
                     .gap(px(10.))
-                    .child(cell("ISO", value(p.map(|p| p.iso.trim_start_matches("ISO ")))))
+                    .child(cell(
+                        "ISO",
+                        value(p.map(|p| p.iso.trim_start_matches("ISO "))),
+                    ))
                     .child(cell("Aperture", value(p.map(|p| p.aperture.as_str()))))
                     .child(cell("Shutter", value(p.map(|p| p.shutter.as_str())))),
             )
@@ -22167,11 +22204,15 @@ fn grid_cell(
                             .left_0()
                             .size_full(),
                     ),
-                None => div().relative().aspect_ratio(1.5).w_full().bg(linear_gradient(
-                    160.,
-                    linear_color_stop(rgb(c.tint.0), 0.),
-                    linear_color_stop(rgb(c.tint.1), 1.),
-                )),
+                None => div()
+                    .relative()
+                    .aspect_ratio(1.5)
+                    .w_full()
+                    .bg(linear_gradient(
+                        160.,
+                        linear_color_stop(rgb(c.tint.0), 0.),
+                        linear_color_stop(rgb(c.tint.1), 1.),
+                    )),
             }
             .children(kind_chip_img),
         )
@@ -23214,6 +23255,8 @@ impl Render for Laika {
                 // editing; every other key is swallowed so photo commands
                 // never fire behind a dialog.
                 if this.publish_open
+                    || this.diag.about_open
+                    || this.diag.welcome_open
                     || this.sync_open
                     || this.export_open
                     || this.help_open
@@ -23553,6 +23596,8 @@ impl Render for Laika {
             .when(self.settings_open, |d| {
                 d.child(self.settings_modal(window, cx))
             })
+            .when(self.diag.about_open, |d| d.child(self.about_modal(cx)))
+            .when(self.diag.welcome_open, |d| d.child(self.welcome_screen(cx)))
             .when(self.apple.open, |d| d.child(self.apple_modal(window, cx)))
             .when(self.rename_open, |d| d.child(self.rename_modal(window, cx)))
             .when(self.manage_open, |d| d.child(self.manage_modal(window, cx)))
@@ -23838,7 +23883,12 @@ impl Laika {
                         )
                         .child(div().flex_1().min_w_0().truncate().child(c.name.clone()))
                         .when(target == Some(cid), |d| {
-                            d.child(div().text_size(px(10.)).text_color(rgb(TEXT_DIM)).child("B"))
+                            d.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child("B"),
+                            )
                         }),
                 );
             }
@@ -27090,6 +27140,18 @@ fn cli_string(name: &str) -> Option<String> {
 }
 
 fn main() {
+    // V32: log everything written to stderr (timestamped, rotated,
+    // credentials scrubbed) and record panics before anything else runs.
+    {
+        let (db_path, _) = default_dirs();
+        if let Some(base) = db_path.parent() {
+            let dir = laika_core::logging::log_dir_for(base);
+            if let Err(e) = laika_core::logging::init(&dir, env!("CARGO_PKG_VERSION")) {
+                eprintln!("[laika] logging unavailable: {e}");
+            }
+        }
+        laika_core::logging::install_panic_hook();
+    }
     let import_arg: Option<String> = arg("--import");
     let sync_now = std::env::args().any(|a| a == "--sync-now");
     gpui_kit::application().run(move |cx| {
@@ -27327,6 +27389,7 @@ fn main() {
                     info_exposure_line: laika_core::slideshow::DEFAULT_EXPOSURE_LINE
                         .to_string(),
                     gal: Default::default(),
+                    diag: Default::default(),
                     slides: Default::default(),
                     geo: Default::default(),
                     coll: Default::default(),
@@ -27478,6 +27541,12 @@ fn main() {
                 }
                 if let Some(dir) = import_arg.clone() {
                     this.begin_import(PathBuf::from(dir), cx);
+                }
+                // V32: crash-report opt-in, context, and the first run.
+                laika_core::logging::set_crash_reports(this.library.prefs.crash_reports);
+                this.refresh_crash_context();
+                if import_arg.is_none() {
+                    this.check_first_run();
                 }
                 this
             })

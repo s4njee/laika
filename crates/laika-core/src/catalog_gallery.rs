@@ -20,7 +20,8 @@ pub struct GallerySummary {
     pub last_deploy_url: String,
 }
 
-const GALLERY_COLS: &str = "id, title, subtitle, eyebrow, slug, status, template_id, columns, gutter, ratio,
+const GALLERY_COLS: &str =
+    "id, title, subtitle, eyebrow, slug, status, template_id, columns, gutter, ratio,
      theme_json, sizes_json, allow_downloads, strip_gps, site_name, meta_line, output_dir,
      deploy_project, created_at, updated_at, last_build_at, last_build_dir, last_deploy_at,
      last_deploy_url";
@@ -212,7 +213,11 @@ impl Catalog {
         if !g.slug.is_empty() {
             validate_slug(&g.slug)?;
             if let Some((_, title)) = self.slug_owner(&g.slug, g.id) {
-                let who = if title.is_empty() { "another gallery".to_string() } else { title };
+                let who = if title.is_empty() {
+                    "another gallery".to_string()
+                } else {
+                    title
+                };
                 return Err(format!("{who} already uses the address {}", g.slug));
             }
         }

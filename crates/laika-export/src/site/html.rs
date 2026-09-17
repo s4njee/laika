@@ -51,7 +51,11 @@ pub fn meta_text(count: usize, meta_line: &str) -> String {
         format!("{count} photographs")
     };
     let m = meta_line.trim();
-    if m.is_empty() { n } else { format!("{n} · {m}") }
+    if m.is_empty() {
+        n
+    } else {
+        format!("{n} · {m}")
+    }
 }
 
 /// Render `index.html`. `photos` are the placed photos that built
@@ -113,9 +117,17 @@ pub fn render_index(g: &Gallery, photos: &[PagePhoto], generator: &str) -> Strin
     h.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     let _ = writeln!(h, "<title>{doc_title}</title>");
     if !g.subtitle.trim().is_empty() {
-        let _ = writeln!(h, "<meta name=\"description\" content=\"{}\">", esc(g.subtitle.trim()));
+        let _ = writeln!(
+            h,
+            "<meta name=\"description\" content=\"{}\">",
+            esc(g.subtitle.trim())
+        );
     }
-    let _ = writeln!(h, "<meta name=\"generator\" content=\"{}\">", esc(generator));
+    let _ = writeln!(
+        h,
+        "<meta name=\"generator\" content=\"{}\">",
+        esc(generator)
+    );
     let _ = writeln!(
         h,
         "<style>\n:root{{--page:{};--canvas:{};--ink:{};--accent:{};--accent-text:{};--radius:{}px;--title:{}px}}\n{}{}</style>",
@@ -194,10 +206,7 @@ pub fn render_index(g: &Gallery, photos: &[PagePhoto], generator: &str) -> Strin
         );
         let large = files.last().expect("filtered to non-empty");
         // Default src: the smallest derivative at least ~1280 wide.
-        let src = files
-            .iter()
-            .find(|f| f.width >= 1280)
-            .unwrap_or(large);
+        let src = files.iter().find(|f| f.width >= 1280).unwrap_or(large);
         let srcset: Vec<String> = files
             .iter()
             .map(|f| format!("{} {}w", esc(&f.file), f.width))

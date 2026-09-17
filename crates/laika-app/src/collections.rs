@@ -109,7 +109,12 @@ impl Laika {
     }
 
     /// Photos dropped on a collection row join it (pairs travel together).
-    pub(crate) fn drop_photos_on_collection(&mut self, ids: Vec<i64>, cid: i64, cx: &mut Context<Self>) {
+    pub(crate) fn drop_photos_on_collection(
+        &mut self,
+        ids: Vec<i64>,
+        cid: i64,
+        cx: &mut Context<Self>,
+    ) {
         let ids = self.expand_pair_targets(&ids);
         let Some(cat) = self.catalog.as_ref() else {
             return;
@@ -545,7 +550,9 @@ impl Laika {
                                 let mask = window.content_mask().bounds;
                                 let visible = b.intersect(&mask);
                                 let mut map = bounds_map.borrow_mut();
-                                if visible.size.width.as_f32() > 1. && visible.size.height.as_f32() > 1. {
+                                if visible.size.width.as_f32() > 1.
+                                    && visible.size.height.as_f32() > 1.
+                                {
                                     map.insert(cid, (frame, visible));
                                 } else {
                                     map.remove(&cid);

@@ -10,6 +10,7 @@ pub mod gallery;
 pub mod import;
 pub mod labels;
 pub mod lines;
+pub mod logging;
 pub mod pairs;
 pub mod photo;
 pub mod prefs;

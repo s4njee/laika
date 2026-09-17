@@ -203,6 +203,27 @@ impl Laika {
             .child(note(
                 "English is the only language in this build; other languages will appear here when translated.",
             ))
+            .child(heading("Diagnostics"))
+            .child(
+                div()
+                    .id("pref-crash")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.library.prefs.crash_reports;
+                        this.set_crash_reports(on, cx);
+                    }))
+                    .child(toggle::toggle(
+                        self.library.prefs.crash_reports,
+                        "Save a crash report if Laika quits unexpectedly",
+                    )),
+            )
+            .child(note(
+                "Logs and crash reports stay on this Mac and never contain passwords or keys. Nothing is sent anywhere.",
+            ))
+            .child(
+                row("Log")
+                    .child(self.chip_choice(("pref-log", 0), "Show Log", false, |this, cx| this.show_log(cx), cx))
+                    .child(self.chip_choice(("pref-log", 1), "About Laika…", false, |this, cx| this.open_about(cx), cx)),
+            )
             .child(heading("Updates"))
             .child(row("Version").child(value(format!("Laika {}", env!("CARGO_PKG_VERSION")))))
             .child(note(

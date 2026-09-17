@@ -430,6 +430,9 @@ pub struct LibraryState {
     /// V31: everything else in Preferences that is app-wide.
     #[serde(default)]
     pub prefs: crate::prefs::AppPrefs,
+    /// V32: the first-run welcome screen was shown (or skipped).
+    #[serde(default)]
+    pub welcomed: bool,
 }
 
 fn default_cache_cap() -> u64 {
@@ -464,6 +467,7 @@ impl Default for LibraryState {
             appearance: String::new(),
             accent: String::new(),
             prefs: Default::default(),
+            welcomed: false,
         }
     }
 }
@@ -545,6 +549,12 @@ impl LibraryState {
         if let Err(e) = self.write(base) {
             eprintln!("[catalog] appearance not saved: {e}");
         }
+    }
+
+    /// V32: remember that the welcome screen was dealt with.
+    pub fn set_welcomed(&mut self, base: &Path) -> Result<(), String> {
+        self.welcomed = true;
+        self.write(base)
     }
 
     /// Recents with existing files first (missing drives sink).
@@ -5867,7 +5877,10 @@ mod tests {
         assert_eq!(loaded.photos[4].cell, None);
         let list = cat.galleries();
         assert_eq!(list.len(), 1);
-        assert_eq!((list[0].photo_count, list[0].cover_photo_id), (5, Some(ids[0])));
+        assert_eq!(
+            (list[0].photo_count, list[0].cover_photo_id),
+            (5, Some(ids[0]))
+        );
         // Slugs: unique across galleries, validated.
         let other = cat.create_gallery("Other").unwrap();
         let mut o = cat.load_gallery(other).unwrap();
@@ -5880,7 +5893,10 @@ mod tests {
         // Duplicate: a draft without slug or deploy history.
         let dup = cat.duplicate_gallery(gid).unwrap();
         let d = cat.load_gallery(dup).unwrap();
-        assert_eq!((d.slug.as_str(), d.status, d.photos.len()), ("", Status::Draft, 5));
+        assert_eq!(
+            (d.slug.as_str(), d.status, d.photos.len()),
+            ("", Status::Draft, 5)
+        );
         assert_eq!(d.photos[1].caption, saved.photos[1].caption);
         // Removing a photo from the catalog drops it from galleries.
         cat.remove_photo(ids[1]).unwrap();
@@ -5889,7 +5905,10 @@ mod tests {
         assert!(after.photos.iter().all(|p| p.photo_id != ids[1]));
         // Corrupt overlapping cells repair on load.
         cat.conn
-            .execute("UPDATE gallery_photos SET col = 0, row = 0 WHERE gallery_id = ?1", [gid])
+            .execute(
+                "UPDATE gallery_photos SET col = 0, row = 0 WHERE gallery_id = ?1",
+                [gid],
+            )
             .unwrap();
         let repaired = cat.load_gallery(gid).unwrap();
         let cells: HashSet<Cell> = repaired.photos.iter().filter_map(|p| p.cell).collect();
@@ -5901,14 +5920,21 @@ mod tests {
         let from = cat.create_gallery_from_collection(album).unwrap();
         let f = cat.load_gallery(from).unwrap();
         assert_eq!(f.title, "Trip");
-        assert_eq!(f.photos.iter().map(|p| p.photo_id).collect::<Vec<_>>(), vec![ids[3], ids[0]]);
+        assert_eq!(
+            f.photos.iter().map(|p| p.photo_id).collect::<Vec<_>>(),
+            vec![ids[3], ids[0]]
+        );
         assert_eq!(f.photos[1].caption, "Harbor");
         assert_eq!(f.placed_count(), 2);
         cat.delete_gallery(gid).unwrap();
         assert!(cat.load_gallery(gid).is_err());
         let orphan: i64 = cat
             .conn
-            .query_row("SELECT count(*) FROM gallery_photos WHERE gallery_id = ?1", [gid], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM gallery_photos WHERE gallery_id = ?1",
+                [gid],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(orphan, 0);
         std::fs::remove_dir_all(&dir).ok();
