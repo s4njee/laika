@@ -1,6 +1,7 @@
-//! Placeholder: gallery build + wrangler deploy land in Phase 5.
+//! Export encoders, watermarks, and static gallery sites.
 
 pub mod formats;
+pub mod site;
 pub mod watermark;
 
 pub use formats::{ExportFormat, ExportFormatOpts, embed_xmp_jpeg, encode_pixels};

@@ -8,3 +8,6 @@ image = "0.25"
 ravif = "0.13"
 resvg = "0.46"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+laika-core = { path = "../laika-core" }

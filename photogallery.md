@@ -23,6 +23,49 @@ Design reference: `design_handoff_gallery_builder/README.md` (tokens, dimensions
 interaction spec) and `Gallery Builder Mockups.dc.html` (views `1a`–`1d` are the
 core dark flow; `2a`/`2b` are exploration only and are not scheduled here).
 
+## Review 2026-09-17 — what changed since this plan, and the build order
+
+The plan still holds; these facts in it are now stale or need a decision.
+
+**Now true in the code (plan said otherwise):**
+- HEIC decodes (ImageIO), so the import zone may list HEIC.
+- Collections and albums exist (V13/V30: `collections`, `collection_items`
+  with `position`, `caption`, cover, title, description). G05 "New gallery
+  from collection" can read album order and captions today.
+- V27 encoders (JPEG/PNG/WebP/AVIF/TIFF) and V28 watermarks exist in
+  `laika-export`; G19/G20 can offer WebP/AVIF `<picture>` sources and the
+  watermark instead of leaving empty slots.
+- V31 added a command table and native menu bar: every G13 shortcut also
+  needs a menu entry there, and gallery preferences (default output folder)
+  belong in Preferences.
+- The Publish module renders the Library grid plus `publish_modal`, whose
+  preview is a gradient mock and whose Build/Publish buttons are disabled.
+- `wrangler` is installed on the reference Mac (`/opt/homebrew/bin`).
+- Line anchors in "Current baseline" are out of date (`main.rs` is ~27k lines).
+
+**Decisions taken for the build (change if you disagree):**
+- Galleries keep their own tables (placement, spans, focal, alt text, theme
+  don't fit albums); "New gallery from collection" copies album order,
+  captions, and title once, rather than linking.
+- The HTML renderer is plain Rust with one escaping function and golden
+  tests, not `askama` — no new template dependency, same output.
+- Drag and resize use the app's existing window-level pointer pattern (crop,
+  grid reorder), not GPUI `on_drag`, so one drag model stays in the app.
+- Undo (G03) snapshots the gallery model per command (galleries are small)
+  instead of typed inverse commands; same user-visible behaviour.
+- Preview builds at 1280 only into a temp folder and opens the system browser.
+- **Fonts (G18):** only Plex Sans 400/500/600 and Mono 400/500 are embedded; no
+  Light 300 and no web fonts. Until Light is added, the lede uses 400 and the
+  published page embeds the existing TTFs with `@font-face` (browsers accept
+  TTF). Adding Light needs the font file dropped into `assets/fonts`.
+
+**Build order:** 1) G01–G03 core model, layout engine, history (tests);
+2) G19–G21 build pipeline, HTML/CSS/JS, lightbox (golden tests);
+3) G04–G12, G14–G16 editor replacing the Publish view; 4) G22–G24 preview,
+publish sheet with folder + wrangler deploy, change diff; 5) G13, G25–G27
+shortcuts/menus, truthfulness pass, tests and measurements. G17 (palette
+sampling) and G28's photographer script follow.
+
 ## Relationship to the existing backlogs
 
 | Existing item | What happens to it |

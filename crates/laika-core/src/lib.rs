@@ -6,6 +6,7 @@ pub mod album;
 pub mod apple_photos;
 pub mod catalog;
 pub mod edit;
+pub mod gallery;
 pub mod import;
 pub mod labels;
 pub mod lines;

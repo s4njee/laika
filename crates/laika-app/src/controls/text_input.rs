@@ -47,6 +47,19 @@ pub enum FieldId {
     AlbumCaption,
     /// V31: Preferences → External Editing file name template.
     EditorNaming,
+    /// G10/G15/G23: gallery page text, photo caption/alt, palette hex,
+    /// output folder and Pages project.
+    GalleryTitle,
+    GalleryEyebrow,
+    GallerySubtitle,
+    GallerySlug,
+    GallerySite,
+    GalleryMeta,
+    GalleryCaption,
+    GalleryAlt,
+    GalleryHex,
+    GalleryOutputDir,
+    GalleryProject,
     /// V22: numeric crop box (display pixels or percent).
     CropX,
     CropY,

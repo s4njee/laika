@@ -184,6 +184,10 @@ pub struct FolderDiff {
     pub error: Option<String>,
 }
 
+#[path = "catalog_gallery.rs"]
+mod gallery_store;
+pub use gallery_store::GallerySummary;
+
 pub struct Catalog {
     conn: Connection,
     pub id: i64,
@@ -850,6 +854,58 @@ pub mod migrations {
             .map_err(|e| format!("album order backfill: {e}"))
     }
 
+    /// G01: published galleries (the Publish module's model). Separate
+    /// from collections: a gallery has its own layout, captions and theme.
+    fn migrate_v9(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS galleries(
+               id INTEGER PRIMARY KEY,
+               title TEXT NOT NULL DEFAULT '',
+               subtitle TEXT NOT NULL DEFAULT '',
+               eyebrow TEXT NOT NULL DEFAULT '',
+               slug TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT 'draft',
+               template_id TEXT NOT NULL DEFAULT 'mixed',
+               columns INTEGER NOT NULL DEFAULT 3,
+               gutter INTEGER NOT NULL DEFAULT 8,
+               ratio REAL NOT NULL DEFAULT 1.5,
+               theme_json TEXT NOT NULL DEFAULT '{}',
+               sizes_json TEXT NOT NULL DEFAULT '[640,1280,2048]',
+               allow_downloads INTEGER NOT NULL DEFAULT 0,
+               strip_gps INTEGER NOT NULL DEFAULT 1,
+               site_name TEXT NOT NULL DEFAULT '',
+               meta_line TEXT NOT NULL DEFAULT '',
+               output_dir TEXT NOT NULL DEFAULT '',
+               deploy_project TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT '',
+               updated_at TEXT NOT NULL DEFAULT '',
+               last_build_at TEXT NOT NULL DEFAULT '',
+               last_build_dir TEXT NOT NULL DEFAULT '',
+               last_deploy_at TEXT NOT NULL DEFAULT '',
+               last_deploy_url TEXT NOT NULL DEFAULT ''
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS galleries_slug ON galleries(slug) WHERE slug <> '';
+             CREATE TABLE IF NOT EXISTS gallery_photos(
+               gallery_id INTEGER NOT NULL,
+               photo_id INTEGER NOT NULL,
+               position INTEGER NOT NULL DEFAULT 0,
+               col INTEGER,
+               row INTEGER,
+               span_x INTEGER NOT NULL DEFAULT 1,
+               span_y INTEGER NOT NULL DEFAULT 1,
+               caption TEXT NOT NULL DEFAULT '',
+               alt_text TEXT NOT NULL DEFAULT '',
+               focal_x REAL NOT NULL DEFAULT 0.5,
+               focal_y REAL NOT NULL DEFAULT 0.5,
+               fit TEXT NOT NULL DEFAULT 'fill',
+               open_full INTEGER NOT NULL DEFAULT 1,
+               PRIMARY KEY(gallery_id, photo_id)
+             );
+             CREATE INDEX IF NOT EXISTS gallery_photos_photo ON gallery_photos(photo_id);",
+        )
+        .map_err(|e| format!("galleries: {e}"))
+    }
+
     pub const MIGRATIONS: &[Migration] = &[
         Migration {
             version: 1,
@@ -891,10 +947,15 @@ pub mod migrations {
             name: "albums: order, captions, cover",
             apply: migrate_v8,
         },
+        Migration {
+            version: 9,
+            name: "galleries",
+            apply: migrate_v9,
+        },
     ];
 
     /// Highest schema this build opens. Bump with every `MIGRATIONS` entry.
-    pub const APP_SCHEMA_VERSION: u32 = 8;
+    pub const APP_SCHEMA_VERSION: u32 = 9;
 
     /// Schema version of an open db (0 = pre-versioning prototype era).
     pub fn read_version(conn: &Connection, db_path: &std::path::Path) -> Result<u32, String> {
@@ -4422,6 +4483,10 @@ impl Catalog {
         self.conn
             .execute("DELETE FROM collection_items WHERE photo_id = ?1", [id])
             .map_err(|e| format!("remove from catalog: {e}"))?;
+        // G01: and gallery membership.
+        self.conn
+            .execute("DELETE FROM gallery_photos WHERE photo_id = ?1", [id])
+            .map_err(|e| format!("remove from catalog: {e}"))?;
         self.conn
             .execute("DELETE FROM keywords WHERE photo_id = ?1", [id])
             .map(|_| ())
@@ -5755,6 +5820,97 @@ mod tests {
         // the library.
         cat.forget_photos_links(&[id]);
         assert!(plan(&c, &cat.photos_links(), &HashSet::new(), &s).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn g01_gallery_round_trip_slugs_and_cascade() {
+        use crate::gallery::layout::Cell;
+        use crate::gallery::{Fit, Status};
+        let dir = workdir("g01");
+        let db = dir.join("c.db");
+        let cache = dir.join("cache");
+        let ids: Vec<i64> = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            (0..6)
+                .map(|i| {
+                    let f = dir.join(format!("p{i}.jpg"));
+                    jpeg(&f, 16 + i as u32, 12);
+                    cat.import_file(&f, &cache).unwrap().unwrap()
+                })
+                .collect()
+        };
+        let (gid, saved) = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            let gid = cat.create_gallery("Hokkaido, Winter").unwrap();
+            let mut g = cat.load_gallery(gid).unwrap();
+            assert!(g.photos.is_empty());
+            g.add_photos(&ids[..5]);
+            g.apply_template("editorial");
+            g.slug = "hokkaido-2026".into();
+            g.subtitle = "Snow & <silence>".into();
+            g.theme.accent = 0x336699;
+            g.photos[1].caption = "Otaru canal — \"night\"".into();
+            g.photos[1].alt_text = "Lamps on a canal".into();
+            g.photos[1].focal = (0.25, 0.75);
+            g.photos[1].fit = Fit::Fit;
+            g.photos[2].open_full_size = false;
+            g.unplace(ids[4]);
+            cat.save_gallery(&g).unwrap();
+            (gid, g)
+        };
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        let mut loaded = cat.load_gallery(gid).unwrap();
+        loaded.updated_at = saved.updated_at.clone();
+        loaded.created_at = saved.created_at.clone();
+        assert_eq!(loaded, saved);
+        assert_eq!(loaded.photos[4].cell, None);
+        let list = cat.galleries();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].photo_count, list[0].cover_photo_id), (5, Some(ids[0])));
+        // Slugs: unique across galleries, validated.
+        let other = cat.create_gallery("Other").unwrap();
+        let mut o = cat.load_gallery(other).unwrap();
+        o.slug = "hokkaido-2026".into();
+        assert!(cat.save_gallery(&o).unwrap_err().contains("already uses"));
+        o.slug = "Not OK".into();
+        assert!(cat.save_gallery(&o).is_err());
+        o.slug = String::new();
+        cat.save_gallery(&o).unwrap();
+        // Duplicate: a draft without slug or deploy history.
+        let dup = cat.duplicate_gallery(gid).unwrap();
+        let d = cat.load_gallery(dup).unwrap();
+        assert_eq!((d.slug.as_str(), d.status, d.photos.len()), ("", Status::Draft, 5));
+        assert_eq!(d.photos[1].caption, saved.photos[1].caption);
+        // Removing a photo from the catalog drops it from galleries.
+        cat.remove_photo(ids[1]).unwrap();
+        let after = cat.load_gallery(gid).unwrap();
+        assert_eq!(after.photos.len(), 4);
+        assert!(after.photos.iter().all(|p| p.photo_id != ids[1]));
+        // Corrupt overlapping cells repair on load.
+        cat.conn
+            .execute("UPDATE gallery_photos SET col = 0, row = 0 WHERE gallery_id = ?1", [gid])
+            .unwrap();
+        let repaired = cat.load_gallery(gid).unwrap();
+        let cells: HashSet<Cell> = repaired.photos.iter().filter_map(|p| p.cell).collect();
+        assert_eq!(cells.len(), repaired.placed_count());
+        // From an album: order and album captions copied.
+        let album = cat.create_collection("Trip").unwrap();
+        cat.add_to_collection(album, &[ids[3], ids[0]]).unwrap();
+        cat.set_album_caption(album, ids[0], "Harbor").unwrap();
+        let from = cat.create_gallery_from_collection(album).unwrap();
+        let f = cat.load_gallery(from).unwrap();
+        assert_eq!(f.title, "Trip");
+        assert_eq!(f.photos.iter().map(|p| p.photo_id).collect::<Vec<_>>(), vec![ids[3], ids[0]]);
+        assert_eq!(f.photos[1].caption, "Harbor");
+        assert_eq!(f.placed_count(), 2);
+        cat.delete_gallery(gid).unwrap();
+        assert!(cat.load_gallery(gid).is_err());
+        let orphan: i64 = cat
+            .conn
+            .query_row("SELECT count(*) FROM gallery_photos WHERE gallery_id = ?1", [gid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphan, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

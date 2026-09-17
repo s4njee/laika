@@ -26,6 +26,10 @@ mod albums;
 mod collections;
 mod commands;
 mod controls;
+mod gallery_canvas;
+mod gallery_inspector;
+mod gallery_publish;
+mod gallery_ui;
 mod geometry;
 mod photos_ingest;
 mod photos_sync;
@@ -849,6 +853,8 @@ struct CellData {
     offline: bool,
     /// V05: cell represents a RAW+JPEG pair / video file.
     pair: bool,
+    /// File type chip, bottom right ("NEF", "JPG", "NEF+JPG").
+    kind: String,
     video: bool,
     duration: String,
     /// Draw the date/badge caption under the image instead of over it,
@@ -1338,6 +1344,8 @@ struct Laika {
     geo: geometry::GeoUi,
     /// V13: label names, collections, Quick Collection, target.
     coll: collections::CollState,
+    /// G04: the Publish module's gallery editor.
+    gal: gallery_ui::GalleryUi,
     /// V31: open in-window menu (index into the menu tree).
     menu_open: Option<usize>,
     /// V31: Preferences tab.
@@ -3029,6 +3037,17 @@ impl Laika {
             text_input::FieldId::InfoExposureLine => self.info_exposure_line.clone(),
             text_input::FieldId::LabelName(i) => self.coll.names.name(i).to_string(),
             text_input::FieldId::EditorNaming => self.library.prefs.editor_naming.clone(),
+            text_input::FieldId::GalleryTitle
+            | text_input::FieldId::GalleryEyebrow
+            | text_input::FieldId::GallerySubtitle
+            | text_input::FieldId::GallerySlug
+            | text_input::FieldId::GallerySite
+            | text_input::FieldId::GalleryMeta
+            | text_input::FieldId::GalleryCaption
+            | text_input::FieldId::GalleryAlt
+            | text_input::FieldId::GalleryHex
+            | text_input::FieldId::GalleryOutputDir
+            | text_input::FieldId::GalleryProject => self.gallery_field_text(id),
             text_input::FieldId::AlbumTitle => self
                 .viewed_collection()
                 .map(|c| c.title.clone())
@@ -3425,6 +3444,17 @@ impl Laika {
             F::AlbumTitle => self.commit_album_text(Some(buf), None),
             F::AlbumDescription => self.commit_album_text(None, Some(buf)),
             F::AlbumCaption => self.commit_album_caption(buf),
+            F::GalleryTitle
+            | F::GalleryEyebrow
+            | F::GallerySubtitle
+            | F::GallerySlug
+            | F::GallerySite
+            | F::GalleryMeta
+            | F::GalleryCaption
+            | F::GalleryAlt
+            | F::GalleryHex
+            | F::GalleryOutputDir
+            | F::GalleryProject => self.commit_gallery_field(id, buf, cx),
             // V13: stash only; Enter creates/saves/renames (a focus change
             // must never make a collection from a half-typed name).
             F::CollectionName => {
@@ -4107,20 +4137,11 @@ impl Laika {
     /// Open a modal: remember slider focus for restore, autofocus the
     /// first field (focus trap entry).
     fn open_publish(&mut self, cx: &mut Context<Self>) {
-        self.return_focus = self.focused_param;
-        // V30: publishing from an album starts from its title.
-        if self.state.publish.title.trim().is_empty() {
-            if let Some(title) = self
-                .viewed_collection()
-                .map(|c| c.display_title().to_string())
-            {
-                self.state.publish.slug = laika_core::state::PublishForm::derive_slug(&title);
-                self.state.publish.title = title;
-            }
-        }
-        self.publish_open = true;
-        self.sync_open = false;
-        self.focus_field(text_input::FieldId::PublishTitle, cx);
+        // G04: Publish is the gallery editor module (no modal).
+        self.flush_saves();
+        self.state.active_module = Module::Publish;
+        self.publish_open = false;
+        self.load_galleries();
         cx.notify();
     }
 
@@ -6052,10 +6073,11 @@ impl Laika {
         }
         // U09: a visible clipping overlay re-derives from the new frame.
         if self.clip_overlay {
+            let split = dev.split;
             dev.clip_image = dev
                 .shown
                 .as_ref()
-                .and_then(|img| Self::clip_overlay_image(img));
+                .and_then(|img| Self::clip_overlay_image(img, split));
             if dev.clip_image.is_none() {
                 self.clip_overlay = false;
             }
@@ -6065,7 +6087,7 @@ impl Laika {
 
     /// U09: red/blue clipping visualization derived from a shown image
     /// (CPU copy, built on toggle/receive — never per frame).
-    fn clip_overlay_image(shown: &Arc<RenderImage>) -> Option<Arc<RenderImage>> {
+    fn clip_overlay_image(shown: &Arc<RenderImage>, split: f32) -> Option<Arc<RenderImage>> {
         let bytes = shown.as_bytes(0)?;
         let size = shown.size(0);
         let (w, h) = (size.width.0 as u32, size.height.0 as u32);
@@ -6073,11 +6095,14 @@ impl Laika {
             return None;
         }
         let mut out = Vec::with_capacity(bytes.len());
-        for px in bytes.chunks_exact(4) {
+        // Only the After side is marked: left of the split is the
+        // unedited Before (the stats skip it the same way).
+        let after_x = ((split.clamp(0., 1.) * w as f32).ceil() as usize).min(w as usize);
+        for (i, px) in bytes.chunks_exact(4).enumerate() {
             // BGRA: shadows blue, highlights red.
-            if px[0] == 0 && px[1] == 0 && px[2] == 0 {
+            if i % w as usize >= after_x && px[0] == 0 && px[1] == 0 && px[2] == 0 {
                 out.extend_from_slice(&[255, 120, 30, 255]);
-            } else if px[0] == 255 && px[1] == 255 && px[2] == 255 {
+            } else if i % w as usize >= after_x && px[0] == 255 && px[1] == 255 && px[2] == 255 {
                 out.extend_from_slice(&[40, 60, 255, 255]);
             } else {
                 out.extend_from_slice(px);
@@ -12021,6 +12046,7 @@ impl Laika {
             menu: self.menu_req.clone(),
             offline: self.offline.contains(&p.id),
             pair: in_pair,
+            kind: file_kind(&p.filename, in_pair),
             video,
             duration: Self::duration_label(p.duration_ms),
             caption_below: None,
@@ -16557,7 +16583,12 @@ impl Laika {
             .filter(|d| d.photo_id == self.state.primary)
             .and_then(|d| d.clip);
         let label = match stats {
-            // Stats are fractions of the frame.
+            // With the overlay on and nothing to paint, say so — an
+            // unchanged image otherwise reads as a dead button.
+            Some((sh, hi)) if self.clip_overlay && sh == 0. && hi == 0. => {
+                "no pure black or white pixels".to_string()
+            }
+            // Stats are fractions of the After side.
             Some((sh, hi)) => format!("shadows {:.1}% · highlights {:.1}%", sh * 100., hi * 100.),
             None => "shadows — · highlights —".to_string(),
         };
@@ -16606,7 +16637,8 @@ impl Laika {
                         } else if let Some(img) = this.dev.as_ref().and_then(|d| d.shown.clone()) {
                             // Built on toggle from current pixels (never
                             // per frame); a new render refreshes it.
-                            if let Some(over) = Self::clip_overlay_image(&img) {
+                            let split = this.dev.as_ref().map(|d| d.split).unwrap_or(0.);
+                            if let Some(over) = Self::clip_overlay_image(&img, split) {
                                 if let Some(dev) = this.dev.as_mut() {
                                     dev.clip_image = Some(over);
                                 }
@@ -20281,6 +20313,22 @@ impl Laika {
             .bg(rgb(bg_panel()))
             .border_l_1()
             .border_color(hairline())
+            // The histogram and the shot info stay pinned above the
+            // scrolling panel stack.
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(14.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(hairline())
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(histogram::histogram(&self.develop_hist(), false))
+                    .child(self.clip_row(cx)),
+            )
+            .child(self.develop_shot_info())
             .child(
                 // U18/U22: the panel stack scrolls (46 sliders never fit
                 // a small window); copy/paste stays pinned below.
@@ -20291,18 +20339,6 @@ impl Laika {
                     .overflow_scroll()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .px(px(14.))
-                            .py(px(12.))
-                            .border_b_1()
-                            .border_color(hairline())
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .child(histogram::histogram(&self.develop_hist(), false))
-                            .child(self.clip_row(cx)),
-                    )
                     .child(self.wb_row(cx))
                     .child(
                         div()
@@ -20393,6 +20429,94 @@ impl Laika {
                             .on_click(cx.listener(|this, _, _, cx| this.paste_settings(cx)))
                             .child(button::primary(&format!("Paste to {}", self.paste_count()))),
                     ),
+            )
+    }
+
+    /// Pinned under the Develop histogram: file name, file type, and the
+    /// exposure (ISO, aperture, shutter speed).
+    fn develop_shot_info(&self) -> Div {
+        let p = self.primary_photo();
+        let name = p.map(|p| p.filename.clone()).unwrap_or_else(|| "No photo".to_string());
+        let kind = p
+            .and_then(|p| std::path::Path::new(&p.filename).extension().map(|e| e.to_string_lossy().to_uppercase()))
+            .unwrap_or_default();
+        let value = |v: Option<&str>| {
+            v.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| "—".to_string())
+        };
+        let cell = |label: &str, v: String| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .font_family(SANS)
+                        .text_size(px(9.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child(label.to_uppercase()),
+                )
+                .child(
+                    div()
+                        .font_family(SANS)
+                        .text_size(px(11.5))
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .overflow_hidden()
+                        .child(v),
+                )
+        };
+        div()
+            .flex_none()
+            .px(px(14.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(hairline())
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_family(SANS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child(name),
+                    )
+                    .when(!kind.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(border_control())
+                                .font_family(SANS)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(9.5))
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .child(kind),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(cell("ISO", value(p.map(|p| p.iso.trim_start_matches("ISO ")))))
+                    .child(cell("Aperture", value(p.map(|p| p.aperture.as_str()))))
+                    .child(cell("Shutter", value(p.map(|p| p.shutter.as_str())))),
             )
     }
 
@@ -21962,6 +22086,16 @@ fn grid_cell(
     let style = c.style;
     let badges = c.badges;
     let full = c.full;
+    // The type label ends the badge row (beside KW/EDIT); compact cells
+    // have no row, so there it sits on the image's bottom-right corner.
+    let kind_on_image = !c.kind.is_empty() && style == CellStyle::Compact;
+    let kind_chip_img = kind_on_image.then(|| {
+        div()
+            .absolute()
+            .right(px(4.))
+            .bottom(px(4.))
+            .child(kind_chip(&c.kind))
+    });
     let badge = |text: String, color: u32| {
         div()
             .font_family(SANS)
@@ -22017,27 +22151,30 @@ fn grid_cell(
                 clicked.set(Some((c.id, m.shift, m.platform, ev.click_count() >= 2)));
             },
         )
-        .child(match c.thumb {
-            // The 3:2 box clips: a 4:3 or portrait image must never spill
-            // past it (it covered the caption under timeline cells).
-            Some(image) => div()
-                .aspect_ratio(1.5)
-                .w_full()
-                .relative()
-                .overflow_hidden()
-                .child(
-                    img(ImageSource::Render(image))
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full(),
-                ),
-            None => div().aspect_ratio(1.5).w_full().bg(linear_gradient(
-                160.,
-                linear_color_stop(rgb(c.tint.0), 0.),
-                linear_color_stop(rgb(c.tint.1), 1.),
-            )),
-        })
+        .child(
+            match c.thumb {
+                // The 3:2 box clips: a 4:3 or portrait image must never spill
+                // past it (it covered the caption under timeline cells).
+                Some(image) => div()
+                    .aspect_ratio(1.5)
+                    .w_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        img(ImageSource::Render(image))
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    ),
+                None => div().relative().aspect_ratio(1.5).w_full().bg(linear_gradient(
+                    160.,
+                    linear_color_stop(rgb(c.tint.0), 0.),
+                    linear_color_stop(rgb(c.tint.1), 1.),
+                )),
+            }
+            .children(kind_chip_img),
+        )
         .child({
             // V16: compact cells are image-only with a corner flag dot;
             // expanded cells carry the overlay text plus enabled badges
@@ -22158,6 +22295,11 @@ fn grid_cell(
                 if badges.sync {
                     row = row.child(div().size(px(5.)).rounded_full().bg(rgb(c.dot)));
                 }
+                if !kind_on_image && !c.kind.is_empty() {
+                    row = row
+                        .child(div().flex_1())
+                        .child(badge(c.kind.clone(), TEXT_SECONDARY));
+                }
                 bar = bar.child(row);
                 if below.is_some() {
                     bar.into_any_element()
@@ -22172,6 +22314,38 @@ fn grid_cell(
                 }
             }
         })
+}
+
+/// Short file-type label from a file name: the extension upper-cased
+/// (JPEG reads JPG); a RAW+JPEG pair cell reads "NEF+JPG".
+fn file_kind(filename: &str, pair: bool) -> String {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .map(|e| e.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    let ext = match ext.as_str() {
+        "JPEG" => "JPG".to_string(),
+        "TIFF" => "TIF".to_string(),
+        _ => ext,
+    };
+    if pair && !ext.is_empty() && ext != "JPG" {
+        format!("{ext}+JPG")
+    } else {
+        ext
+    }
+}
+
+fn kind_chip(kind: &str) -> Div {
+    div()
+        .px(px(4.))
+        .py(px(1.))
+        .rounded(px(2.))
+        .bg(rgba(0x000000B3))
+        .font_family(SANS)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(8.5))
+        .text_color(rgb(0xDEE4EA))
+        .child(kind.to_string())
 }
 
 /// Developer frame profiling (`LAIKA_PROFILE=1`): logs sections over 1 ms.
@@ -22590,6 +22764,7 @@ impl Render for Laika {
         // the single transition (U03) — selection and primary can never
         // bypass save/load again.
         if let Some(req) = self.menu_req.take() {
+            self.coll.menu_open = false;
             self.context_menu = Some(req);
         }
         if let Some((id, shift, cmd, double)) = self.clicked.take() {
@@ -22693,6 +22868,15 @@ impl Render for Laika {
                                 return;
                             }
                         }
+                        // G08/G09: gallery drags, resizes, and sliders.
+                        if this.gallery_mouse_move(
+                            pos,
+                            ev.pressed_button == Some(MouseButton::Left),
+                            ev.modifiers.shift,
+                            cx,
+                        ) {
+                            return;
+                        }
                         // V04: folder hover highlight while a staged
                         // drag moves past the click threshold.
                         let dragging_photos = this.drag_from.as_ref().is_some_and(|(_, start)| {
@@ -22701,9 +22885,22 @@ impl Render for Laika {
                         if dragging_photos {
                             this.tooltip = None;
                             let hover = this.folder_at(pos);
+                            // Collection rows take drops too (add, not move).
+                            let coll_hover = if hover.is_none() {
+                                this.collection_at(pos)
+                            } else {
+                                None
+                            };
+                            if this.coll.drop_hover.get() != coll_hover {
+                                this.coll.drop_hover.set(coll_hover);
+                                cx.notify();
+                            }
                             // V30: over the grid in album order, the drag
                             // reorders (a folder under the pointer wins).
-                            let slot = if hover.is_none() && this.album_reorder_target().is_some() {
+                            let slot = if hover.is_none()
+                                && coll_hover.is_none()
+                                && this.album_reorder_target().is_some()
+                            {
                                 this.grid_insert_index(pos)
                             } else {
                                 None
@@ -22720,6 +22917,8 @@ impl Render for Laika {
                                 this.drop_folder.set(cur);
                             }
                         } else if this.drop_folder.take().is_some() {
+                            cx.notify();
+                        } else if this.coll.drop_hover.take().is_some() {
                             cx.notify();
                         }
                         // Slider, size and grading-wheel drags skip the stage
@@ -22862,6 +23061,10 @@ impl Render for Laika {
                     if phase == DispatchPhase::Bubble {
                         let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
                         e.update(cx, |this, cx| {
+                            // G08: finish a gallery gesture.
+                            if this.gallery_mouse_up(pos, cx) {
+                                this.suppress_click = true;
+                            }
                             if let Some(i) = this.dragging.take() {
                                 let label = PARAMS[i].label;
                                 let value = edit::format(i, this.values[i]);
@@ -22893,8 +23096,13 @@ impl Render for Laika {
                             if let Some((targets, start)) = this.drag_from.take() {
                                 let moved = (start.0 - pos.0).abs() + (start.1 - pos.1).abs() > 8.;
                                 let drop = this.drop_folder.take();
+                                let coll_drop = this.coll.drop_hover.take();
                                 if moved {
-                                    if let Some(folder) = drop {
+                                    if let Some(cid) = coll_drop {
+                                        this.coll.drop_at.set(None);
+                                        this.drop_photos_on_collection(targets, cid, cx);
+                                        this.suppress_click = true;
+                                    } else if let Some(folder) = drop {
                                         this.coll.drop_at.set(None);
                                         this.drop_photos_on_folder(targets, folder, cx);
                                         this.suppress_click = true;
@@ -22959,7 +23167,7 @@ impl Render for Laika {
             Some(match self.state.active_module {
                 Module::Library => self.library(window, cx),
                 Module::Develop => self.develop(window, cx),
-                Module::Publish => self.library(window, cx),
+                Module::Publish => self.publish_module(window, cx),
             })
         };
         prof("module", t_module);
@@ -23153,6 +23361,10 @@ impl Render for Laika {
                             this.field_key(key, shift, cmd, key_char, None, cx);
                         }
                     }
+                    return;
+                }
+                // G13: the gallery editor's keys (picker, sheet, canvas).
+                if this.gallery_key(key, shift, cmd, cx) {
                     return;
                 }
                 // Cmd/Ctrl shortcuts first so `cmd-d` can't fall through to
@@ -23474,20 +23686,35 @@ impl Laika {
                     },
                 )),
             );
-        // V13: add to the target collection (B does the same toggle).
-        if let Some(target) = self.target_collection() {
-            let cid = target.id;
-            menu = menu.child(
-                item("ctx-collection", format!("Add to {}", target.name), true).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        this.close_context_menu();
-                        this.menu_target(pid, cx);
-                        this.add_targets_to(cid, cx);
+        // V13: every collection, in a submenu (✓ = all targets already
+        // in it; choosing a checked one takes them out).
+        let coll_open = self.coll.menu_open;
+        menu = menu.child(
+            div()
+                .id("ctx-collections")
+                .flex()
+                .justify_between()
+                .px(px(12.))
+                .py(px(6.))
+                .rounded(px(3.))
+                .font_family(SANS)
+                .text_size(px(12.))
+                .text_color(rgb(TEXT_PRIMARY))
+                .when(coll_open, |d| d.bg(rgb(bg_row_hover())))
+                .hover(|s| s.bg(rgb(bg_row_hover())))
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if *hovered && !this.coll.menu_open {
+                        this.coll.menu_open = true;
                         cx.notify();
-                    }),
-                ),
-            );
-        }
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.coll.menu_open = !this.coll.menu_open;
+                    cx.notify();
+                }))
+                .child("Add to Collection")
+                .child(div().text_color(rgb(TEXT_DIM)).child("\u{203A}")),
+        );
         menu = menu.child(
             item("ctx-apple", "Add to Apple Photos".to_string(), true).on_click(cx.listener(
                 move |this, _, _, cx| {
@@ -23538,6 +23765,103 @@ impl Laika {
                     el
                 }
             });
+        let flyout = coll_open.then(|| {
+            let targets = self.expand_pair_targets(&if self.state.selection.contains(&pid) {
+                self.targets()
+            } else {
+                vec![pid]
+            });
+            const FW: f32 = 220.;
+            let fx = if left + W + FW + 8. <= vp.width.as_f32() {
+                left + W + 2.
+            } else {
+                (left - FW - 2.).max(6.)
+            };
+            let rows = self.coll.list.len() as f32 * 28. + 60.;
+            let fy = (top + 96.).min(vp.height.as_f32() - rows - 6.).max(6.);
+            let target = self.target_collection().map(|c| c.id);
+            let mut fly = div()
+                .id("ctx-coll-flyout")
+                .occlude()
+                .absolute()
+                .left(px(fx))
+                .top(px(fy))
+                .w(px(FW))
+                .max_h(px(vp.height.as_f32() - 12.))
+                .overflow_y_scroll()
+                .p(px(4.))
+                .rounded(px(6.))
+                .bg(rgb(bg_chrome()))
+                .border_1()
+                .border_color(border_control())
+                .shadow_lg();
+            for (i, c) in self.coll.list.iter().enumerate() {
+                let cid = c.id;
+                // Read membership directly: `in_collection` keeps a single
+                // cache slot that the grid filter depends on.
+                let all_in = !targets.is_empty() && {
+                    if Some(cid) == self.coll.quick {
+                        targets.iter().all(|t| self.coll.quick_members.contains(t))
+                    } else {
+                        let members = self
+                            .catalog
+                            .as_ref()
+                            .map(|cat| cat.collection_members(cid))
+                            .unwrap_or_default();
+                        targets.iter().all(|t| members.contains(t))
+                    }
+                };
+                fly = fly.child(
+                    div()
+                        .id(("ctx-coll", i))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(3.))
+                        .font_family(SANS)
+                        .text_size(px(12.))
+                        .text_color(rgb(TEXT_PRIMARY))
+                        .hover(|s| s.bg(rgb(bg_row_hover())))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_context_menu();
+                            this.menu_target(pid, cx);
+                            this.toggle_targets_in(cid, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_color(rgb(accent_line()))
+                                .child(if all_in { "\u{2713}" } else { "" }),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(c.name.clone()))
+                        .when(target == Some(cid), |d| {
+                            d.child(div().text_size(px(10.)).text_color(rgb(TEXT_DIM)).child("B"))
+                        }),
+                );
+            }
+            fly.child(div().my(px(4.)).h(px(1.)).bg(hairline())).child(
+                div()
+                    .id("ctx-coll-new")
+                    .px(px(10.))
+                    .py(px(6.))
+                    .pl(px(30.))
+                    .rounded(px(3.))
+                    .font_family(SANS)
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .hover(|s| s.bg(rgb(bg_row_hover())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_context_menu();
+                        this.menu_target(pid, cx);
+                        this.new_collection_from_menu(cx);
+                        cx.notify();
+                    }))
+                    .child("New Collection\u{2026}"),
+            )
+        });
         Some(
             div()
                 .absolute()
@@ -23566,12 +23890,14 @@ impl Laika {
                             cx.notify();
                         })),
                 )
-                .child(menu),
+                .child(menu)
+                .children(flyout),
         )
     }
 
     /// Close the context menu and any tooltip its items left behind.
     fn close_context_menu(&mut self) {
+        self.coll.menu_open = false;
         self.context_menu = None;
         self.tooltip = None;
         self.hover_tip.set(None);
@@ -26642,6 +26968,17 @@ fn field_tag(id: text_input::FieldId) -> usize {
         text_input::FieldId::AlbumDescription => 78,
         text_input::FieldId::AlbumCaption => 79,
         text_input::FieldId::EditorNaming => 80,
+        text_input::FieldId::GalleryTitle => 200,
+        text_input::FieldId::GalleryEyebrow => 201,
+        text_input::FieldId::GallerySubtitle => 202,
+        text_input::FieldId::GallerySlug => 203,
+        text_input::FieldId::GallerySite => 204,
+        text_input::FieldId::GalleryMeta => 205,
+        text_input::FieldId::GalleryCaption => 206,
+        text_input::FieldId::GalleryAlt => 207,
+        text_input::FieldId::GalleryHex => 208,
+        text_input::FieldId::GalleryOutputDir => 209,
+        text_input::FieldId::GalleryProject => 210,
         text_input::FieldId::CropX => 66,
         text_input::FieldId::CropY => 67,
         text_input::FieldId::CropW => 68,
@@ -26989,6 +27326,7 @@ fn main() {
                     info_file_line: laika_core::slideshow::DEFAULT_FILE_LINE.to_string(),
                     info_exposure_line: laika_core::slideshow::DEFAULT_EXPOSURE_LINE
                         .to_string(),
+                    gal: Default::default(),
                     slides: Default::default(),
                     geo: Default::default(),
                     coll: Default::default(),
@@ -27511,5 +27849,19 @@ mod export_preset_tests {
             assert!(Laika::validate_export_settings(&snap).is_ok());
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod file_kind_tests {
+    use super::file_kind;
+
+    #[test]
+    fn labels_by_extension() {
+        assert_eq!(file_kind("IMG_5442.NEF", false), "NEF");
+        assert_eq!(file_kind("shot.jpeg", false), "JPG");
+        assert_eq!(file_kind("IMG_1.nef", true), "NEF+JPG");
+        assert_eq!(file_kind("a.JPG", true), "JPG");
+        assert_eq!(file_kind("no-extension", false), "");
     }
 }

@@ -39,6 +39,13 @@ pub(crate) struct CollState {
     pub captions: RefCell<Option<(i64, HashMap<i64, String>)>>,
     /// V30: grid insertion slot while a reorder drag hovers.
     pub drop_at: Rc<Cell<Option<usize>>>,
+    /// Collection rows' visible window bounds, stamped with the frame
+    /// they were painted in (photo drops hit-test against the latest).
+    pub row_bounds: Rc<RefCell<HashMap<i64, (u64, Bounds<Pixels>)>>>,
+    /// The collection row a photo drag is over.
+    pub drop_hover: Rc<Cell<Option<i64>>>,
+    /// Photo context menu: the "Add to Collection" submenu is open.
+    pub menu_open: bool,
 }
 
 /// A round color swatch for a label (hollow ring for "no label").
@@ -81,6 +88,61 @@ impl Laika {
                 self.state.filters.collection_name.clear();
             }
         }
+        // G05: the galleries list follows the open catalog.
+        self.load_galleries();
+    }
+
+    /// The collection row under a window position during a photo drag.
+    pub(crate) fn collection_at(&self, pos: (f32, f32)) -> Option<i64> {
+        let map = self.coll.row_bounds.borrow();
+        let latest = map.values().map(|(g, _)| *g).max()?;
+        map.iter()
+            .filter(|(_, (g, _))| *g == latest)
+            .find(|(_, (_, b))| {
+                let (x, y) = (b.origin.x.as_f32(), b.origin.y.as_f32());
+                pos.0 >= x
+                    && pos.1 >= y
+                    && pos.0 <= x + b.size.width.as_f32()
+                    && pos.1 <= y + b.size.height.as_f32()
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Photos dropped on a collection row join it (pairs travel together).
+    pub(crate) fn drop_photos_on_collection(&mut self, ids: Vec<i64>, cid: i64, cx: &mut Context<Self>) {
+        let ids = self.expand_pair_targets(&ids);
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        let name = self
+            .coll
+            .list
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        self.status_note = match cat.add_to_collection(cid, &ids) {
+            Ok(0) => format!("already in {name}"),
+            Ok(n) => format!("added {n} photo{} to {name}", if n == 1 { "" } else { "s" }),
+            Err(e) => e,
+        };
+        self.refresh_collections(cx);
+    }
+
+    /// Context menu: add the targets to a collection, or take them out
+    /// when every target is already in it.
+    pub(crate) fn toggle_targets_in(&mut self, cid: i64, cx: &mut Context<Self>) {
+        let ids = self.expand_pair_targets(&self.targets());
+        if !ids.is_empty() && ids.iter().all(|pid| self.in_collection(cid, *pid)) {
+            self.remove_targets_from(cid, cx);
+        } else {
+            self.add_targets_to(cid, cx);
+        }
+    }
+
+    /// Context menu entry point for a new collection from the targets.
+    pub(crate) fn new_collection_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.open_name_field(NameMode::New, cx);
     }
 
     fn refresh_collections(&mut self, cx: &mut Context<Self>) {
@@ -460,17 +522,47 @@ impl Laika {
             let active = selected == Some(c.id);
             let is_target = target == Some(c.id);
             let (cid, name) = (c.id, c.name.clone());
+            let drop_hot = self.coll.drop_hover.get() == Some(cid);
+            let bounds_map = self.coll.row_bounds.clone();
+            let frame = self.render_gen.get();
             rows = rows.child(
                 div()
+                    .relative()
                     .flex()
                     .items_center()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color::<Hsla>(if drop_hot {
+                        rgb(accent_line()).into()
+                    } else {
+                        rgba(0x00000000).into()
+                    })
+                    // Photo-drop target: record the row's visible bounds
+                    // (clipped to the scrolling rail).
+                    .child(
+                        canvas(
+                            move |b, window, _| {
+                                let mask = window.content_mask().bounds;
+                                let visible = b.intersect(&mask);
+                                let mut map = bounds_map.borrow_mut();
+                                if visible.size.width.as_f32() > 1. && visible.size.height.as_f32() > 1. {
+                                    map.insert(cid, (frame, visible));
+                                } else {
+                                    map.remove(&cid);
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     .child(
                         div()
                             .id(("collection", i))
                             .flex_1()
                             .min_w_0()
                             .rounded(px(3.))
-                            .on_hover(self.tip("Filter to this collection"))
+                            .on_hover(self.tip("Filter to this collection · drop photos to add"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let f = &mut this.state.filters;
                                 if f.collection == Some(cid) {

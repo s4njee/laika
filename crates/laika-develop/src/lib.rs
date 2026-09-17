@@ -891,6 +891,9 @@ fn render_with(
     let t1 = Instant::now();
 
     let (w, h, row) = (width as usize, height as usize, padded_row as usize);
+    // The histogram and clip stats describe the developed (After) side
+    // only: columns left of the split show the unedited Before.
+    let after_x = ((u.rows[3][0].clamp(0., 1.) * w as f32).ceil() as usize).min(w);
     let mut rgba = Vec::with_capacity(w * h * 4);
     let mut hist = [0f32; 48];
     let (mut shadow, mut highlight) = (0usize, 0usize);
@@ -901,7 +904,7 @@ fn render_with(
             let line = &mapped[y * row..y * row + w * 4];
             rgba.extend_from_slice(line);
             if y % 2 == 0 {
-                for px in line.chunks_exact(4).step_by(2) {
+                for px in line[after_x * 4..].chunks_exact(4).step_by(2) {
                     let l = 0.0722 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.2126 * px[2] as f32;
                     hist[((l / 256.) * 48.).min(47.) as usize] += 1.;
                 }
@@ -915,13 +918,15 @@ fn render_with(
         }
     } else {
         // Clip stats are symmetric in R/B; only previews display them.
-        for px in rgba.chunks_exact(4) {
-            let (lo, hi) = (px[0].min(px[1]).min(px[2]), px[0].max(px[1]).max(px[2]));
-            shadow += (hi == 0) as usize;
-            highlight += (lo == 255) as usize;
+        for line in rgba.chunks_exact(w * 4) {
+            for px in line[after_x * 4..].chunks_exact(4) {
+                let (lo, hi) = (px[0].min(px[1]).min(px[2]), px[0].max(px[1]).max(px[2]));
+                shadow += (hi == 0) as usize;
+                highlight += (lo == 255) as usize;
+            }
         }
     }
-    let n = (w * h).max(1) as f32;
+    let n = ((w - after_x) * h).max(1) as f32;
     let max = hist.iter().cloned().fold(1., f32::max);
     for b in &mut hist {
         *b = (*b / max).sqrt();

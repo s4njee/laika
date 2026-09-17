@@ -4156,10 +4156,13 @@ dependencies = [
 name = "laika-export"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "image",
+ "laika-core",
  "ravif",
  "resvg 0.46.0",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
