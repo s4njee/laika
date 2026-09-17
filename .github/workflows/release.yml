@@ -1,0 +1,79 @@
+name: release
+
+# Every push to main publishes a rolling "nightly" prerelease; a `v*` tag
+# publishes a versioned release. Both attach Laika.app as .zip and .dmg.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build
+        run: cargo build --release -p laika-app
+
+      - name: Bundle
+        id: bundle
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            base=$(grep -m1 '^version' crates/laika-app/Cargo.toml | cut -d'"' -f2)
+            version="${base}-nightly.$(date -u +%Y%m%d).${GITHUB_SHA::7}"
+          fi
+          scripts/bundle-macos.sh "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Laika-${{ steps.bundle.outputs.version }}-macos
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.sha256
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Laika ${GITHUB_REF_NAME} for macOS (Apple silicon).
+
+          The app is ad-hoc signed, not notarized. After downloading, open it once
+          with right-click → Open (or run \`xattr -cr /Applications/Laika.app\`)."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.dmg dist/*.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.dmg dist/*.sha256 \
+              --title "Laika ${GITHUB_REF_NAME}" --notes "$notes"
+          fi
+
+      - name: Publish nightly prerelease
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create nightly dist/*.zip dist/*.dmg dist/*.sha256 \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Laika nightly (${GITHUB_SHA::7})" \
+            --notes "Latest build of main at ${GITHUB_SHA}. Ad-hoc signed, not notarized: right-click → Open on first launch."
