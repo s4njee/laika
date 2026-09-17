@@ -13,6 +13,10 @@ pub(crate) struct DiagUi {
     /// `sw_vers` result, read once when About opens.
     pub os_version: String,
     pub note: String,
+    /// The catalog that failed to open and why (e.g. another Laika has it).
+    pub catalog_problem: Option<(PathBuf, String)>,
+    /// The "catalog unavailable" explanation is showing.
+    pub problem_open: bool,
 }
 
 /// Where sample RAWs ship: inside the app bundle, else the workspace
@@ -327,6 +331,12 @@ impl Laika {
     /// Show the welcome screen on first launch with an empty catalog.
     /// Existing libraries (photos already present) are marked welcomed.
     pub(crate) fn check_first_run(&mut self) {
+        // A catalog that couldn't open (locked by another Laika, unreadable)
+        // is explained instead — it is not an empty first run.
+        if self.catalog.is_none() {
+            self.diag.problem_open = self.diag.catalog_problem.is_some();
+            return;
+        }
         if self.library.welcomed {
             return;
         }
@@ -346,8 +356,140 @@ impl Laika {
         }
     }
 
+    /// Explain why there is no catalog (import and other writes need one).
+    pub(crate) fn show_catalog_problem(&mut self, cx: &mut Context<Self>) {
+        self.diag.welcome_open = false;
+        self.diag.problem_open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn catalog_problem_screen(&self, cx: &mut Context<Self>) -> Div {
+        let (title, detail, path) = match self.diag.catalog_problem.as_ref() {
+            Some((db, why)) if why.contains("open elsewhere") => (
+                "This catalog is open in another copy of Laika",
+                format!(
+                    "{why}. Only one Laika can use a catalog at a time, so nothing was changed. Quit the other copy, then Try Again — or open a different catalog."
+                ),
+                db.display().to_string(),
+            ),
+            Some((db, why)) => (
+                "The catalog couldn't be opened",
+                format!("{why}."),
+                db.display().to_string(),
+            ),
+            None => (
+                "No catalog is open",
+                "Create a catalog or open an existing one to import photos.".to_string(),
+                String::new(),
+            ),
+        };
+        let retry = self.diag.catalog_problem.as_ref().map(|(db, _)| db.clone());
+        let button = |id: &'static str, label: &str| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(7.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(border_control())
+                .text_size(px(11.5))
+                .text_color(rgb(TEXT_SECONDARY))
+                .hover(|s| s.bg(rgb(bg_row_hover())))
+                .child(label.to_string())
+        };
+        let content = div()
+            .p(px(26.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(relative(1.5))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(detail),
+            )
+            .when(!path.is_empty(), |d| {
+                d.child(
+                    div()
+                        .p(px(8.))
+                        .rounded(px(4.))
+                        .bg(rgb(bg_well()))
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT_TERTIARY))
+                        .child(path),
+                )
+            })
+            .when(
+                !self.manage_note.is_empty() && self.catalog.is_none(),
+                |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(WARNING))
+                            .child(self.manage_note.clone()),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .pt(px(4.))
+                    .when_some(retry, |d, db| {
+                        d.child(button("problem-retry", "Try Again").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                let name = db
+                                    .file_stem()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("Laika")
+                                    .to_string();
+                                let root = db.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                                this.open_catalog_file(db.clone(), name, root, cx);
+                                if this.catalog.is_some() {
+                                    this.diag.problem_open = false;
+                                    this.status_note = format!("opened {}", this.catalog_name);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                    })
+                    .child(
+                        button("problem-manage", "Open or Create Catalog…").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.diag.problem_open = false;
+                                this.manage_open = true;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("problem-close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.diag.problem_open = false;
+                                cx.notify();
+                            }))
+                            .child(button::outline("Close")),
+                    ),
+            );
+        modal::modal_shell_w(content, 560.)
+    }
+
     /// Copy the bundled sample RAWs next to the catalog and import them.
     pub(crate) fn import_samples(&mut self, cx: &mut Context<Self>) {
+        if self.catalog.is_none() {
+            self.show_catalog_problem(cx);
+            return;
+        }
         let Some(src) = bundled_samples() else {
             self.diag.note = "sample photos aren't included in this build".to_string();
             cx.notify();

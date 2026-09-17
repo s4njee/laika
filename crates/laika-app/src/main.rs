@@ -4189,6 +4189,7 @@ impl Laika {
     /// Close every modal and restore pre-modal slider focus.
     fn close_modals(&mut self, cx: &mut Context<Self>) {
         self.diag.about_open = false;
+        self.diag.problem_open = false;
         // Esc on the welcome screen is "Skip for now".
         if self.diag.welcome_open {
             self.finish_welcome();
@@ -7715,6 +7716,7 @@ impl Laika {
     fn open_import_dialog(&mut self, cx: &mut Context<Self>) {
         if self.catalog.is_none() {
             self.status_note = "no catalog is open — open one first".to_string();
+            self.show_catalog_problem(cx);
             cx.notify();
             return;
         }
@@ -8155,35 +8157,42 @@ impl Laika {
             cx.notify();
             return;
         }
+        // Lock first (see `open_locked_catalog`): never migrate a catalog
+        // another Laika has open.
+        if let Some(dir) = db.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let lock = match laika_core::catalog::CatalogLock::acquire(&db) {
+            Ok(lock) => lock,
+            Err(e) => {
+                // Old catalog stays open and locked; nothing was disturbed.
+                eprintln!("[laika] catalog {} not opened: {e}", db.display());
+                self.manage_note = e.clone();
+                self.diag.catalog_problem = Some((db.clone(), e));
+                cx.notify();
+                return;
+            }
+        };
         let cat = match Catalog::open(&db, &name_hint, &root_hint) {
             Ok(c) => c,
             Err(e) => {
+                drop(lock);
                 self.manage_note = format!("open catalog: {e}");
                 cx.notify();
                 return;
             }
         };
-        match laika_core::catalog::CatalogLock::acquire(&db) {
-            Ok(lock) => {
-                self.catalog_lock.take();
-                self.catalog_lock = Some(lock);
-                self.new_catalog_dir = None;
-                self.catalog_name_draft.clear();
-                self.defocus_field();
-                let base = self.app_base.clone();
-                self.library.push_recent(&db, &base);
-                self.new_catalog_dir = None;
-                self.catalog_name_draft.clear();
-                self.adopt_catalog(cat, cx);
-                self.status_note = format!("opened {}", self.catalog_name);
-                cx.notify();
-            }
-            Err(e) => {
-                // Old catalog stays open and locked; nothing was disturbed.
-                self.manage_note = e;
-                cx.notify();
-            }
-        }
+        self.catalog_lock.take();
+        self.catalog_lock = Some(lock);
+        self.new_catalog_dir = None;
+        self.catalog_name_draft.clear();
+        self.defocus_field();
+        let base = self.app_base.clone();
+        self.library.push_recent(&db, &base);
+        self.adopt_catalog(cat, cx);
+        self.status_note = format!("opened {}", self.catalog_name);
+        cx.notify();
+        self.diag.catalog_problem = None;
     }
 
     /// V07: create a catalog file from the picked dir + name draft.
@@ -8497,6 +8506,7 @@ impl Laika {
         if self.catalog.is_none() {
             // V07: locked-out launch has no catalog to write to.
             self.status_note = "no catalog is open — open one first".to_string();
+            self.show_catalog_problem(cx);
             cx.notify();
             return;
         }
@@ -23257,6 +23267,7 @@ impl Render for Laika {
                 if this.publish_open
                     || this.diag.about_open
                     || this.diag.welcome_open
+                    || this.diag.problem_open
                     || this.sync_open
                     || this.export_open
                     || this.help_open
@@ -23598,6 +23609,9 @@ impl Render for Laika {
             })
             .when(self.diag.about_open, |d| d.child(self.about_modal(cx)))
             .when(self.diag.welcome_open, |d| d.child(self.welcome_screen(cx)))
+            .when(self.diag.problem_open, |d| {
+                d.child(self.catalog_problem_screen(cx))
+            })
             .when(self.apple.open, |d| d.child(self.apple_modal(window, cx)))
             .when(self.rename_open, |d| d.child(self.rename_modal(window, cx)))
             .when(self.manage_open, |d| d.child(self.manage_modal(window, cx)))
@@ -27117,12 +27131,24 @@ fn open_locked_catalog(
         .parent()
         .map(|d| d.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(home));
+    // Lock before opening: opening migrates, and a catalog another Laika
+    // has open must never be migrated underneath it.
+    if let Some(dir) = db.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let lock = match laika_core::catalog::CatalogLock::acquire(db) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("[laika] catalog {} not opened: {e}", db.display());
+            return (None, None, Some(e));
+        }
+    };
     match Catalog::open(db, &name, &root) {
-        Ok(cat) => match laika_core::catalog::CatalogLock::acquire(db) {
-            Ok(lock) => (Some(cat), Some(lock), None),
-            Err(e) => (None, None, Some(e)),
-        },
-        Err(e) => (None, None, Some(format!("open catalog: {e}"))),
+        Ok(cat) => (Some(cat), Some(lock), None),
+        Err(e) => {
+            drop(lock);
+            (None, None, Some(format!("open catalog: {e}")))
+        }
     }
 }
 
@@ -27222,6 +27248,11 @@ fn main() {
                             && startup_db.is_none());
                 let (catalog, catalog_lock, mut lock_note) =
                     open_locked_catalog(startup_db.as_deref(), &db_path, &home);
+                // V32: why no catalog opened, for the blocking explanation.
+                let startup_problem = match (&catalog, &lock_note, startup_db.as_ref()) {
+                    (None, Some(note), Some(db)) => Some((db.clone(), note.clone())),
+                    _ => None,
+                };
                 if catalog.is_some() {
                     if let Some(p) = startup_db.as_ref() {
                         library.push_recent(p, &app_base);
@@ -27543,6 +27574,7 @@ fn main() {
                     this.begin_import(PathBuf::from(dir), cx);
                 }
                 // V32: crash-report opt-in, context, and the first run.
+                this.diag.catalog_problem = startup_problem.clone();
                 laika_core::logging::set_crash_reports(this.library.prefs.crash_reports);
                 this.refresh_crash_context();
                 if import_arg.is_none() {
