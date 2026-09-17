@@ -6008,7 +6008,7 @@ impl Laika {
                                     p.filename.rsplit('.').next().unwrap_or("")
                                 );
                             }
-                            this.status_note = format!("decode failed: {e}");
+                            this.status_note = laika_raw::decode::failure_reason(&e);
                         }
                     }
                     cx.notify();
@@ -7420,7 +7420,7 @@ impl Laika {
                 None => laika_raw::decode::linear_from_raster(&src, None),
             }) {
                 Ok(Ok(img)) => img,
-                Ok(Err(e)) | Err(e) => return fail(format!("decode failed: {e}")),
+                Ok(Err(e)) | Err(e) => return fail(laika_raw::decode::failure_reason(&e)),
             }
         };
         let frame = match renderer.render_export(linear.clone(), item.params, 0., item.geom) {
@@ -12266,9 +12266,21 @@ impl Laika {
     /// measure).
     fn viewport_meter(&self) -> impl IntoElement + use<> {
         let slot = self.viewport_box.clone();
-        canvas(move |b, _, _| slot.set(b), |_, _, _, _| {})
-            .absolute()
-            .size_full()
+        canvas(
+            move |b, window, _| {
+                // The fitted photo is sized from these bounds: when the
+                // stage changes size (crop panel opening, rails toggling,
+                // window resize) paint again so it refits this frame
+                // instead of overflowing until something else redraws.
+                if slot.get().size != b.size {
+                    window.refresh();
+                }
+                slot.set(b);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
     }
 
     /// U07: Fit / 100% / 200% segmented control shared by Loupe and
@@ -12537,10 +12549,17 @@ impl Laika {
                         .into_any_element()
                 }
             };
+        // Inset, not `size_full` inside a padded parent: an absolute child
+        // sized to 100% spills past the padding on the right and bottom,
+        // so the fitted photo overflowed whenever the stage got shorter
+        // (e.g. the crop panel opening).
         let stage = div()
             .id("loupe-stage")
             .absolute()
-            .size_full()
+            .top(px(26.))
+            .left(px(26.))
+            .right(px(26.))
+            .bottom(px(26.))
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Right,
@@ -12604,7 +12623,6 @@ impl Laika {
             .relative()
             .flex_1()
             .min_h_0()
-            .p(px(26.))
             .child(stage)
             .child(
                 div()
@@ -14932,10 +14950,17 @@ impl Laika {
             ),
             _ => None,
         };
+        // Inset, not `size_full` inside a padded parent: an absolute child
+        // sized to 100% spills past the padding on the right and bottom,
+        // so the fitted photo overflowed whenever the stage got shorter
+        // (e.g. the crop panel opening).
         let stage = div()
             .id("develop-stage")
             .absolute()
-            .size_full()
+            .top(px(26.))
+            .left(px(26.))
+            .right(px(26.))
+            .bottom(px(26.))
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Right,
@@ -15022,7 +15047,6 @@ impl Laika {
             .relative()
             .flex_1()
             .min_h_0()
-            .p(px(26.))
             .child(stage)
             .when(!self.crop_open, |d| {
                 d.child(div().absolute().left(px(14.)).top(px(12.)).child(tr(

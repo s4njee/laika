@@ -165,7 +165,7 @@ fn render_photo(
             }
         }) {
             Ok(Ok(img)) => img,
-            Ok(Err(e)) | Err(e) => return Err(format!("decode failed: {e}")),
+            Ok(Err(e)) | Err(e) => return Err(laika_raw::decode::failure_reason(&e)),
         }
     };
     let frame = renderer

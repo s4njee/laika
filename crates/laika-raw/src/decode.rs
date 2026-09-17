@@ -52,7 +52,7 @@ const LINEAR_STEPS: &[rawler::imgop::develop::ProcessingStep] = &[
 ];
 
 fn linear_floats(path: &Path) -> Result<(u32, u32, Vec<f32>, rawler::RawImage), String> {
-    let raw = rawler::decode_file(path).map_err(|e| format!("decode {}: {e}", path.display()))?;
+    let raw = rawler::decode_file(path).map_err(|e| decode_error_message(path, &e.to_string()))?;
     let dev = rawler::imgop::develop::RawDevelop::new_with(LINEAR_STEPS);
     let inter = dev
         .develop_intermediate(&raw)
@@ -136,6 +136,39 @@ fn finish(
 }
 
 /// Full-resolution linear decode. Budget: under 1.5 s for 24 MP (release).
+/// A user-facing reason for a failed RAW decode. rawler reports damaged
+/// data as a caught panic with a request to file a bug upstream; say what
+/// it means instead (the full detail still goes to the log).
+pub fn decode_error_message(path: &Path, detail: &str) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("panic") || lower.contains("corrupt") || lower.contains("unexpected eof") {
+        eprintln!("[decode] {} damaged: {detail}", path.display());
+        format!("{name} looks damaged — its image data is incomplete, so it can't be developed")
+    } else if lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("unknown camera")
+    {
+        eprintln!("[decode] {} unsupported: {detail}", path.display());
+        format!("{name} is from a camera or format this build can't decode yet")
+    } else {
+        format!("decode {}: {detail}", path.display())
+    }
+}
+
+/// Prefix a decode error for display unless it is already a plain-language
+/// reason from [`decode_error_message`].
+pub fn failure_reason(e: &str) -> String {
+    if e.contains(" looks damaged") || e.contains(" can't decode yet") {
+        e.to_string()
+    } else {
+        format!("decode failed: {e}")
+    }
+}
+
 pub fn decode(path: &Path) -> Result<LinearImage, String> {
     let params = RawDecodeParams::default();
     let (w, h, flat, raw) = linear_floats(path)?;
@@ -380,6 +413,35 @@ fn read_cache(path: &Path) -> Result<LinearImage, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn damaged_raw_reports_a_clear_reason() {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/raw/IMG_5442.NEF");
+        let bytes = std::fs::read(&src).unwrap();
+        let dir = std::env::temp_dir().join(format!("laika-damaged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cut = dir.join("TRUNCATED.NEF");
+        // Keep the headers, lose most of the image data.
+        std::fs::write(&cut, &bytes[..bytes.len() * 2 / 5]).unwrap();
+        let err = match decode(&cut) {
+            Err(e) => e,
+            Ok(_) => {
+                std::fs::remove_dir_all(&dir).ok();
+                return; // this rawler recovers partial data; nothing to report
+            }
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!err.contains("github.com"), "{err}");
+        assert!(err.contains("TRUNCATED.NEF"), "{err}");
+        let m = decode_error_message(
+            &cut,
+            "Failed to decode image, possibly corrupt image: Caught a panic while decoding. Please file a bug with a sample file at https://github.com/dnglab/dnglab/issues",
+        );
+        assert_eq!(
+            m,
+            "TRUNCATED.NEF looks damaged — its image data is incomplete, so it can't be developed"
+        );
+    }
+
     use super::*;
 
     fn nef() -> Option<PathBuf> {
