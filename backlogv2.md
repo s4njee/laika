@@ -1023,7 +1023,50 @@ relaunch.
 - **Depends on:** U13, U04. **Touchpoints:** Collections schema (`position`,
   `cover_photo_id`, `caption`), Grid drag, Publish form.
 
-### [ ] V31 — Preferences window and complete menu bar
+### [x] V31 — Preferences window and complete menu bar
+
+**Result: done 2026-09-17, with stated limits.** `cargo fmt` and
+`cargo test --workspace` pass (laika-core 172, laika-app 30), no new
+warnings. Verified live in the isolated e2e app (release): the native menu
+bar with every group, View › Timeline and Settings… from the menus, the
+Preferences tabs, Filmstrip size Large visibly enlarging the Loupe
+filmstrip and persisting to `library.json`, and the in-window menu bar
+(forced on macOS with `LAIKA_INWINDOW_MENU=1`) running View › Timeline.
+- Storage: `AppPrefs` inside `library.json` in the app support directory
+  (serde defaults, clamped on read); Reset to Defaults restores
+  preferences, appearance and cache limits, keeping recents, the launch
+  catalog and the cache location. Per-catalog settings (label names,
+  Loupe info lines, slideshow, the catalog's own grid choices and pair
+  grouping) sit under "This catalog" or say so.
+- General: catalog at launch (last / ask / fixed + chooser); language and
+  version shown.
+- File Handling: cache location, cap and 1:1 TTL; import dialog defaults
+  (add vs copy, skip duplicates, new only, eject); RAW+JPEG grouping for
+  catalogs that haven't chosen; sidecar policy (write, or catalog only —
+  no writes or heals, external sidecar edits still read).
+- Interface: default columns, cell style, overlay and badge set for
+  catalogs without their own; hide panels on entering the wall; filmstrip
+  size (small/medium/large, applied live).
+- External Editing: application, TIFF or JPEG, file-name template; new
+  ⌘E / File › Edit in External Editor renders the selection next to the
+  originals and opens the files in that application.
+- Performance: GPU preference (high performance / low power) with the
+  adapter in use; import worker count (auto or 1–32; the env var still
+  wins and is flagged); thumbnails decoded at once.
+- Menus: one command table (70+ commands in Laika/File/Edit/Photo/
+  Develop/View/Help, submenus for rating, flag, label, Upright, catalog,
+  backup, Apple Photos) drives the native macOS menu bar and an
+  in-window bar elsewhere; every title shows its shortcut. The keyboard's
+  view/mode keys now run the same commands. ⌘Q, ⌘, and ⌘H are native key
+  equivalents; the other keys stay on the window's handler so text fields
+  and dialogs keep them.
+- Limits: English is the only language; there is no update service to
+  check (version shown instead); external editing is 8-bit sRGB with no
+  re-import round-trip (V26); the GPU preference applies on the next
+  launch and only matters with two GPUs; smart/1:1 preview builds stay
+  sequential; Preferences is an in-window panel rather than a separate
+  OS window; the Linux menu bar was exercised on macOS only.
+
 
 - **Deliver:** A Preferences window with **General** (catalog at launch, language,
   update check), **File Handling** (cache location and cap from V09, import

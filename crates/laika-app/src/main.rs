@@ -24,10 +24,12 @@ use laika_core::sync::SyncSettings;
 mod activity;
 mod albums;
 mod collections;
+mod commands;
 mod controls;
 mod geometry;
 mod photos_ingest;
 mod photos_sync;
+mod prefs_ui;
 mod progress_hud;
 mod slideshow;
 mod theme;
@@ -515,6 +517,8 @@ struct ExportDialog {
     retry_ids: Vec<(String, i64)>,
     done_count: usize,
     skipped_count: usize,
+    /// V31: open finished files in this application (external editing).
+    open_with: Option<String>,
 }
 
 /// U10: cancellable background export run (sequential full renders).
@@ -1334,6 +1338,12 @@ struct Laika {
     geo: geometry::GeoUi,
     /// V13: label names, collections, Quick Collection, target.
     coll: collections::CollState,
+    /// V31: open in-window menu (index into the menu tree).
+    menu_open: Option<usize>,
+    /// V31: Preferences tab.
+    prefs_tab: u8,
+    /// V31: GPU the renderer started on (shown in Preferences).
+    gpu_adapter: String,
     /// V20: batch actions aim here instead of the selection (slideshow
     /// ratings land on the slide on screen only).
     forced_targets: Option<Vec<i64>>,
@@ -2798,6 +2808,11 @@ impl Laika {
         if self.catalog.is_none() {
             return;
         }
+        // V31: sidecar policy "never" keeps edits in the catalog only.
+        if self.library.prefs.sidecars == laika_core::prefs::SidecarPolicy::Never {
+            self.sidecar_pending.remove(&pid);
+            return;
+        }
         // Ensure an entry so rating-only photos converge their sidecar too
         // (memory missing implies the DB holds nothing either — the loader
         // populates every acknowledged row).
@@ -2818,6 +2833,10 @@ impl Laika {
     /// Perform one sidecar write for `pid` immediately, using that photo's
     /// stored values (safe after navigating away from it).
     fn write_sidecar_now(&mut self, pid: i64, now: Instant) {
+        if self.library.prefs.sidecars == laika_core::prefs::SidecarPolicy::Never {
+            self.sidecar_pending.remove(&pid);
+            return;
+        }
         let Some(photo) = self.find(pid).cloned() else {
             // Removed from the catalog: nothing left to converge.
             self.sidecar_pending.remove(&pid);
@@ -3009,6 +3028,7 @@ impl Laika {
             text_input::FieldId::InfoFileLine => self.info_file_line.clone(),
             text_input::FieldId::InfoExposureLine => self.info_exposure_line.clone(),
             text_input::FieldId::LabelName(i) => self.coll.names.name(i).to_string(),
+            text_input::FieldId::EditorNaming => self.library.prefs.editor_naming.clone(),
             text_input::FieldId::AlbumTitle => self
                 .viewed_collection()
                 .map(|c| c.title.clone())
@@ -3393,6 +3413,15 @@ impl Laika {
             }
             F::PhotosAlbum => self.commit_apple_album(buf, cx),
             F::LabelName(i) => self.commit_label_name(i, buf, cx),
+            F::EditorNaming => {
+                let t = buf.trim();
+                if t.contains('/') || t.contains('\\') {
+                    return Err("names can't contain folders".to_string());
+                }
+                let t = t.to_string();
+                self.set_prefs(move |p| p.editor_naming = t, cx);
+                Ok(())
+            }
             F::AlbumTitle => self.commit_album_text(Some(buf), None),
             F::AlbumDescription => self.commit_album_text(None, Some(buf)),
             F::AlbumCaption => self.commit_album_caption(buf),
@@ -3977,6 +4006,7 @@ impl Laika {
                 F::LabelName(3),
                 F::LabelName(4),
                 F::LabelName(5),
+                F::EditorNaming,
             ]
         } else if self.apple.open {
             vec![F::PhotosAlbum]
@@ -5764,11 +5794,17 @@ impl Laika {
             return self.dev.is_some();
         }
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<laika_develop::Rendered>();
-        match laika_develop::Renderer::spawn(move |frame| {
-            tx.unbounded_send(frame).ok();
-        }) {
+        // V31: Preferences → Performance GPU choice.
+        let low_power = self.library.prefs.gpu == laika_core::prefs::GpuPreference::LowPower;
+        match laika_develop::Renderer::spawn_with(
+            move |frame| {
+                tx.unbounded_send(frame).ok();
+            },
+            low_power,
+        ) {
             Ok((renderer, adapter)) => {
                 eprintln!("[develop] adapter: {adapter}");
+                self.gpu_adapter = adapter.clone();
                 cx.spawn(async move |entity, cx| {
                     while let Some(mut frame) = rx.next().await {
                         while let Ok(Some(next)) = rx.try_next() {
@@ -6801,6 +6837,7 @@ impl Laika {
             retry_ids: Vec::new(),
             done_count: 0,
             skipped_count: 0,
+            open_with: None,
         };
         self.load_export_settings(&mut d);
         Self::refresh_export_presets(&self.catalog, &mut d);
@@ -7523,7 +7560,14 @@ impl Laika {
                 }
                 ExportPostAction::Open => {
                     // Opening 50 viewers helps nobody: first 10, stated.
-                    let line = Self::post_action_open(&files);
+                    let open_with = self
+                        .export_dialog
+                        .as_ref()
+                        .and_then(|d| d.open_with.clone());
+                    let line = match open_with {
+                        Some(app) => Self::open_in_app(&app, &files),
+                        None => Self::post_action_open(&files),
+                    };
                     if let Some(d) = self.export_dialog.as_mut() {
                         d.report.push(format!("{who}{line}"));
                     }
@@ -7573,6 +7617,26 @@ impl Laika {
 
     /// V28: open exported files with the system handler (first 10 —
     /// stated cap, never a silent pile of viewers).
+    /// V31: open rendered files in the external editor (first 10).
+    fn open_in_app(app: &str, files: &[PathBuf]) -> String {
+        if files.is_empty() {
+            return "nothing rendered for the external editor".to_string();
+        }
+        let files: Vec<&PathBuf> = files.iter().take(10).collect();
+        let mut cmd = if cfg!(target_os = "macos") {
+            let mut c = std::process::Command::new("open");
+            c.arg("-a").arg(app);
+            c
+        } else {
+            std::process::Command::new(app)
+        };
+        match cmd.args(&files).status() {
+            Ok(s) if s.success() => format!("opened {} in {app}", files.len()),
+            Ok(s) => format!("{app} exited {s}"),
+            Err(e) => format!("couldn't start {app}: {e}"),
+        }
+    }
+
     fn post_action_open(files: &[PathBuf]) -> String {
         if files.is_empty() {
             return "open skipped — no files exported".to_string();
@@ -7621,12 +7685,13 @@ impl Laika {
             scanning_total: 0,
             entries: Vec::new(),
             thumb_count: 0,
-            copy_mode: false,
+            // V31: defaults come from Preferences → File Handling.
+            copy_mode: self.library.prefs.import_copy,
             dest: None,
             second: None,
-            eject: false,
-            skip_dup: true,
-            new_only: true,
+            eject: self.library.prefs.import_eject,
+            skip_dup: self.library.prefs.import_skip_duplicates,
+            new_only: self.library.prefs.import_new_only,
             picker: None,
             cancel: Arc::new(AtomicBool::new(false)),
             report: None,
@@ -7872,15 +7937,26 @@ impl Laika {
         let Some(cat) = self.catalog.as_ref() else {
             return;
         };
-        self.cell_style =
-            laika_core::state::CellStyle::parse(&cat.get_import_default("cell_style"));
-        self.overlay = laika_core::state::OverlayMode::parse(&cat.get_import_default("overlay"));
-        self.badges = laika_core::state::BadgeSet::parse(&cat.get_import_default("badges"));
-        if let Ok(cols) = cat.get_import_default("thumb_columns").parse::<u8>() {
-            if (3..=20).contains(&cols) {
-                self.state.thumb_columns = cols;
-            }
-        }
+        // V31: a catalog without its own choice uses Preferences →
+        // Interface defaults.
+        let prefs = self.library.prefs.clone();
+        let or_default = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
+        self.cell_style = laika_core::state::CellStyle::parse(&or_default(
+            cat.get_import_default("cell_style"),
+            &prefs.default_cell_style,
+        ));
+        self.overlay = laika_core::state::OverlayMode::parse(&or_default(
+            cat.get_import_default("overlay"),
+            &prefs.default_overlay,
+        ));
+        self.badges = laika_core::state::BadgeSet::parse(&or_default(
+            cat.get_import_default("badges"),
+            &prefs.default_badges,
+        ));
+        self.state.thumb_columns = match cat.get_import_default("thumb_columns").parse::<u8>() {
+            Ok(cols) if (3..=20).contains(&cols) => cols,
+            _ => prefs.default_columns.clamp(3, 20),
+        };
         // V20: Loupe info overlay + slideshow settings.
         self.loupe_info =
             laika_core::slideshow::LoupeInfo::parse(&cat.get_import_default("loupe_info"));
@@ -7989,8 +8065,13 @@ impl Laika {
         self.load_apple_sync();
         // V05: grouping preference is per catalog.
         if let Some(cat) = self.catalog.as_ref() {
-            self.pair_grouped = cat.get_import_default("pair_grouped") != "0";
-            let report = cat.rescan_sidecars();
+            self.pair_grouped = match cat.get_import_default("pair_grouped").as_str() {
+                "" => self.library.prefs.group_pairs_default,
+                v => v != "0",
+            };
+            let report = cat.rescan_sidecars_with(
+                self.library.prefs.sidecars == laika_core::prefs::SidecarPolicy::Always,
+            );
             if report.external > 0 || report.healed > 0 {
                 eprintln!(
                     "[catalog] opened with {} external and {} healed sidecars",
@@ -10084,9 +10165,11 @@ impl Laika {
         }
         self.thumb_loading = true;
         self.thumb_rescan = false;
+        // V31: Preferences → Performance thumbnail concurrency.
+        let concurrency = self.library.prefs.thumb_concurrency.clamp(1, 32) as usize;
         cx.spawn(async move |entity, cx| {
             // Decode in parallel batches; results merge on the UI thread.
-            for batch in missing.chunks(8) {
+            for batch in missing.chunks(concurrency) {
                 // U21: a kick during the loop means the set is stale
                 // (filter change, scroll) — stop instead of loading hidden
                 // rows. Peek only: the flag must survive to the converge
@@ -14560,9 +14643,9 @@ impl Laika {
             const FILM_GAP: f32 = 6.;
             let photos = self.filmstrip_photos();
             let n = photos.len();
-            let pitch = layout::FILM_CELL_W + FILM_GAP;
+            let pitch = layout::FILM_CELL_W() + FILM_GAP;
             let total = (2. * FILM_PAD + n as f32 * pitch - FILM_GAP).max(0.);
-            let cell_top = ((layout::FILMSTRIP - 1. - layout::FILM_CELL_H) / 2.).max(0.);
+            let cell_top = ((layout::FILMSTRIP() - 1. - layout::FILM_CELL_H()) / 2.).max(0.);
             let handle = self.film_scroll.clone();
             let measured = handle.bounds().size.width.as_f32();
             let view_w = if measured > 1. { measured } else { 1200. };
@@ -14577,10 +14660,10 @@ impl Laika {
                     .and_then(|pid| photos.iter().position(|p| p.id == pid))
                 {
                     let left = FILM_PAD + idx as f32 * pitch;
-                    let right = left + layout::FILM_CELL_W;
+                    let right = left + layout::FILM_CELL_W();
                     if left < scroll_x || right > scroll_x + view_w {
                         let max = (total - view_w).max(0.);
-                        scroll_x = (left - (view_w - layout::FILM_CELL_W) / 2.).clamp(0., max);
+                        scroll_x = (left - (view_w - layout::FILM_CELL_W()) / 2.).clamp(0., max);
                         handle.set_offset(point(px(-scroll_x), px(0.)));
                     }
                 }
@@ -14607,8 +14690,8 @@ impl Laika {
                         .left(px(FILM_PAD + i as f32 * pitch))
                         .top(px(cell_top))
                         .flex_none()
-                        .w(px(layout::FILM_CELL_W))
-                        .h(px(layout::FILM_CELL_H))
+                        .w(px(layout::FILM_CELL_W()))
+                        .h(px(layout::FILM_CELL_H()))
                         .rounded(px(2.))
                         .border_1()
                         .border_color::<Hsla>(if current {
@@ -14650,7 +14733,7 @@ impl Laika {
                 });
             div()
                 .id("filmstrip")
-                .h(px(layout::FILMSTRIP))
+                .h(px(layout::FILMSTRIP()))
                 .flex_none()
                 .bg(rgb(bg_app()))
                 .border_t_1()
@@ -17699,6 +17782,7 @@ impl Laika {
             retry_ids: Vec::new(),
             done_count: 0,
             skipped_count: 0,
+            open_with: None,
         });
         self.apply_export_snapshot(&snap);
         self.start_export(false, cx);
@@ -22224,6 +22308,9 @@ enum ImportWork {
 
 /// Worker count for import processing: most cores, leaving room for the UI
 /// and the renderer; bounded so large raster decodes can't exhaust memory.
+/// V31: Preferences → Performance import workers (0 = automatic).
+static IMPORT_WORKERS_PREF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn import_worker_count() -> usize {
     // Developer override for benchmarking (`LAIKA_IMPORT_WORKERS=1`).
     if let Some(n) = std::env::var("LAIKA_IMPORT_WORKERS")
@@ -22232,11 +22319,15 @@ fn import_worker_count() -> usize {
     {
         return n.clamp(1, 32);
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .saturating_sub(2)
-        .clamp(2, 8)
+    let prefs = laika_core::prefs::AppPrefs {
+        import_workers: IMPORT_WORKERS_PREF.load(std::sync::atomic::Ordering::Relaxed) as u8,
+        ..Default::default()
+    };
+    prefs.import_worker_count(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    )
 }
 
 /// Fan preparation (hashing, EXIF, previews, thumbnail decode) out over
@@ -23082,45 +23173,24 @@ impl Render for Laika {
                         "delete" | "backspace" => this.delete_rejected(cx),
                         // V20: impromptu slideshow (selection or visible).
                         "enter" => this.start_slideshow(window, cx),
+                        // V31: edit in the external editor from Preferences.
+                        "e" => this.run_command(commands::Command::EditExternal, window, cx),
                         _ => {}
                     }
                     return;
                 }
                 match key {
-                    "g" => {
-                        // U02: never switch modules dirty.
-                        this.flush_saves();
-                        this.state.active_module = Module::Library;
-                        this.view = ViewMode::Grid;
-                        this.prev_view = ViewMode::Grid;
-                        this.publish_open = false;
-                        // U09: the eyedropper is a Develop-mode tool.
-                        this.wb_pick = false;
-                        cx.notify();
-                    }
+                    "g" => this.run_command(commands::Command::ViewGrid, window, cx),
                     "e" => {
-                        // V28: Shift+E repeats the last export without
-                        // the dialog; plain E opens the Loupe.
-                        if shift {
-                            this.export_with_previous(cx);
-                            return;
-                        }
-                        this.flush_saves();
-                        this.state.active_module = Module::Library;
-                        this.view = ViewMode::Loupe;
-                        this.prev_view = ViewMode::Loupe;
-                        // U09: the eyedropper is a Develop-mode tool.
-                        this.wb_pick = false;
-                        cx.notify();
+                        // V28: Shift+E repeats the last export; plain E is Loupe.
+                        let cmd = if shift {
+                            commands::Command::ExportPrevious
+                        } else {
+                            commands::Command::ViewLoupe
+                        };
+                        this.run_command(cmd, window, cx);
                     }
-                    "d" => {
-                        this.flush_saves();
-                        this.state.active_module = Module::Develop;
-                        if let Some(pid) = this.state.primary {
-                            this.open_develop_for(pid, cx);
-                        }
-                        cx.notify();
-                    }
+                    "d" => this.run_command(commands::Command::Develop, window, cx),
                     // V22: crop tool keys (overlay, orientation swap, nudge).
                     "o" if this.crop_open => this.cycle_overlay(shift, cx),
                     "x" if this.crop_open => this.swap_crop_orientation(cx),
@@ -23137,11 +23207,7 @@ impl Render for Laika {
                     "x" => this.apply_flag(false, cx),
                     "u" => this.clear_flags(cx),
                     // V16: overlay cycle (none → file → exif).
-                    "j" => {
-                        this.overlay = this.overlay.cycle();
-                        this.save_cell_prefs();
-                        cx.notify();
-                    }
+                    "j" => this.run_command(commands::Command::CellOverlay, window, cx),
                     // V20: Loupe info overlay (none → file → exposure).
                     "i" => this.cycle_loupe_info(cx),
                     // V15: mirror the scope ([ horizontal, ] vertical).
@@ -23150,36 +23216,13 @@ impl Render for Laika {
                     // U07: shared Loupe/Develop zoom cycle.
                     "z" => this.cycle_zoom(cx),
                     // V18: capture-ordered timeline (T switches, plain like G/E).
-                    "t" => {
-                        this.prev_view = ViewMode::Timeline;
-                        this.view = ViewMode::Timeline;
-                        cx.notify();
-                    }
+                    "t" => this.run_command(commands::Command::ViewTimeline, window, cx),
                     // V17: flush thumbnail wall (W toggles, back to last view).
-                    "w" => {
-                        if this.view == ViewMode::Wall {
-                            this.view = this.prev_view;
-                        } else {
-                            this.prev_view = this.view;
-                            this.view = ViewMode::Wall;
-                        }
-                        cx.notify();
-                    }
+                    "w" => this.run_command(commands::Command::ViewWall, window, cx),
                     // U06: auto-advance toggle for keyboard-first culling.
-                    "a" => {
-                        this.auto_advance = !this.auto_advance;
-                        this.status_note = if this.auto_advance {
-                            "auto-advance on — ratings step to the next photo".to_string()
-                        } else {
-                            "auto-advance off".to_string()
-                        };
-                        cx.notify();
-                    }
+                    "a" => this.run_command(commands::Command::AutoAdvance, window, cx),
                     // V12: keyword manager (hierarchy, sets, import/export).
-                    "k" => {
-                        this.kw_open = true;
-                        cx.notify();
-                    }
+                    "k" => this.run_command(commands::Command::KeywordManager, window, cx),
                     "f2" => this.open_rename(cx),
                     "/" => {
                         this.focus_field(text_input::FieldId::SearchQuery, cx);
@@ -23198,10 +23241,7 @@ impl Render for Laika {
                     "3" => this.apply_rating(3, cx),
                     "4" => this.apply_rating(4, cx),
                     "5" => this.apply_rating(5, cx),
-                    "?" => {
-                        this.help_open = !this.help_open;
-                        cx.notify();
-                    }
+                    "?" => this.run_command(commands::Command::Shortcuts, window, cx),
                     // U08: Enter applies an open crop (Esc cancels).
                     "enter" if this.crop_open && this.field.is_none() => {
                         this.apply_crop(cx);
@@ -23231,10 +23271,7 @@ impl Render for Laika {
                         cx.notify();
                     }
                     // V17: lights cycle (normal → dim → out).
-                    "l" => {
-                        this.lights = (this.lights + 1) % 3;
-                        cx.notify();
-                    }
+                    "l" => this.run_command(commands::Command::Lights, window, cx),
                     "r" => this.retry_failed_sync(cx),
                     "s" => {
                         if this.sync_open {
@@ -23249,25 +23286,9 @@ impl Render for Laika {
                     "down" => this.arrow_vertical(1, ev.keystroke.modifiers.shift, cx),
                     // V17: wall chrome + display keys (fields and modals
                     // trap Tab; everywhere else Shift+Tab hides chrome).
-                    "tab" if shift => {
-                        this.hide_chrome = !this.hide_chrome;
-                        cx.notify();
-                    }
-                    "f" => {
-                        window.toggle_fullscreen();
-                    }
-                    "y" => {
-                        let pid = this.state.primary;
-                        let geom = pid.map(|id| this.render_geom(id)).unwrap_or_default();
-                        let values = pid
-                            .map(|id| this.effective_values(id, this.values))
-                            .unwrap_or_else(edit::defaults);
-                        if let Some(dev) = this.dev.as_mut() {
-                            dev.split = if dev.split > 0. { 0. } else { 0.38 };
-                            dev.submit_current(&values, geom, pid);
-                            cx.notify();
-                        }
-                    }
+                    "tab" if shift => this.run_command(commands::Command::HideChrome, window, cx),
+                    "f" => this.run_command(commands::Command::FullScreen, window, cx),
+                    "y" => this.run_command(commands::Command::BeforeAfter, window, cx),
                     "\\" => {
                         let pid = this.state.primary;
                         let geom = pid.map(|id| this.render_geom(id)).unwrap_or_default();
@@ -23302,7 +23323,10 @@ impl Render for Laika {
                     }
                 }
             }))
-            .when(show.is_none(), |d| d.child(self.top_bar(window, cx)))
+            .when(show.is_none(), |d| {
+                d.children(self.menu_bar(cx))
+                    .child(self.top_bar(window, cx))
+            })
             .children(module)
             .when(show.is_none(), |d| {
                 d.children(self.progress_hud(window, cx))
@@ -23333,6 +23357,7 @@ impl Render for Laika {
             .when(self.import_open, |d| d.child(self.import_modal(window, cx)))
             .when(self.tooltip.is_some(), |d| d.child(self.tooltip_tip()))
             .children(self.context_menu_el(window, cx))
+            .children(self.menu_dropdown(cx))
             .child(drag)
     }
 }
@@ -26162,7 +26187,7 @@ impl Laika {
                                 .text_size(px(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
-                                .child("Settings"),
+                                .child("Preferences"),
                         )
                         .child(
                             div()
@@ -26179,36 +26204,22 @@ impl Laika {
                                 .child("Done"),
                         ),
                 )
-                .child(section("Appearance"))
-                .child(
+                .child(self.prefs_tabs(cx))
+                .child({
+                    let tab = self.prefs_tab;
                     div()
+                        .id("prefs-scroll")
                         .flex()
-                        .items_start()
-                        .gap(px(8.))
-                        .child(row_label("Theme"))
-                        .child(cards),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(row_label("Accent color"))
-                        .child(swatches),
-                )
-                .child(self.backup_field(
-                    text_input::FieldId::AccentHex,
-                    if custom { "Custom · in use" } else { "Custom" },
-                    &theme::hex(accent_now),
-                    "#RRGGBB",
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(rgb(TEXT_DIM))
-                        .child("Applies to every catalog. Photo colors are never affected."),
-                )
+                        .flex_col()
+                        .gap(px(14.))
+                        .max_h(px(540.))
+                        .overflow_y_scroll()
+                        .pr(px(8.))
+                        .when(tab == 0, |d| d.child(self.prefs_general(cx)))
+                        .when(tab == 1, |d| d.child(self.prefs_file_handling(cx)))
+                        .when(tab == 2, |d| {
+                            d.child(self.prefs_interface(cx))
+                                .child(section("This catalog"))
                 .child(section("Loupe info overlay"))
                 .child(self.backup_field(
                     text_input::FieldId::InfoFileLine,
@@ -26270,8 +26281,46 @@ impl Laika {
                         .text_size(px(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("⌘Enter plays the selection, or everything shown. Space pauses · arrows step · 0–5, 6–9 and P/X/U mark the slide · Esc returns to Loupe. Saved with this catalog."),
-                ),
-            560.,
+                )
+                        })
+                        .when(tab == 3, |d| d.child(self.prefs_external(cx)))
+                        .when(tab == 4, |d| d.child(self.prefs_performance(cx)))
+                        .when(tab == 5, |d| {
+                            d
+                .child(section("Appearance"))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(8.))
+                        .child(row_label("Theme"))
+                        .child(cards),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(row_label("Accent color"))
+                        .child(swatches),
+                )
+                .child(self.backup_field(
+                    text_input::FieldId::AccentHex,
+                    if custom { "Custom · in use" } else { "Custom" },
+                    &theme::hex(accent_now),
+                    "#RRGGBB",
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Applies to every catalog. Photo colors are never affected."),
+                )
+                        })
+                })
+                .child(self.prefs_footer(cx)),
+            680.,
         )
     }
 
@@ -26360,7 +26409,7 @@ impl Laika {
     }
 
     fn help_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        const ROWS: [(&str, &str); 61] = [
+        const ROWS: [(&str, &str); 62] = [
             ("G / E / D", "Grid · Loupe · Develop"),
             ("← → ↑ ↓", "Move through photos (Shift extends)"),
             ("⌘A / ⌘D", "Select visible · clear selection"),
@@ -26398,7 +26447,11 @@ impl Laika {
                 "Top-left button · choose an SD card or folder",
             ),
             ("F2", "Rename selected photos from a template"),
-            ("⌘,", "Settings: appearance (grey/black) and accent color"),
+            (
+                "⌘,",
+                "Preferences: general, files, interface, editing, performance",
+            ),
+            ("⌘E", "Edit in the external editor chosen in Preferences"),
             (
                 "Apple Photos",
                 "Left rail: sync originals in place · right-click to add photos",
@@ -26588,6 +26641,7 @@ fn field_tag(id: text_input::FieldId) -> usize {
         text_input::FieldId::AlbumTitle => 77,
         text_input::FieldId::AlbumDescription => 78,
         text_input::FieldId::AlbumCaption => 79,
+        text_input::FieldId::EditorNaming => 80,
         text_input::FieldId::CropX => 66,
         text_input::FieldId::CropY => 67,
         text_input::FieldId::CropW => 68,
@@ -26724,6 +26778,12 @@ fn main() {
                     .map(|d| d.to_path_buf())
                     .unwrap_or_else(|| PathBuf::from(&home));
                 let mut library = laika_core::catalog::LibraryState::read(&app_base);
+                // V31: runtime-applied preferences.
+                theme::layout::set_filmstrip_scale(library.prefs.filmstrip.scale());
+                IMPORT_WORKERS_PREF.store(
+                    library.prefs.import_workers as usize,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 theme::set_appearance(theme::Appearance::parse(&library.appearance));
                 if let Some(c) = theme::parse_hex(&library.accent) {
                     theme::set_accent(c);
@@ -26786,7 +26846,9 @@ fn main() {
                 // from the catalog so acknowledged saves survive restarts.
                 let mut rescan_note: Option<String> = None;
                 if let Some(cat) = catalog.as_ref() {
-                    let report = cat.rescan_sidecars();
+                    let report = cat.rescan_sidecars_with(
+                        library.prefs.sidecars == laika_core::prefs::SidecarPolicy::Always,
+                    );
                     if report.applied > 0 || report.healed > 0 {
                         eprintln!(
                             "[laika] sidecars: {} applied ({} external), {} healed from catalog",
@@ -26930,6 +26992,9 @@ fn main() {
                     slides: Default::default(),
                     geo: Default::default(),
                     coll: Default::default(),
+                    menu_open: None,
+                    prefs_tab: 0,
+                    gpu_adapter: String::new(),
                     forced_targets: None,
                     auto_advance: false,
                     zoom: zoom::ZoomLevel::Fit,
@@ -27053,7 +27118,10 @@ fn main() {
                 this.kick_apple_loop(cx);
                 // V05: pair grouping preference (grouped cell per capture).
                 if let Some(cat) = this.catalog.as_ref() {
-                    this.pair_grouped = cat.get_import_default("pair_grouped") != "0";
+                    this.pair_grouped = match cat.get_import_default("pair_grouped").as_str() {
+                        "" => this.library.prefs.group_pairs_default,
+                        v => v != "0",
+                    };
                 }
                 // V16: cell prefs ride along.
                 this.load_cell_prefs();
@@ -27090,6 +27158,8 @@ fn main() {
             });
             std::mem::forget(sub);
         }
+        // V31: native menu bar (macOS); Linux shows the in-window bar.
+        commands::install_native_menus(cx, handle);
         cx.activate(true);
     });
 }

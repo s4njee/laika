@@ -300,11 +300,20 @@ pub struct Renderer {
 impl Renderer {
     /// Starts the render thread. Returns once the adapter is up.
     pub fn spawn(on_frame: impl Fn(Rendered) + Send + 'static) -> Result<(Self, String), String> {
+        Self::spawn_with(on_frame, false)
+    }
+
+    /// V31: start on the low-power GPU when asked (systems with one GPU
+    /// get the same adapter either way).
+    pub fn spawn_with(
+        on_frame: impl Fn(Rendered) + Send + 'static,
+        low_power: bool,
+    ) -> Result<(Self, String), String> {
         let (tx, rx) = mpsc::channel::<Msg>();
         let (ready_tx, ready_rx) = mpsc::channel();
         thread::Builder::new()
             .name("laika-develop".into())
-            .spawn(move || match Gpu::new() {
+            .spawn(move || match Gpu::new(low_power) {
                 Ok(gpu) => {
                     ready_tx.send(Ok(gpu.adapter_info())).ok();
                     gpu.run(rx, on_frame);
@@ -472,10 +481,14 @@ fn fullscreen_pass(
 }
 
 impl Gpu {
-    fn new() -> Result<Self, String> {
+    fn new(low_power: bool) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference: if low_power {
+                wgpu::PowerPreference::LowPower
+            } else {
+                wgpu::PowerPreference::HighPerformance
+            },
             ..Default::default()
         }))
         .map_err(|e| e.to_string())?;

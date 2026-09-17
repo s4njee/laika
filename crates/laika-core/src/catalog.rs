@@ -423,6 +423,9 @@ pub struct LibraryState {
     /// UI accent as `#RRGGBB` (empty = the default green).
     #[serde(default)]
     pub accent: String,
+    /// V31: everything else in Preferences that is app-wide.
+    #[serde(default)]
+    pub prefs: crate::prefs::AppPrefs,
 }
 
 fn default_cache_cap() -> u64 {
@@ -456,6 +459,7 @@ impl Default for LibraryState {
             cache_ttl_days: default_cache_ttl(),
             appearance: String::new(),
             accent: String::new(),
+            prefs: Default::default(),
         }
     }
 }
@@ -466,10 +470,30 @@ impl LibraryState {
     }
 
     pub fn read(base: &Path) -> Self {
-        std::fs::read(Self::path(base))
+        let mut state: Self = std::fs::read(Self::path(base))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.prefs = state.prefs.sanitized();
+        state
+    }
+
+    /// V31: save app preferences.
+    pub fn set_prefs(&mut self, prefs: crate::prefs::AppPrefs, base: &Path) -> Result<(), String> {
+        self.prefs = prefs.sanitized();
+        self.write(base)
+    }
+
+    /// V31: Reset to Defaults — preferences, appearance, and cache policy.
+    /// Recents, the launch catalog, and the cache location stay (resetting
+    /// those would lose track of files).
+    pub fn reset_prefs(&mut self, base: &Path) -> Result<(), String> {
+        self.prefs = Default::default();
+        self.appearance.clear();
+        self.accent.clear();
+        self.cache_cap_mb = default_cache_cap();
+        self.cache_ttl_days = default_cache_ttl();
+        self.write(base)
     }
 
     fn write(&self, base: &Path) -> Result<(), String> {
@@ -2289,6 +2313,12 @@ impl Catalog {
     /// original. Runs at startup and after import. Stale sidecars are healed
     /// from the catalog so acknowledged saves survive crashes.
     pub fn rescan_sidecars(&self) -> RescanReport {
+        self.rescan_sidecars_with(true)
+    }
+
+    /// V31: `heal = false` (sidecar policy "never") still adopts external
+    /// sidecar edits but never writes one.
+    pub fn rescan_sidecars_with(&self, heal: bool) -> RescanReport {
         let mut report = RescanReport::default();
         let params_by_photo: std::collections::HashMap<i64, Vec<f32>> = self
             .load_all_params()
@@ -2302,6 +2332,7 @@ impl Catalog {
                     report.applied += 1;
                     report.external += 1;
                 }
+                Ok(SidecarApply::Stale) if !heal => {}
                 Ok(SidecarApply::Stale) => {
                     // Heal only when the catalog holds params for this photo;
                     // otherwise there is nothing to converge. History rides

@@ -140,7 +140,7 @@ impl Laika {
                 .absolute()
                 // Above the filmstrip in Develop, above the status bar elsewhere.
                 .bottom(px(if self.state.active_module == Module::Develop {
-                    layout::FILMSTRIP + layout::DEVELOP_TOOLBAR + 12.
+                    layout::FILMSTRIP() + layout::DEVELOP_TOOLBAR + 12.
                 } else {
                     layout::STATUS_BAR + 14.
                 }))

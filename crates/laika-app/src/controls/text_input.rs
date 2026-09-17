@@ -45,6 +45,8 @@ pub enum FieldId {
     AlbumTitle,
     AlbumDescription,
     AlbumCaption,
+    /// V31: Preferences → External Editing file name template.
+    EditorNaming,
     /// V22: numeric crop box (display pixels or percent).
     CropX,
     CropY,

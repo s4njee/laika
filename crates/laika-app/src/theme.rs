@@ -318,9 +318,34 @@ pub mod layout {
     pub const TOOLBAR: f32 = 40.;
     pub const DEVELOP_TOOLBAR: f32 = 38.;
     pub const STATUS_BAR: f32 = 28.;
-    pub const FILMSTRIP: f32 = 96.;
-    pub const FILM_CELL_W: f32 = 106.;
-    pub const FILM_CELL_H: f32 = 72.;
+    /// V31: filmstrip size preference (scale × 1000).
+    static FILM_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+    pub fn set_filmstrip_scale(scale: f32) {
+        FILM_SCALE.store(
+            (scale.clamp(0.5, 2.) * 1000.).round() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn film_scale() -> f32 {
+        FILM_SCALE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.
+    }
+
+    #[allow(non_snake_case)]
+    pub fn FILMSTRIP() -> f32 {
+        (96. * film_scale()).round()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn FILM_CELL_W() -> f32 {
+        (106. * film_scale()).round()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn FILM_CELL_H() -> f32 {
+        (72. * film_scale()).round()
+    }
     pub const RAIL_LIBRARY_LEFT: f32 = 226.;
     pub const RAIL_LIBRARY_RIGHT: f32 = 290.;
     pub const RAIL_DEVELOP_LEFT: f32 = 210.;

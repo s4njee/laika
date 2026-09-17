@@ -11,6 +11,7 @@ pub mod labels;
 pub mod lines;
 pub mod pairs;
 pub mod photo;
+pub mod prefs;
 pub mod slideshow;
 pub mod state;
 pub mod sync;
