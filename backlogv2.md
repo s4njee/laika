@@ -617,7 +617,53 @@ manager in the running app.
 - **Depends on:** U02, U04, U13. **Touchpoints:** Right rail, `xmp.rs`, keywords
   schema.
 
-### [ ] V13 — Color labels, quick collection, and target collection
+### [x] V13 — Color labels, quick collection, and target collection
+
+**Result: done 2026-09-17.** `cargo fmt` and `cargo test --workspace`
+pass (laika-core 164, including the new label and collection tests), no
+new warnings. Verified live in the isolated e2e app (release): the v6→v7
+migration with its automatic backup; keys 6 and 8 labeling; B adding to
+the Quick Collection; the red label chip filtering 9,427 photos to 1; the
+Quick Collection filter; Save as… creating a collection and clearing the
+Quick Collection; everything intact after a relaunch.
+- Schema v7: `photos.label` (0 none, 1–5 Red/Yellow/Green/Blue/Purple)
+  and `collections` + `collection_items` (the Quick Collection is the one
+  `kind='quick'` row, created on demand). Removing a photo drops its
+  memberships; restore-after-remove keeps the label.
+- Labels: 6–9 set red/yellow/green/blue and pressing again clears
+  (Lightroom's toggle); the context menu sets any of the five or clears;
+  pairs get the label together; each change is one undo step (labels
+  ride `Snap`, history and named snapshots). Slideshow keys 6–9 label
+  the slide on screen.
+- Names: editable per catalog in Settings → Color labels (distinct,
+  blank restores the default). Sidecars write the name as `xmp:Label`
+  (Lightroom stores and reads the name). Reading maps this catalog's
+  names first, then Lightroom's stock names; unknown text such as
+  "Select" is carried untouched and never overwrites a label. Renaming
+  rewrites the sidecars of photos with that label. Photos inside an Apple
+  Photos library get no sidecar (unchanged rule).
+- Filters: label chips (no label + five colors, multi-select) combine
+  with rating, flag and every other filter and clear with Clear; collection
+  scope sits beside folder and album scope. Saved filter presets from before
+  V13 still load.
+- Collections (left rail): Quick Collection plus saved collections with
+  counts; ○/● chooses the target collection that B and the context menu's
+  "Add to …" use (persisted per catalog, falls back to Quick). Viewing a
+  collection offers Save as… and Clear (Quick) or Rename…, Remove
+  selected and Delete (saved); New creates a collection from the
+  selection. Names commit on Enter only.
+- Badges: label swatch in expanded cells (every column count), beside the
+  flag dot in compact cells, and on filmstrip thumbnails; the Loupe label
+  line and slideshow toast name the label. The V16 badge toggle now
+  controls it.
+- Also fixed: at launch the V22 overlay/aspect presets never loaded
+  (only a catalog switch loaded them); they now load with the cell prefs.
+- Limits: B / Add to / Remove from collection aren't undo steps yet
+  (they apply immediately; B again reverses); Lightroom reading the
+  label was verified against the sidecar text, not by opening Lightroom;
+  context-menu label/collection items were code-reviewed only (the test
+  harness can't open context menus).
+
 
 - **Deliver:** Five color labels (`6`–`9` and a fifth via menu), label filter
   chips, editable label names per catalog, and a label badge in cells and
@@ -923,7 +969,46 @@ line, O overlay cycling, typed W, X swap, output-size chip.
 - **Depends on:** U10, U25, V27, V30. **Touchpoints:** `laika-export` templates,
   Publish form, theme options schema.
 
-### [ ] V30 — Albums: manual ordering, cover, description, and captions
+### [x] V30 — Albums: manual ordering, cover, description, and captions
+
+**Result: done 2026-09-17, with stated limits.** `cargo fmt` and
+`cargo test --workspace` pass (laika-core 169, including a 200-photo
+reorder that survives reopen), no new warnings. Verified live in the
+isolated e2e app (release): v7→v8 migration with backup, building a
+7-photo album with B, dragging the last photo to the front, an album
+caption that left the photo's title empty, and the order intact after a
+relaunch.
+- Schema v8: `collection_items.position` and `.caption`,
+  `collections.cover_photo_id`, `.title`, `.description`. Existing
+  members keep the order they were added in. New members append; removing
+  one (or the photo) leaves the rest in order; a cover that leaves the
+  album reads as none. Saving the Quick Collection keeps its order.
+- Order: pure `laika-core::album` (block moves keep their own order,
+  unknown ids ignored, stays a permutation over 500 random moves of 200).
+  Every collection shows in the new **Album** sort (selecting a collection
+  switches to it; leaving switches back to date). In Grid, dragging photos
+  (pairs together) onto a cell makes them take that cell's slot — after it
+  when moving forward, before it when moving backward — with a bar on that
+  side, so every slot (including the first cell of any row) is reachable;
+  a folder under the pointer still wins. Slideshow plays in album order.
+  Export and rename now number files in on-screen order (previously
+  catalog id order), so album order carries into `{seq}`.
+- Album panel (left rail, while viewing a collection): gallery title
+  (empty uses the collection name), description, cover (use selected /
+  clear, with thumbnail), and a one-click switch to album order.
+- Captions: an "In album" field under Caption in the right rail edits the
+  album-only caption over the selection (`<mixed>` on disagreement, batch
+  empty leaves captions unchanged); "use as photo title" copies it to the
+  photo's own title only when chosen. Album captions win in the slideshow
+  caption and in exported JPEG captions when exporting from the album.
+  Publish prefills its title from the album.
+- Limits: the gallery build (V29) doesn't exist yet, so "the default gallery
+  order" and "captions the gallery shows" are ready in the catalog API
+  (`album_order`, `album_captions`, cover, title, description) but not yet
+  rendered by a gallery; Timeline stays chronological (it groups by capture
+  date); drag-to-reorder is Grid only (the Wall has no reorder); the
+  description is a single-line field.
+
 
 - **Problem:** U13 adds collections. Galleries and slideshows also need a
   curated order, a cover, and text.

@@ -38,6 +38,13 @@ pub enum FieldId {
     /// V20: Loupe info line templates.
     InfoFileLine,
     InfoExposureLine,
+    /// V13: color label names (1..=5) and the collection name field.
+    LabelName(u8),
+    CollectionName,
+    /// V30: album gallery title/description and per-photo album caption.
+    AlbumTitle,
+    AlbumDescription,
+    AlbumCaption,
     /// V22: numeric crop box (display pixels or percent).
     CropX,
     CropY,

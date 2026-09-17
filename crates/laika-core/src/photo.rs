@@ -17,6 +17,8 @@ pub struct Photo {
     pub rating: u8,
     pub picked: bool,
     pub rejected: bool,
+    /// V13: color label, 0 = none.
+    pub label: u8,
     pub sync: SyncState,
     /// Gradient placeholder seed until real thumbnails land (Phase 2).
     pub tint: (u32, u32),
@@ -30,6 +32,7 @@ impl Photo {
             rating: 0,
             picked: false,
             rejected: false,
+            label: 0,
             sync: SyncState::Local,
             tint,
         }

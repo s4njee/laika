@@ -22,6 +22,8 @@ use laika_core::state::{AppState, Module};
 use laika_core::sync::SyncSettings;
 
 mod activity;
+mod albums;
+mod collections;
 mod controls;
 mod geometry;
 mod photos_ingest;
@@ -118,6 +120,7 @@ fn as_photo(p: &DbPhoto) -> Photo {
         rating: p.rating,
         picked: p.picked,
         rejected: p.rejected,
+        label: p.label,
         sync: p.sync,
         tint: (0, 0),
     }
@@ -823,6 +826,8 @@ struct CellData {
     /// U06: visible pick/reject state (badges, not just filter chips).
     picked: bool,
     rejected: bool,
+    /// V13: color label (0 = none).
+    label: u8,
     /// V16: overlay text lines for the current mode (empty = none).
     overlay: Vec<String>,
     /// V16: crop box / tone edits / keywords present.
@@ -1327,6 +1332,8 @@ struct Laika {
     slides: slideshow::SlideState,
     /// V22: Transform/Upright, guides, straighten, overlays, presets.
     geo: geometry::GeoUi,
+    /// V13: label names, collections, Quick Collection, target.
+    coll: collections::CollState,
     /// V20: batch actions aim here instead of the selection (slideshow
     /// ratings land on the slide on screen only).
     forced_targets: Option<Vec<i64>>,
@@ -1552,6 +1559,12 @@ impl Laika {
                         return false;
                     }
                 }
+                // V13: collection scope (labels match in the pure matcher).
+                if let Some(cid) = f.collection {
+                    if !self.in_collection(cid, p.id) {
+                        return false;
+                    }
+                }
                 let kws = self
                     .photo_keywords
                     .get(&p.id)
@@ -1569,7 +1582,16 @@ impl Laika {
             })
             .collect();
         out.sort_by(|a, b| f.compare_db(a, b));
-        out.into_iter().map(|p| p.id).collect()
+        let mut ids: Vec<i64> = out.into_iter().map(|p| p.id).collect();
+        // V30: album order inside a collection (capture order breaks ties
+        // for anything the album hasn't placed).
+        if let (laika_core::state::SortField::Album, Some(cid)) = (f.sort.field, f.collection) {
+            laika_core::album::sort_by_album(&mut ids, &self.album_order_of(cid));
+            if f.sort.dir == laika_core::state::SortDir::Desc {
+                ids.reverse();
+            }
+        }
+        ids
     }
 
     /// V05: complete pairs over the current rows (memoized per frame;
@@ -2986,6 +3008,30 @@ impl Laika {
             text_input::FieldId::PhotosAlbum => self.apple.settings.album_name().to_string(),
             text_input::FieldId::InfoFileLine => self.info_file_line.clone(),
             text_input::FieldId::InfoExposureLine => self.info_exposure_line.clone(),
+            text_input::FieldId::LabelName(i) => self.coll.names.name(i).to_string(),
+            text_input::FieldId::AlbumTitle => self
+                .viewed_collection()
+                .map(|c| c.title.clone())
+                .unwrap_or_default(),
+            text_input::FieldId::AlbumDescription => self
+                .viewed_collection()
+                .map(|c| c.description.clone())
+                .unwrap_or_default(),
+            text_input::FieldId::AlbumCaption => self
+                .state
+                .primary
+                .and_then(|pid| self.album_caption(pid))
+                .unwrap_or_default(),
+            text_input::FieldId::CollectionName => match self.coll.name_mode {
+                collections::NameMode::Rename(id) => self
+                    .coll
+                    .list
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
             text_input::FieldId::CropX => self.crop_field_text(0),
             text_input::FieldId::CropY => self.crop_field_text(1),
             text_input::FieldId::CropW => self.crop_field_text(2),
@@ -3212,6 +3258,14 @@ impl Laika {
 
     /// Defocus the editor (after commit-on-leave semantics elsewhere).
     fn defocus_field(&mut self) {
+        // V13: leaving the collection name field ends its mode.
+        if self
+            .field
+            .as_ref()
+            .is_some_and(|f| f.id == text_input::FieldId::CollectionName)
+        {
+            self.coll.name_mode = collections::NameMode::Closed;
+        }
         self.field = None;
     }
 
@@ -3338,6 +3392,16 @@ impl Laika {
                 self.persist_sync_settings()
             }
             F::PhotosAlbum => self.commit_apple_album(buf, cx),
+            F::LabelName(i) => self.commit_label_name(i, buf, cx),
+            F::AlbumTitle => self.commit_album_text(Some(buf), None),
+            F::AlbumDescription => self.commit_album_text(None, Some(buf)),
+            F::AlbumCaption => self.commit_album_caption(buf),
+            // V13: stash only; Enter creates/saves/renames (a focus change
+            // must never make a collection from a half-typed name).
+            F::CollectionName => {
+                self.coll.name_draft = buf.to_string();
+                Ok(())
+            }
             F::CropX => self.commit_crop_field(0, buf, cx),
             F::CropY => self.commit_crop_field(1, buf, cx),
             F::CropW => self.commit_crop_field(2, buf, cx),
@@ -3904,7 +3968,16 @@ impl Laika {
         if self.publish_open {
             vec![F::PublishTitle, F::PublishSlug]
         } else if self.settings_open {
-            vec![F::AccentHex, F::InfoFileLine, F::InfoExposureLine]
+            vec![
+                F::AccentHex,
+                F::InfoFileLine,
+                F::InfoExposureLine,
+                F::LabelName(1),
+                F::LabelName(2),
+                F::LabelName(3),
+                F::LabelName(4),
+                F::LabelName(5),
+            ]
         } else if self.apple.open {
             vec![F::PhotosAlbum]
         } else if self.sync_open {
@@ -4005,6 +4078,16 @@ impl Laika {
     /// first field (focus trap entry).
     fn open_publish(&mut self, cx: &mut Context<Self>) {
         self.return_focus = self.focused_param;
+        // V30: publishing from an album starts from its title.
+        if self.state.publish.title.trim().is_empty() {
+            if let Some(title) = self
+                .viewed_collection()
+                .map(|c| c.display_title().to_string())
+            {
+                self.state.publish.slug = laika_core::state::PublishForm::derive_slug(&title);
+                self.state.publish.title = title;
+            }
+        }
         self.publish_open = true;
         self.sync_open = false;
         self.focus_field(text_input::FieldId::PublishTitle, cx);
@@ -4119,6 +4202,17 @@ impl Laika {
                         }
                         Some(text_input::FieldId::CatalogName) => {
                             self.create_catalog(cx);
+                        }
+                        Some(text_input::FieldId::CollectionName) => {
+                            let draft = self.coll.name_draft.clone();
+                            match self.commit_collection_name(&draft, cx) {
+                                Ok(()) => self.defocus_field(),
+                                Err(e) => {
+                                    if let Some(f) = self.field.as_mut() {
+                                        f.error = Some(e);
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -4834,6 +4928,7 @@ impl Laika {
             p.rating = snap.rating;
             p.picked = snap.picked;
             p.rejected = snap.rejected;
+            p.label = snap.color_label;
         }
         self.persist_photo(pid);
         self.persist_rating(pid);
@@ -5404,10 +5499,10 @@ impl Laika {
                 )
             })
             .unwrap_or((true, true, true, true, true, true));
-        let (rating, picked, rejected) = self
+        let (rating, picked, rejected, color_label) = self
             .find(pid)
-            .map(|p| (p.rating, p.picked, p.rejected))
-            .unwrap_or((0, false, false));
+            .map(|p| (p.rating, p.picked, p.rejected, p.label))
+            .unwrap_or((0, false, false, 0));
         edit::Snap {
             params,
             crop,
@@ -5421,6 +5516,7 @@ impl Laika {
             rating,
             picked,
             rejected,
+            color_label,
         }
     }
 
@@ -6018,6 +6114,15 @@ impl Laika {
             .collect()
     }
 
+    /// V30: ids in the on-screen order (grid/album sort); anything not
+    /// visible keeps its relative place at the end.
+    fn in_visible_order(&self, mut ids: Vec<i64>) -> Vec<i64> {
+        let order = self.ordered_ids();
+        let rank: HashMap<i64, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        ids.sort_by_key(|id| rank.get(id).copied().unwrap_or(usize::MAX));
+        ids
+    }
+
     /// U02: catalog write for one photo's rating/flags from the in-memory
     /// row (user intent). Failures shelve the photo for retry.
     fn persist_rating(&mut self, pid: i64) -> bool {
@@ -6030,6 +6135,7 @@ impl Laika {
         match cat
             .set_rating(pid, p.rating)
             .and_then(|_| cat.set_flag(pid, p.picked, p.rejected))
+            .and_then(|_| cat.set_label(pid, p.label))
         {
             Ok(()) => {
                 self.rating_dirty.remove(&pid);
@@ -6664,7 +6770,8 @@ impl Laika {
             cx.notify();
             return;
         }
-        let ids = self.targets();
+        // V30: files number in the order shown (album order in an album).
+        let ids = self.in_visible_order(self.targets());
         if ids.is_empty() {
             self.status_note = "select photos first — nothing to export".to_string();
             cx.notify();
@@ -6867,7 +6974,10 @@ impl Laika {
                 creator: p.creator.clone(),
                 copyright: p.copyright.clone(),
                 title: p.title.clone(),
-                caption: p.caption.clone(),
+                // V30: exporting from an album carries its captions.
+                caption: self
+                    .album_caption(p.id)
+                    .unwrap_or_else(|| p.caption.clone()),
                 headline: p.headline.clone(),
                 location: p.location.clone(),
                 history: edit
@@ -7272,6 +7382,7 @@ impl Laika {
                 contact: String::new(),
                 location: item.location.clone(),
                 keywords: Vec::new(),
+                ..Default::default()
             };
             if auth.title.is_empty()
                 && auth.caption.is_empty()
@@ -7332,6 +7443,7 @@ impl Laika {
                         contact: String::new(),
                         location: item.location.clone(),
                         keywords: Vec::new(),
+                        ..Default::default()
                     },
                     &geom_to_edit(&item.geom),
                     &foreign,
@@ -7889,6 +8001,7 @@ impl Laika {
         // V16: cell prefs ride along.
         self.load_cell_prefs();
         self.load_geo_prefs();
+        self.load_collections();
         self.stage_startup_sync();
         self.pump_sync(cx);
         cx.notify();
@@ -8851,7 +8964,7 @@ impl Laika {
 
     /// V02: open the rename dialog over the visible-scope targets.
     fn open_rename(&mut self, cx: &mut Context<Self>) {
-        let ids = self.targets();
+        let ids = self.in_visible_order(self.targets());
         if ids.is_empty() {
             self.status_note = "select photos first".to_string();
             cx.notify();
@@ -9725,6 +9838,7 @@ impl Laika {
                         rating: 0,
                         picked: false,
                         rejected: false,
+                        color_label: 0,
                     });
                     edit.push_snap("Preset", &name, snap);
                     self.persist_photo(id);
@@ -10548,6 +10662,7 @@ impl Laika {
                         )
                     })
                     .child(self.folder_panel(window, cx))
+                    .child(self.collections_section(window, cx))
                     .child(self.apple_albums_section(window, cx))
                     .child(self.metadata_browser(window, cx))
                     .child(self.preset_section(window, cx))
@@ -11383,6 +11498,7 @@ impl Laika {
                         9,
                         cx,
                     ))
+                    .child(self.label_filter_chips(cx))
                     .child(self.advance_toggle(cx))
                     .when(f.is_active(), |d| {
                         d.child(self.filter_chip("Clear", false, 6, cx))
@@ -11598,6 +11714,8 @@ impl Laika {
             SortField::Captured => "date",
             SortField::Filename => "name",
             SortField::Rating => "rating",
+            SortField::Album if self.state.filters.collection.is_some() => "album",
+            SortField::Album => "date",
         };
         let dir = match self.state.filters.sort.dir {
             SortDir::Asc => "asc",
@@ -11614,13 +11732,19 @@ impl Laika {
                     .text_size(px(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
-                    .on_hover(self.tip("Sort order: date, name, rating"))
+                    .on_hover(
+                        self.tip(
+                            "Sort order: date, name, rating (album order inside a collection)",
+                        ),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
+                        let in_album = this.state.filters.collection.is_some();
                         let f = &mut this.state.filters.sort.field;
                         *f = match *f {
                             SortField::Captured => SortField::Filename,
                             SortField::Filename => SortField::Rating,
-                            SortField::Rating => SortField::Captured,
+                            SortField::Rating if in_album => SortField::Album,
+                            SortField::Rating | SortField::Album => SortField::Captured,
                         };
                         cx.notify();
                     }))
@@ -11781,6 +11905,7 @@ impl Laika {
             selected: self.state.selection.contains(&p.id),
             picked: p.picked,
             rejected: p.rejected,
+            label: p.label,
             overlay: laika_core::state::overlay_lines(
                 self.overlay,
                 &p.filename,
@@ -11913,9 +12038,14 @@ impl Laika {
                 // so row heights track window resizes and sidebar toggles.
                 canvas(
                     move |b, window, _| {
-                        if meter.get().size.width != b.size.width {
+                        let old = meter.get();
+                        if old != b {
                             meter.set(b);
-                            window.refresh();
+                            // V30: origin feeds drag hit-testing; only a
+                            // width change needs a re-render.
+                            if old.size.width != b.size.width {
+                                window.refresh();
+                            }
                         }
                     },
                     |_, _, _, _| {},
@@ -11923,6 +12053,7 @@ impl Laika {
                 .absolute()
                 .size_full(),
             )
+            .children(self.album_insert_marker())
             .child(
                 uniform_list("grid", rows.len(), move |range, window, _cx| {
                     let mut outside = false;
@@ -12184,6 +12315,15 @@ impl Laika {
                     " · REJECTED"
                 } else {
                     ""
+                };
+                // V13: the label name rides along too.
+                let flagged = if p.label > 0 {
+                    format!(
+                        "{flagged} · {}",
+                        self.coll.names.name(p.label).to_uppercase()
+                    )
+                } else {
+                    flagged.to_string()
                 };
                 // U07: zoom level plus detail state, so an enlarged
                 // fallback is never mistaken for native pixels.
@@ -13479,6 +13619,10 @@ impl Laika {
             ),
         ] {
             col = col.child(self.meta_field_row(label, id, tip, cx));
+            // V30: the album's own caption sits under the photo caption.
+            if id == text_input::FieldId::MetaCaption {
+                col = col.children(self.album_caption_row(cx));
+            }
         }
         // Metadata presets: apply chips + save box.
         let presets = self
@@ -14363,6 +14507,7 @@ impl Laika {
             p.rating = snap.rating;
             p.picked = snap.picked;
             p.rejected = snap.rejected;
+            p.label = snap.color_label;
         }
         self.record_step(pid, "Snapshot", "", before);
         self.apply_snap(pid, snap, cx);
@@ -14485,6 +14630,16 @@ impl Laika {
                             }),
                         )
                         .children(thumb.map(|image| img(ImageSource::Render(image)).size_full()))
+                        // V13: label swatch in the corner.
+                        .when(p.label > 0, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .right(px(3.))
+                                    .bottom(px(3.))
+                                    .child(collections::label_swatch(p.label, 7.)),
+                            )
+                        })
                         .when(!has_thumb, |d| {
                             d.bg(linear_gradient(
                                 160.,
@@ -17513,7 +17668,8 @@ impl Laika {
                 return;
             }
         };
-        let ids = self.targets();
+        // V30: files number in the order shown (album order in an album).
+        let ids = self.in_visible_order(self.targets());
         if ids.is_empty() {
             self.status_note = "select photos first — nothing to export".to_string();
             cx.notify();
@@ -21810,14 +21966,20 @@ fn grid_cell(
                 } else {
                     None
                 };
-                match dot {
-                    Some(color) => div()
+                // V13: the label swatch sits beside the flag dot.
+                let label = (badges.label && c.label > 0).then_some(c.label);
+                if dot.is_none() && label.is_none() {
+                    div().into_any_element()
+                } else {
+                    div()
                         .absolute()
                         .left(px(5.))
                         .top(px(5.))
-                        .child(div().size(px(7.)).rounded_full().bg(rgb(color)))
-                        .into_any_element(),
-                    None => div().into_any_element(),
+                        .flex()
+                        .gap(px(3.))
+                        .children(dot.map(|color| div().size(px(7.)).rounded_full().bg(rgb(color))))
+                        .children(label.map(|l| collections::label_swatch(l, 7.)))
+                        .into_any_element()
                 }
             } else {
                 let below = c.caption_below;
@@ -21889,7 +22051,10 @@ fn grid_cell(
                     if badges.keywords && c.has_keywords {
                         row = row.child(badge("KW".to_string(), TEXT_SECONDARY));
                     }
-                    // (label renders with V13; the toggle already persists.)
+                }
+                // V13: label swatch at every size (small, never clipped).
+                if badges.label && c.label > 0 {
+                    row = row.child(collections::label_swatch(c.label, 7.));
                 }
                 if badges.flag && c.picked {
                     row = row.child(badge("PICK".to_string(), accent_line()));
@@ -22445,6 +22610,17 @@ impl Render for Laika {
                         if dragging_photos {
                             this.tooltip = None;
                             let hover = this.folder_at(pos);
+                            // V30: over the grid in album order, the drag
+                            // reorders (a folder under the pointer wins).
+                            let slot = if hover.is_none() && this.album_reorder_target().is_some() {
+                                this.grid_insert_index(pos)
+                            } else {
+                                None
+                            };
+                            if this.coll.drop_at.get() != slot {
+                                this.coll.drop_at.set(slot);
+                                cx.notify();
+                            }
                             let cur = this.drop_folder.take();
                             if cur != hover {
                                 this.drop_folder.set(hover);
@@ -22628,10 +22804,15 @@ impl Render for Laika {
                                 let drop = this.drop_folder.take();
                                 if moved {
                                     if let Some(folder) = drop {
+                                        this.coll.drop_at.set(None);
                                         this.drop_photos_on_folder(targets, folder, cx);
+                                        this.suppress_click = true;
+                                    } else if this.coll.drop_at.get().is_some() {
+                                        this.drop_album_reorder(targets, cx);
                                         this.suppress_click = true;
                                     }
                                 }
+                                this.coll.drop_at.set(None);
                                 cx.notify();
                             }
                             // U07: still viewport press = click toggles the
@@ -23003,6 +23184,14 @@ impl Render for Laika {
                     "/" => {
                         this.focus_field(text_input::FieldId::SearchQuery, cx);
                     }
+                    // V13: color labels (6 red, 7 yellow, 8 green, 9 blue).
+                    "6" | "7" | "8" | "9" => {
+                        if let Some(l) = laika_core::labels::label_for_key(key) {
+                            this.apply_label(l, cx);
+                        }
+                    }
+                    // V13: Quick Collection / target collection toggle.
+                    "b" => this.toggle_in_target(cx),
                     "0" => this.apply_rating(0, cx),
                     "1" => this.apply_rating(1, cx),
                     "2" => this.apply_rating(2, cx),
@@ -23038,6 +23227,7 @@ impl Render for Laika {
                         this.focused_param = None;
                         this.drag_from = None;
                         this.drop_folder.set(None);
+                        this.coll.drop_at.set(None);
                         cx.notify();
                     }
                     // V17: lights cycle (normal → dim → out).
@@ -23154,7 +23344,7 @@ impl Laika {
         let (pid, (x, y)) = self.context_menu?;
         let photo = self.find(pid)?;
         const W: f32 = 210.;
-        const H: f32 = 236.;
+        const H: f32 = 300.;
         let vp = window.viewport_size();
         let left = x.min(vp.width.as_f32() - W - 6.).max(6.);
         let top = y.min(vp.height.as_f32() - H - 6.).max(6.);
@@ -23247,6 +23437,7 @@ impl Laika {
                     .child(photo.filename.clone()),
             )
             .child(stars)
+            .child(self.label_menu_row(pid, cx))
             .child(sep())
             .child(
                 item("ctx-export", "Export\u{2026}".to_string(), true).on_click(cx.listener(
@@ -23258,6 +23449,20 @@ impl Laika {
                     },
                 )),
             );
+        // V13: add to the target collection (B does the same toggle).
+        if let Some(target) = self.target_collection() {
+            let cid = target.id;
+            menu = menu.child(
+                item("ctx-collection", format!("Add to {}", target.name), true).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.close_context_menu();
+                        this.menu_target(pid, cx);
+                        this.add_targets_to(cid, cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
         menu = menu.child(
             item("ctx-apple", "Add to Apple Photos".to_string(), true).on_click(cx.listener(
                 move |this, _, _, cx| {
@@ -26032,13 +26237,39 @@ impl Laika {
                                 .join(" ")
                         )),
                 )
+                .child(section("Color labels"))
+                .children(
+                    [
+                        (1u8, "Red · 6", "Red"),
+                        (2, "Yellow · 7", "Yellow"),
+                        (3, "Green · 8", "Green"),
+                        (4, "Blue · 9", "Blue"),
+                        (5, "Purple", "Purple"),
+                    ]
+                    .into_iter()
+                    .map(|(i, label, placeholder)| {
+                        self.backup_field(
+                            text_input::FieldId::LabelName(i),
+                            label,
+                            self.coll.names.name(i),
+                            placeholder,
+                            cx,
+                        )
+                    }),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Names are saved with this catalog and written to sidecars as xmp:Label (Lightroom reads the name). Clear a name to restore the default."),
+                )
                 .child(section("Slideshow"))
                 .child(self.slideshow_settings(cx))
                 .child(
                     div()
                         .text_size(px(11.5))
                         .text_color(rgb(TEXT_DIM))
-                        .child("⌘Enter plays the selection, or everything shown. Space pauses · arrows step · 0–5 and P/X/U mark the slide · Esc returns to Loupe. Saved with this catalog."),
+                        .child("⌘Enter plays the selection, or everything shown. Space pauses · arrows step · 0–5, 6–9 and P/X/U mark the slide · Esc returns to Loupe. Saved with this catalog."),
                 ),
             560.,
         )
@@ -26129,7 +26360,7 @@ impl Laika {
     }
 
     fn help_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        const ROWS: [(&str, &str); 59] = [
+        const ROWS: [(&str, &str); 61] = [
             ("G / E / D", "Grid · Loupe · Develop"),
             ("← → ↑ ↓", "Move through photos (Shift extends)"),
             ("⌘A / ⌘D", "Select visible · clear selection"),
@@ -26137,6 +26368,14 @@ impl Laika {
             ("P / X / U", "Pick · reject · unflag"),
             ("A", "Auto-advance after rating/flag (culling)"),
             ("0–5", "Star rating"),
+            (
+                "6 / 7 / 8 / 9",
+                "Color label red · yellow · green · blue (again clears)",
+            ),
+            (
+                "B",
+                "Add to / remove from the target collection (Quick Collection)",
+            ),
             ("Click a value", "Type an exact slider number"),
             ("← → on a slider", "Adjust it (click a slider first)"),
             ("In a field", "Type · ⌘A/C/X/V/Z · arrows select"),
@@ -26344,6 +26583,11 @@ fn field_tag(id: text_input::FieldId) -> usize {
         text_input::FieldId::PhotosAlbum => 63,
         text_input::FieldId::InfoFileLine => 64,
         text_input::FieldId::InfoExposureLine => 65,
+        text_input::FieldId::LabelName(i) => 70 + i as usize,
+        text_input::FieldId::CollectionName => 76,
+        text_input::FieldId::AlbumTitle => 77,
+        text_input::FieldId::AlbumDescription => 78,
+        text_input::FieldId::AlbumCaption => 79,
         text_input::FieldId::CropX => 66,
         text_input::FieldId::CropY => 67,
         text_input::FieldId::CropW => 68,
@@ -26685,6 +26929,7 @@ fn main() {
                         .to_string(),
                     slides: Default::default(),
                     geo: Default::default(),
+                    coll: Default::default(),
                     forced_targets: None,
                     auto_advance: false,
                     zoom: zoom::ZoomLevel::Fit,
@@ -26812,6 +27057,9 @@ fn main() {
                 }
                 // V16: cell prefs ride along.
                 this.load_cell_prefs();
+                // V22 overlay/aspect presets and V13 labels + collections.
+                this.load_geo_prefs();
+                this.load_collections();
                 // V04: watched-folder poll loop (first pass baselines only).
                 this.kick_watch_loop(cx);
                 // CLI-configured or previously queued work starts in the

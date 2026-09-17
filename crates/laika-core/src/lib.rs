@@ -2,10 +2,12 @@
 //! Phase 1: AppState-adjacent types live here so later phases can grow the DB
 //! without touching UI code. Full SQLite storage lands in Phase 2.
 
+pub mod album;
 pub mod apple_photos;
 pub mod catalog;
 pub mod edit;
 pub mod import;
+pub mod labels;
 pub mod lines;
 pub mod pairs;
 pub mod photo;

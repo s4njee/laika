@@ -41,6 +41,9 @@ pub enum SortField {
     Captured,
     Filename,
     Rating,
+    /// V30: the viewed collection's custom order (applied by the app;
+    /// without a collection it reads as capture order).
+    Album,
 }
 
 /// U12: sort direction.
@@ -84,6 +87,15 @@ pub struct Filters {
     /// The album's name, for labels.
     #[serde(default)]
     pub album_name: String,
+    /// V13: color label bitmask (bit 0 = no label, 1..=5 = colors);
+    /// 0 = any. Combines with rating and flag filters.
+    #[serde(default)]
+    pub labels: u8,
+    /// V13: collection scope (membership resolved by the app).
+    #[serde(default)]
+    pub collection: Option<i64>,
+    #[serde(default)]
+    pub collection_name: String,
     pub sort: SortSpec,
 }
 
@@ -103,6 +115,8 @@ impl Filters {
             || self.date_to.is_some()
             || self.folder.is_some()
             || self.album.is_some()
+            || self.labels != 0
+            || self.collection.is_some()
     }
 
     /// Human list of active constraints (empty-results explanation).
@@ -153,6 +167,17 @@ impl Filters {
         if self.album.is_some() {
             out.push(format!("album {}", self.album_name));
         }
+        if self.labels != 0 {
+            let names = ["no label", "red", "yellow", "green", "blue", "purple"];
+            let picked: Vec<&str> = (0..6)
+                .filter(|b| self.labels & (1 << b) != 0)
+                .map(|b| names[b])
+                .collect();
+            out.push(format!("label {}", picked.join("/")));
+        }
+        if self.collection.is_some() {
+            out.push(format!("collection {}", self.collection_name));
+        }
         out
     }
 
@@ -177,6 +202,9 @@ impl Filters {
         if self.unsynced_only && !matches!(p.sync, SyncState::Pending | SyncState::Failed) {
             return false;
         }
+        if !crate::labels::matches_mask(self.labels, p.label) {
+            return false;
+        }
         true
     }
 
@@ -189,6 +217,7 @@ impl Filters {
             rating: p.rating,
             picked: p.picked,
             rejected: p.rejected,
+            label: p.label,
             sync: p.sync,
             tint: (0, 0),
         };
@@ -242,6 +271,7 @@ impl Filters {
             SortField::Captured => a.captured_at.cmp(&b.captured_at),
             SortField::Filename => a.filename.cmp(&b.filename),
             SortField::Rating => a.rating.cmp(&b.rating),
+            SortField::Album => a.captured_at.cmp(&b.captured_at),
         };
         let ord = if ord == Ordering::Equal && self.sort.field != SortField::Filename {
             a.filename.cmp(&b.filename)
@@ -684,6 +714,7 @@ mod tests {
             rating,
             picked,
             rejected: false,
+            label: 0,
             sync,
             tint: (0, 0),
         }

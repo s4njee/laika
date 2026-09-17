@@ -721,6 +721,8 @@ pub struct HistoryStep {
     pub rating: u8,
     pub picked: bool,
     pub rejected: bool,
+    /// V13: color label rides every step (0 = none).
+    pub color_label: u8,
 }
 
 /// U14: full restorable photo state for undo steps, snapshots, and reloads.
@@ -740,6 +742,8 @@ pub struct Snap {
     pub rating: u8,
     pub picked: bool,
     pub rejected: bool,
+    /// V13: color label rides every step (0 = none).
+    pub color_label: u8,
 }
 
 /// Persisted history rows survive unknown future fields.
@@ -772,6 +776,8 @@ pub struct HistoryJson {
     pub picked: bool,
     #[serde(default)]
     pub rejected: bool,
+    #[serde(default)]
+    pub color_label: u8,
 }
 
 impl HistoryStep {
@@ -791,6 +797,7 @@ impl HistoryStep {
             rating: self.rating,
             picked: self.picked,
             rejected: self.rejected,
+            color_label: self.color_label,
         }
     }
 
@@ -812,6 +819,7 @@ impl HistoryStep {
             rating: j.rating,
             picked: j.picked,
             rejected: j.rejected,
+            color_label: j.color_label,
         })
     }
 }
@@ -873,6 +881,7 @@ impl Edit {
             rating: snap.rating,
             picked: snap.picked,
             rejected: snap.rejected,
+            color_label: snap.color_label,
         });
         self.params = snap.params;
         self.crop = snap.crop;
@@ -911,6 +920,7 @@ impl Edit {
                 rating: 0,
                 picked: false,
                 rejected: false,
+                color_label: 0,
             },
         );
     }
@@ -934,6 +944,7 @@ impl Edit {
                 rating: snap.rating,
                 picked: snap.picked,
                 rejected: snap.rejected,
+                color_label: snap.color_label,
             });
             self.cursor = 1;
         }
@@ -1004,6 +1015,7 @@ pub fn step_snap(step: &HistoryStep) -> Snap {
         rating: step.rating,
         picked: step.picked,
         rejected: step.rejected,
+        color_label: step.color_label,
     }
 }
 
@@ -1205,6 +1217,7 @@ mod tests {
             rating: 4,
             picked: true,
             rejected: false,
+            color_label: 3,
         }
     }
 

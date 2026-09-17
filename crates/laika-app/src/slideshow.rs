@@ -567,6 +567,11 @@ impl Laika {
                 let n = key.parse::<u8>().unwrap_or(0);
                 self.slide_mark(cx, move |this, cx| this.apply_rating(n, cx));
             }
+            "6" | "7" | "8" | "9" if !cmd => {
+                if let Some(l) = laika_core::labels::label_for_key(key) {
+                    self.slide_mark(cx, move |this, cx| this.apply_label(l, cx));
+                }
+            }
             "p" if !cmd => self.slide_mark(cx, |this, cx| this.apply_flag(true, cx)),
             "x" if !cmd => self.slide_mark(cx, |this, cx| this.apply_flag(false, cx)),
             "u" if !cmd => self.slide_mark(cx, |this, cx| this.clear_flags(cx)),
@@ -602,7 +607,12 @@ impl Laika {
                 } else {
                     ""
                 };
-                format!("{stars}{flag}")
+                let label = if p.label > 0 {
+                    format!(" · {}", self.coll.names.name(p.label))
+                } else {
+                    String::new()
+                };
+                format!("{stars}{flag}{label}")
             })
             .unwrap_or_default();
         if let Some(show) = self.slides.show.as_mut() {
@@ -728,7 +738,13 @@ impl Laika {
         let caption = photo
             .as_ref()
             .filter(|_| prefs.caption)
-            .map(|p| p.title.trim().to_string())
+            // V30: inside an album its caption wins over the photo title.
+            .map(|p| {
+                self.album_caption(p.id)
+                    .unwrap_or_else(|| p.title.clone())
+                    .trim()
+                    .to_string()
+            })
             .filter(|t| !t.is_empty());
         let caption_el = caption.map(|text| {
             div()

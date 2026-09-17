@@ -104,6 +104,33 @@ pub struct DbPhoto {
     /// V05: video duration + codec (0/empty for stills).
     pub duration_ms: i64,
     pub codec: String,
+    /// V13: color label, 0 = none, 1..=5 (see `labels`).
+    pub label: u8,
+}
+
+/// V13: a collection row for the rail. V30: every collection is also an
+/// album — gallery title (empty = the name), description, and cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub quick: bool,
+    pub count: usize,
+    pub title: String,
+    pub description: String,
+    /// Cover photo, only while it is still a member.
+    pub cover: Option<i64>,
+}
+
+impl Collection {
+    /// Gallery-facing title: the album title, else the collection name.
+    pub fn display_title(&self) -> &str {
+        if self.title.trim().is_empty() {
+            &self.name
+        } else {
+            &self.title
+        }
+    }
 }
 
 impl DbPhoto {
@@ -738,6 +765,67 @@ pub mod migrations {
         .map_err(|e| format!("photos albums: {e}"))
     }
 
+    /// V13: color labels on photos; collections (the Quick Collection is
+    /// the one row with kind 'quick') and their membership.
+    fn migrate_v7(conn: &Connection) -> Result<(), String> {
+        let has_label = conn
+            .prepare("SELECT 1 FROM pragma_table_info('photos') WHERE name = 'label'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())))
+            .is_ok();
+        if !has_label {
+            conn.execute_batch("ALTER TABLE photos ADD COLUMN label INTEGER DEFAULT 0")
+                .map_err(|e| format!("photo labels: {e}"))?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS collections(
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL,
+               kind TEXT NOT NULL DEFAULT 'user',
+               created_at TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS collection_items(
+               collection_id INTEGER NOT NULL,
+               photo_id INTEGER NOT NULL,
+               added_at TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(collection_id, photo_id)
+             );
+             CREATE INDEX IF NOT EXISTS collection_items_photo ON collection_items(photo_id);
+             CREATE INDEX IF NOT EXISTS photos_label ON photos(label);",
+        )
+        .map_err(|e| format!("collections: {e}"))
+    }
+
+    /// V30: albums — custom order and per-album captions on membership,
+    /// cover/title/description on the collection. Existing members keep
+    /// the order they were added in.
+    fn migrate_v8(conn: &Connection) -> Result<(), String> {
+        let has = |table: &str, col: &str| {
+            conn.prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"
+            ))
+            .and_then(|mut s| s.query_row([], |_| Ok(())))
+            .is_ok()
+        };
+        for (table, col, ddl) in [
+            ("collection_items", "position", "INTEGER NOT NULL DEFAULT 0"),
+            ("collection_items", "caption", "TEXT NOT NULL DEFAULT ''"),
+            (
+                "collections",
+                "cover_photo_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("collections", "title", "TEXT NOT NULL DEFAULT ''"),
+            ("collections", "description", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !has(table, col) {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                    .map_err(|e| format!("albums ({table}.{col}): {e}"))?;
+            }
+        }
+        conn.execute_batch("UPDATE collection_items SET position = rowid WHERE position = 0;")
+            .map_err(|e| format!("album order backfill: {e}"))
+    }
+
     pub const MIGRATIONS: &[Migration] = &[
         Migration {
             version: 1,
@@ -769,10 +857,20 @@ pub mod migrations {
             name: "apple photos albums",
             apply: migrate_v6,
         },
+        Migration {
+            version: 7,
+            name: "color labels, collections",
+            apply: migrate_v7,
+        },
+        Migration {
+            version: 8,
+            name: "albums: order, captions, cover",
+            apply: migrate_v8,
+        },
     ];
 
     /// Highest schema this build opens. Bump with every `MIGRATIONS` entry.
-    pub const APP_SCHEMA_VERSION: u32 = 6;
+    pub const APP_SCHEMA_VERSION: u32 = 8;
 
     /// Schema version of an open db (0 = pre-versioning prototype era).
     pub fn read_version(conn: &Connection, db_path: &std::path::Path) -> Result<u32, String> {
@@ -1305,7 +1403,7 @@ impl Catalog {
              creator, copyright, rights, contact, captured_orig, capture_offset_min,
              duration_ms, codec, title, caption, headline, location,
              exif_program, exif_metering, exif_flash, exif_focal35,
-             exif_serial, exif_firmware, exif_gps
+             exif_serial, exif_firmware, exif_gps, label
              FROM photos WHERE catalog_id = ?1 ORDER BY captured_at, filename",
         );
         let Ok(stmt) = stmt.as_mut() else {
@@ -1351,7 +1449,7 @@ impl Catalog {
                  creator, copyright, rights, contact, captured_orig, capture_offset_min,
                  duration_ms, codec, title, caption, headline, location,
                  exif_program, exif_metering, exif_flash, exif_focal35,
-                 exif_serial, exif_firmware, exif_gps
+                 exif_serial, exif_firmware, exif_gps, label
                  FROM photos WHERE catalog_id = ?1 AND id = ?2",
             )
             .ok()?;
@@ -1376,6 +1474,359 @@ impl Catalog {
             )
             .map(|_| ())
             .map_err(|e| format!("save rating: {e}"))
+    }
+
+    /// V13: color label (0 clears).
+    pub fn set_label(&self, id: i64, label: u8) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE photos SET label = ?1 WHERE id = ?2",
+                params![label.min(5), id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("save label: {e}"))
+    }
+
+    /// V13: this catalog's label names (editable, per catalog).
+    pub fn label_names(&self) -> crate::labels::LabelNames {
+        crate::labels::LabelNames::parse(&self.get_import_default("label_names"))
+    }
+
+    pub fn set_label_names(&self, names: &crate::labels::LabelNames) {
+        self.set_import_default("label_names", &names.serialize());
+    }
+
+    // ---- V13 collections -------------------------------------------------
+
+    /// Every collection, the Quick Collection first (created on demand),
+    /// then by name, with member counts.
+    pub fn collections(&self) -> Vec<Collection> {
+        let _ = self.quick_collection_id();
+        let mut stmt = match self.conn.prepare(
+            "SELECT c.id, c.name, c.kind,
+               (SELECT count(*) FROM collection_items i
+                  JOIN photos p ON p.id = i.photo_id
+                 WHERE i.collection_id = c.id),
+               c.title, c.description,
+               (SELECT i.photo_id FROM collection_items i
+                 WHERE i.collection_id = c.id AND i.photo_id = c.cover_photo_id)
+             FROM collections c
+             ORDER BY c.kind = 'quick' DESC, c.name COLLATE NOCASE",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(Collection {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                quick: r.get::<_, String>(2)? == "quick",
+                count: r.get::<_, i64>(3)? as usize,
+                title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                description: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                cover: r.get::<_, Option<i64>>(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// The Quick Collection's id (exactly one per catalog).
+    pub fn quick_collection_id(&self) -> Result<i64, String> {
+        if let Ok(id) = self.conn.query_row(
+            "SELECT id FROM collections WHERE kind = 'quick' ORDER BY id LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return Ok(id);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO collections(name, kind, created_at) VALUES ('Quick Collection', 'quick', ?1)",
+                [chrono_stamp()],
+            )
+            .map_err(|e| format!("quick collection: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn check_collection_name(&self, name: &str, except: Option<i64>) -> Result<String, String> {
+        let t = name.trim();
+        if t.is_empty() {
+            return Err("name the collection".to_string());
+        }
+        if t.chars().count() > 80 {
+            return Err("keep collection names under 80 characters".to_string());
+        }
+        if t.eq_ignore_ascii_case("Quick Collection") {
+            return Err("that name belongs to the Quick Collection".to_string());
+        }
+        let clash: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND kind = 'user'",
+                [t],
+                |r| r.get(0),
+            )
+            .ok();
+        if clash.is_some_and(|id| Some(id) != except) {
+            return Err(format!("a collection named {t} already exists"));
+        }
+        Ok(t.to_string())
+    }
+
+    pub fn create_collection(&self, name: &str) -> Result<i64, String> {
+        let name = self.check_collection_name(name, None)?;
+        self.conn
+            .execute(
+                "INSERT INTO collections(name, kind, created_at) VALUES (?1, 'user', ?2)",
+                params![name, chrono_stamp()],
+            )
+            .map_err(|e| format!("create collection: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_collection(&self, id: i64, name: &str) -> Result<(), String> {
+        if self.quick_collection_id().ok() == Some(id) {
+            return Err("the Quick Collection keeps its name".to_string());
+        }
+        let name = self.check_collection_name(name, Some(id))?;
+        self.conn
+            .execute(
+                "UPDATE collections SET name = ?1 WHERE id = ?2",
+                params![name, id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("rename collection: {e}"))
+    }
+
+    /// Delete a user collection (photos stay in the catalog). The Quick
+    /// Collection can only be cleared.
+    pub fn delete_collection(&self, id: i64) -> Result<(), String> {
+        if self.quick_collection_id().ok() == Some(id) {
+            return Err("clear the Quick Collection instead".to_string());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM collection_items WHERE collection_id = ?1",
+                [id],
+            )
+            .and_then(|_| {
+                self.conn
+                    .execute("DELETE FROM collections WHERE id = ?1", [id])
+            })
+            .map(|_| ())
+            .map_err(|e| format!("delete collection: {e}"))
+    }
+
+    pub fn collection_members(&self, id: i64) -> HashSet<i64> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT photo_id FROM collection_items WHERE collection_id = ?1")
+        {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        stmt.query_map([id], |r| r.get::<_, i64>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Add photos (already-present ones are skipped). Returns how many
+    /// were new. V30: new members append to the end of the album order.
+    pub fn add_to_collection(&self, id: i64, photos: &[i64]) -> Result<usize, String> {
+        let stamp = chrono_stamp();
+        let mut next: i64 = self
+            .conn
+            .query_row(
+                "SELECT coalesce(max(position), 0) FROM collection_items WHERE collection_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let mut added = 0;
+        for pid in photos {
+            next += 1;
+            added += self
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO collection_items(collection_id, photo_id, added_at, position)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, pid, stamp, next],
+                )
+                .map_err(|e| format!("add to collection: {e}"))?;
+        }
+        Ok(added)
+    }
+
+    // ---- V30 albums ------------------------------------------------------
+
+    /// Members in album order (removed photos simply drop out; the rest
+    /// keep their relative order).
+    pub fn album_order(&self, id: i64) -> Vec<i64> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT i.photo_id FROM collection_items i
+               JOIN photos p ON p.id = i.photo_id
+              WHERE i.collection_id = ?1
+              ORDER BY i.position, i.added_at, i.photo_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([id], |r| r.get::<_, i64>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Persist a full order (members not listed keep their place after
+    /// the listed ones, in their old order). One transaction.
+    pub fn set_album_order(&self, id: i64, order: &[i64]) -> Result<(), String> {
+        let current = self.album_order(id);
+        let listed: HashSet<i64> = order.iter().copied().collect();
+        let full: Vec<i64> = order
+            .iter()
+            .copied()
+            .filter(|p| current.contains(p))
+            .chain(current.iter().copied().filter(|p| !listed.contains(p)))
+            .collect();
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("album order: {e}"))?;
+        let result = (|| {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "UPDATE collection_items SET position = ?1
+                      WHERE collection_id = ?2 AND photo_id = ?3",
+                )
+                .map_err(|e| e.to_string())?;
+            for (i, pid) in full.iter().enumerate() {
+                stmt.execute(params![i as i64 + 1, id, pid])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok::<(), String>(())
+        })();
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|e| format!("album order: {e}")),
+            Err(e) => {
+                self.conn.execute_batch("ROLLBACK").ok();
+                Err(format!("album order: {e}"))
+            }
+        }
+    }
+
+    /// Move photos to sit before `before` (None = the end). Returns the
+    /// new order.
+    pub fn move_in_album(
+        &self,
+        id: i64,
+        moving: &[i64],
+        before: Option<i64>,
+    ) -> Result<Vec<i64>, String> {
+        let order = crate::album::reorder(&self.album_order(id), moving, before);
+        self.set_album_order(id, &order)?;
+        Ok(order)
+    }
+
+    pub fn set_album_cover(&self, id: i64, photo: Option<i64>) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE collections SET cover_photo_id = ?1 WHERE id = ?2",
+                params![photo.unwrap_or(0), id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("album cover: {e}"))
+    }
+
+    pub fn set_album_text(&self, id: i64, title: &str, description: &str) -> Result<(), String> {
+        if title.chars().count() > 200 {
+            return Err("keep the album title under 200 characters".to_string());
+        }
+        if description.chars().count() > 4000 {
+            return Err("keep the description under 4000 characters".to_string());
+        }
+        self.conn
+            .execute(
+                "UPDATE collections SET title = ?1, description = ?2 WHERE id = ?3",
+                params![title.trim(), description.trim(), id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("album text: {e}"))
+    }
+
+    /// Album-only caption for one member (the photo's own title and
+    /// caption are untouched).
+    pub fn set_album_caption(&self, id: i64, photo: i64, caption: &str) -> Result<(), String> {
+        if caption.chars().count() > 2000 {
+            return Err("keep captions under 2000 characters".to_string());
+        }
+        let n = self
+            .conn
+            .execute(
+                "UPDATE collection_items SET caption = ?1 WHERE collection_id = ?2 AND photo_id = ?3",
+                params![caption.trim(), id, photo],
+            )
+            .map_err(|e| format!("album caption: {e}"))?;
+        if n == 0 {
+            return Err("that photo isn't in this album".to_string());
+        }
+        Ok(())
+    }
+
+    /// Non-empty album captions by photo.
+    pub fn album_captions(&self, id: i64) -> HashMap<i64, String> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT photo_id, caption FROM collection_items
+              WHERE collection_id = ?1 AND caption <> ''",
+        ) {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        stmt.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn remove_from_collection(&self, id: i64, photos: &[i64]) -> Result<usize, String> {
+        let mut removed = 0;
+        for pid in photos {
+            removed += self
+                .conn
+                .execute(
+                    "DELETE FROM collection_items WHERE collection_id = ?1 AND photo_id = ?2",
+                    params![id, pid],
+                )
+                .map_err(|e| format!("remove from collection: {e}"))?;
+        }
+        Ok(removed)
+    }
+
+    pub fn clear_collection(&self, id: i64) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM collection_items WHERE collection_id = ?1",
+                [id],
+            )
+            .map_err(|e| format!("clear collection: {e}"))
+    }
+
+    /// Save the Quick Collection as a named collection and clear it
+    /// (Lightroom's default). Returns the new collection's id.
+    pub fn save_quick_collection(&self, name: &str) -> Result<i64, String> {
+        let quick = self.quick_collection_id()?;
+        let members: Vec<i64> = self.collection_members(quick).into_iter().collect();
+        if members.is_empty() {
+            return Err("the Quick Collection is empty".to_string());
+        }
+        let id = self.create_collection(name)?;
+        // V30: the saved album keeps the Quick Collection's order.
+        let ordered = self.album_order(quick);
+        let _ = members;
+        self.add_to_collection(id, &ordered)?;
+        self.clear_collection(quick)?;
+        Ok(id)
     }
 
     pub fn set_flag(&self, id: i64, picked: bool, rejected: bool) -> Result<(), String> {
@@ -1656,6 +2107,13 @@ impl Catalog {
         if let Some(rating) = side.rating {
             self.set_rating(id, rating)?;
         }
+        // V13: xmp:Label by name; text this catalog doesn't know (e.g.
+        // "Select") leaves the label alone.
+        if let Some(text) = side.label.as_deref() {
+            if let Some(label) = self.label_names().from_xmp(text) {
+                self.set_label(id, label)?;
+            }
+        }
         // Adopt carried authorship field-by-field: a sidecar that only
         // sets the creator must not blank catalog copyright.
         let cur = self.photo_authorship(id);
@@ -1684,6 +2142,9 @@ impl Catalog {
             } else {
                 side.keywords.clone()
             },
+            // Already applied above (by name).
+            label: cur.label.clone(),
+            label_names: cur.label_names.clone(),
         };
         let got_auth = !side.title.is_empty()
             || !side.caption.is_empty()
@@ -1752,6 +2213,11 @@ impl Catalog {
             contact: meta.contact,
             location: meta.location,
             keywords: self.export_keyword_paths(id),
+            label: self
+                .photo_by_id(id)
+                .map(|p| self.label_names().name(p.label).to_string())
+                .unwrap_or_default(),
+            label_names: self.label_names().0.to_vec(),
         }
     }
 
@@ -3921,6 +4387,10 @@ impl Catalog {
                 .execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [id])
                 .map_err(|e| format!("remove from catalog: {e}"))?;
         }
+        // V13: collection membership goes with the photo.
+        self.conn
+            .execute("DELETE FROM collection_items WHERE photo_id = ?1", [id])
+            .map_err(|e| format!("remove from catalog: {e}"))?;
         self.conn
             .execute("DELETE FROM keywords WHERE photo_id = ?1", [id])
             .map(|_| ())
@@ -4005,9 +4475,9 @@ impl Catalog {
                      sync_state, remote_key, creator, copyright, rights, contact, captured_orig,
                      capture_offset_min, duration_ms, codec, title, caption, headline, location,
                      exif_program, exif_metering, exif_flash, exif_focal35, exif_serial,
-                     exif_firmware, exif_gps)
+                     exif_firmware, exif_gps, label)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
-                     ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)",
+                     ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38)",
                     params![
                         self.id, stored_path, p.filename, p.blake3, p.captured_at, p.camera, p.lens,
                         p.focal_mm, p.aperture, p.shutter, p.iso, p.width, p.height, p.rating,
@@ -4015,7 +4485,7 @@ impl Catalog {
                         p.copyright, p.rights, p.contact, p.captured_orig, p.capture_offset_min,
                         p.duration_ms, p.codec, p.title, p.caption, p.headline, p.location,
                         p.exif_program, p.exif_metering, p.exif_flash, p.exif_focal35, p.exif_serial,
-                        p.exif_firmware, p.exif_gps,
+                        p.exif_firmware, p.exif_gps, p.label,
                     ],
                 )
                 .map_err(|e| format!("restore photo: {e}"))?;
@@ -4028,10 +4498,10 @@ impl Catalog {
                      sync_state, remote_key, creator, copyright, rights, contact, captured_orig,
                      capture_offset_min, duration_ms, codec, title, caption, headline, location,
                      exif_program, exif_metering, exif_flash, exif_focal35, exif_serial,
-                     exif_firmware, exif_gps)
+                     exif_firmware, exif_gps, label)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                      ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,
-                     ?36,?37,?38)",
+                     ?36,?37,?38,?39)",
                     params![
                         p.id, self.id, stored_path, p.filename, p.blake3, p.captured_at, p.camera,
                         p.lens, p.focal_mm, p.aperture, p.shutter, p.iso, p.width, p.height,
@@ -4039,7 +4509,7 @@ impl Catalog {
                         p.copyright, p.rights, p.contact, p.captured_orig, p.capture_offset_min,
                         p.duration_ms, p.codec, p.title, p.caption, p.headline, p.location,
                         p.exif_program, p.exif_metering, p.exif_flash, p.exif_focal35, p.exif_serial,
-                        p.exif_firmware, p.exif_gps,
+                        p.exif_firmware, p.exif_gps, p.label,
                     ],
                 )
                 .map_err(|e| format!("restore photo: {e}"))?;
@@ -4598,6 +5068,7 @@ impl Catalog {
             rating: snap.rating,
             picked: snap.picked,
             rejected: snap.rejected,
+            color_label: snap.color_label,
         })
         .map_err(|e| format!("save snapshot: {e}"))?;
         // Same-name snapshots replace (one row per treatment name).
@@ -4658,6 +5129,7 @@ impl Catalog {
                         rating: j.rating,
                         picked: j.picked,
                         rejected: j.rejected,
+                        color_label: j.color_label,
                     },
                 ))
             })
@@ -4727,6 +5199,8 @@ fn row_to_photo(r: &rusqlite::Row) -> rusqlite::Result<DbPhoto> {
         exif_serial: r.get::<_, Option<String>>(35)?.unwrap_or_default(),
         exif_firmware: r.get::<_, Option<String>>(36)?.unwrap_or_default(),
         exif_gps: r.get::<_, Option<String>>(37)?.unwrap_or_default(),
+        // V13: appended last so earlier positions never shift.
+        label: (opt_i(38).clamp(0, 5)) as u8,
     })
 }
 
@@ -5250,6 +5724,199 @@ mod tests {
         // the library.
         cat.forget_photos_links(&[id]);
         assert!(plan(&c, &cat.photos_links(), &HashSet::new(), &s).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v30_two_hundred_photo_order_survives_reopen() {
+        let dir = workdir("v30-200");
+        let db = dir.join("c.db");
+        let (album, reversed) = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            let mut ids = Vec::new();
+            for i in 0..200 {
+                cat.conn
+                    .execute(
+                        "INSERT INTO photos(catalog_id, path, filename, blake3, captured_at)
+                         VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00')",
+                        params![
+                            cat.id,
+                            format!("/x/p{i}.jpg"),
+                            format!("p{i}.jpg"),
+                            format!("h{i}")
+                        ],
+                    )
+                    .unwrap();
+                ids.push(cat.conn.last_insert_rowid());
+            }
+            let album = cat.create_collection("Big").unwrap();
+            cat.add_to_collection(album, &ids).unwrap();
+            let mut reversed = ids.clone();
+            reversed.reverse();
+            cat.set_album_order(album, &reversed).unwrap();
+            // One more drag-style move on top.
+            let order = cat
+                .move_in_album(album, &[reversed[10], reversed[150]], Some(reversed[0]))
+                .unwrap();
+            (album, order)
+        };
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        assert_eq!(cat.album_order(album), reversed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v30_album_order_cover_captions() {
+        let dir = workdir("v30-albums");
+        let db = dir.join("c.db");
+        let cache = dir.join("cache");
+        let ids: Vec<i64> = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            (0..8)
+                .map(|i| {
+                    let f = dir.join(format!("p{i}.jpg"));
+                    jpeg(&f, 16 + i as u32, 12);
+                    cat.import_file(&f, &cache).unwrap().unwrap()
+                })
+                .collect()
+        };
+        let album = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            let album = cat.create_collection("Wedding").unwrap();
+            cat.add_to_collection(album, &ids[..6]).unwrap();
+            // New members append in the order given.
+            assert_eq!(cat.album_order(album), ids[..6].to_vec());
+            let order = cat
+                .move_in_album(album, &[ids[4], ids[0]], Some(ids[2]))
+                .unwrap();
+            assert_eq!(order, vec![ids[1], ids[0], ids[4], ids[2], ids[3], ids[5]]);
+            cat.add_to_collection(album, &[ids[6]]).unwrap();
+            cat.set_album_cover(album, Some(ids[3])).unwrap();
+            cat.set_album_text(album, "Anna & Ben", "June, Lisbon")
+                .unwrap();
+            cat.set_album_caption(album, ids[2], "First dance").unwrap();
+            assert!(
+                cat.set_album_caption(album, ids[7], "not a member")
+                    .is_err()
+            );
+            // The photo's own title stays untouched.
+            assert_eq!(cat.photo_by_id(ids[2]).unwrap().title, "");
+            album
+        };
+        // Survives restart; removal keeps the rest in order.
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        assert_eq!(
+            cat.album_order(album),
+            vec![ids[1], ids[0], ids[4], ids[2], ids[3], ids[5], ids[6]]
+        );
+        cat.remove_from_collection(album, &[ids[4]]).unwrap();
+        cat.remove_photo(ids[0]).unwrap();
+        assert_eq!(
+            cat.album_order(album),
+            vec![ids[1], ids[2], ids[3], ids[5], ids[6]]
+        );
+        let c = cat
+            .collections()
+            .into_iter()
+            .find(|c| c.id == album)
+            .unwrap();
+        assert_eq!(
+            (c.display_title(), c.description.as_str(), c.cover),
+            ("Anna & Ben", "June, Lisbon", Some(ids[3]))
+        );
+        assert_eq!(
+            cat.album_captions(album).get(&ids[2]).map(String::as_str),
+            Some("First dance")
+        );
+        // A cover that leaves the album reads as none.
+        cat.remove_from_collection(album, &[ids[3]]).unwrap();
+        let c = cat
+            .collections()
+            .into_iter()
+            .find(|c| c.id == album)
+            .unwrap();
+        assert_eq!(c.cover, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v13_labels_and_collections() {
+        let dir = workdir("v13-labels");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        jpeg(&dir.join("a/one.jpg"), 32, 24);
+        jpeg(&dir.join("b/two.jpg"), 40, 30);
+        let db = dir.join("c.db");
+        let cache = dir.join("cache");
+        let (one, saved) = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            let one = cat
+                .import_file(&dir.join("a/one.jpg"), &cache)
+                .unwrap()
+                .unwrap();
+            let two = cat
+                .import_file(&dir.join("b/two.jpg"), &cache)
+                .unwrap()
+                .unwrap();
+            // Labels persist and clamp.
+            cat.set_label(one, 3).unwrap();
+            cat.set_label(two, 9).unwrap();
+            assert_eq!(cat.photo_by_id(one).unwrap().label, 3);
+            assert_eq!(cat.photo_by_id(two).unwrap().label, 5);
+            // Renamed labels travel as names in the sidecar and read back.
+            let mut names = cat.label_names();
+            names.set(3, "Keepers").unwrap();
+            cat.set_label_names(&names);
+            let auth = cat.photo_authorship(one);
+            assert_eq!(auth.label, "Keepers");
+            let path = cat.photo_by_id(one).unwrap().path;
+            crate::xmp::write(
+                &path,
+                &crate::edit::defaults(),
+                0,
+                &[],
+                None,
+                &auth,
+                &Default::default(),
+            )
+            .unwrap();
+            let raw = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
+            assert!(raw.contains("xmp:Label=\"Keepers\""), "{raw}");
+            cat.set_label(one, 0).unwrap();
+            cat.apply_sidecar(one, &path).unwrap();
+            assert_eq!(cat.photo_by_id(one).unwrap().label, 3);
+            // Quick Collection across folders; saving clears it.
+            let quick = cat.quick_collection_id().unwrap();
+            assert_eq!(cat.quick_collection_id().unwrap(), quick);
+            assert_eq!(cat.add_to_collection(quick, &[one, two]).unwrap(), 2);
+            assert_eq!(cat.add_to_collection(quick, &[one]).unwrap(), 0);
+            let list = cat.collections();
+            assert!(list[0].quick && list[0].count == 2, "{list:?}");
+            assert!(cat.delete_collection(quick).is_err());
+            assert!(cat.save_quick_collection("Quick Collection").is_err());
+            let saved = cat.save_quick_collection("Portfolio").unwrap();
+            assert!(cat.collection_members(quick).is_empty());
+            assert_eq!(cat.collection_members(saved).len(), 2);
+            assert!(cat.create_collection("portfolio").is_err());
+            assert!(cat.save_quick_collection("Other").is_err(), "empty quick");
+            cat.rename_collection(saved, "Best of").unwrap();
+            // Removing a photo drops its membership.
+            cat.remove_photo(two).unwrap();
+            assert_eq!(cat.collection_members(saved), [one].into_iter().collect());
+            (one, saved)
+        };
+        // Survives reopen.
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        assert_eq!(cat.photo_by_id(one).unwrap().label, 3);
+        assert_eq!(cat.label_names().name(3), "Keepers");
+        let list = cat.collections();
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            (list[1].id, list[1].name.as_str(), list[1].count),
+            (saved, "Best of", 1)
+        );
+        cat.delete_collection(saved).unwrap();
+        assert_eq!(cat.collections().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6085,6 +6752,7 @@ mod tests {
             rating: 4,
             picked: false,
             rejected: false,
+            color_label: 0,
         };
         cat.save_snapshot(id, "s1", &snap).unwrap();
         let saved = cat.snapshot_removed(id).expect("snapshot");
@@ -6503,6 +7171,7 @@ mod tests {
                     rating: 0,
                     picked: false,
                     rejected: false,
+                    color_label: 0,
                 },
             );
             cat.save_params(id, &e).unwrap();
@@ -6865,6 +7534,7 @@ mod tests {
                 rating: 0,
                 picked: false,
                 rejected: false,
+                color_label: 0,
             };
             e.ensure_baseline(base);
             let mut p1 = crate::edit::defaults();
@@ -6885,6 +7555,7 @@ mod tests {
                     rating: 4,
                     picked: true,
                     rejected: false,
+                    color_label: 0,
                 },
             );
             cat.save_params(id, &e).unwrap();
@@ -6935,6 +7606,7 @@ mod tests {
             rating: 5,
             picked: true,
             rejected: false,
+            color_label: 4,
         };
         let row = cat.save_snapshot(7, "Warm", &snap).unwrap();
         assert!(row > 0);
@@ -6942,6 +7614,8 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].1, "Warm");
         assert_eq!(list[0].2.rating, 5);
+        // V13: the color label rides snapshots too.
+        assert_eq!(list[0].2.color_label, 4);
         assert_eq!(list[0].2.crop, Some(1.0));
         // U18: bypass flags round-trip with the snapshot.
         assert!(!list[0].2.curve_on && !list[0].2.optics_on);

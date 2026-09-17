@@ -169,6 +169,8 @@ pub struct Sidecar {
     /// Absent attributes mean "leave catalog geometry alone" (a foreign
     /// rewrite without crop keys must not wipe a Laika crop).
     pub geom: Option<crate::edit::CropGeom>,
+    /// V13: `xmp:Label` text when present (a name, mapped by the catalog).
+    pub label: Option<String>,
     /// U18: whether the file carried any tone key (a rating-only foreign
     /// rewrite must not reset catalog tone to defaults).
     pub has_tone: bool,
@@ -191,6 +193,7 @@ impl Default for Sidecar {
             location: String::new(),
             keywords: Vec::new(),
             geom: None,
+            label: None,
             has_tone: false,
         }
     }
@@ -311,6 +314,12 @@ pub struct Authorship {
     /// Full canonical paths, export-included only (leaves feed
     /// dc:subject, paths feed lr:hierarchicalSubject).
     pub keywords: Vec<String>,
+    /// V13: color label name for `xmp:Label` (empty = no label).
+    pub label: String,
+    /// V13: this catalog's label names. A carried foreign `xmp:Label`
+    /// survives only when it is none of them (e.g. Lightroom's "Select"),
+    /// so clearing a Laika label never resurrects the old text.
+    pub label_names: Vec<String>,
 }
 
 impl Authorship {
@@ -568,6 +577,10 @@ pub fn render(
         ));
     }
     desc.push_attribute(("xmp:Rating", rating.to_string().as_str()));
+    // V13: Lightroom stores the label's name.
+    if !authorship.label.trim().is_empty() {
+        desc.push_attribute(("xmp:Label", authorship.label.trim()));
+    }
     // V15: orientation always explicit — tiff:Orientation for foreign
     // readers, laika:Rotation as the lossless source of truth.
     desc.push_attribute(("xmlns:tiff", "http://ns.adobe.com/tiff/1.0/"));
@@ -648,6 +661,20 @@ pub fn render(
         // declared) makes the whole document malformed.
         if matches!(desc.try_get_attribute(k.as_str()), Ok(Some(_))) {
             continue;
+        }
+        // V13: a label text Laika owns is rewritten from the catalog, never
+        // carried (clearing a label must stick).
+        if k == "xmp:Label" {
+            let t = v.trim();
+            let ours = authorship
+                .label_names
+                .iter()
+                .map(String::as_str)
+                .chain(crate::labels::DEFAULT_NAMES)
+                .any(|n| n.eq_ignore_ascii_case(t));
+            if ours {
+                continue;
+            }
         }
         desc.push_attribute((k.as_str(), v.as_str()));
     }
@@ -912,6 +939,7 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
     // spaces — the End arm trims the assembled buffer instead.
     let mut params = crate::edit::defaults();
     let mut rating = None;
+    let mut label: Option<String> = None;
     let mut history = Vec::new();
     let mut preset = None;
     let mut title = String::new();
@@ -1000,6 +1028,9 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
                 }
             } else if key == "xmp:Rating" {
                 rating = val.parse::<u8>().ok();
+                found = true;
+            } else if key == "xmp:Label" {
+                label = Some(val.clone());
                 found = true;
             } else if key == "laika:History" {
                 history = val.split(" | ").map(|s| s.to_string()).collect();
@@ -1268,6 +1299,7 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
         location,
         keywords,
         geom,
+        label,
         has_tone,
     })
 }
@@ -1383,6 +1415,27 @@ mod tests {
         assert!(back.contains("crs:ProcessVersion=\"15.4\""), "{back}");
         assert!(back.contains("xmp:Label=\"Select\""), "{back}");
         assert_eq!(read(&photo).unwrap().rating, Some(5));
+        // V13: our own label replaces it; clearing ours leaves no label
+        // (a recognized name is never carried back in).
+        let red = Authorship {
+            label: "Red".into(),
+            ..Authorship::default()
+        };
+        write(&photo, &warm, 5, &[], None, &red, &Default::default()).unwrap();
+        let back = std::fs::read_to_string(sidecar_path(&photo)).unwrap();
+        assert_eq!(back.matches("xmp:Label").count(), 1, "{back}");
+        assert_eq!(read(&photo).unwrap().label.as_deref(), Some("Red"));
+        write(
+            &photo,
+            &warm,
+            5,
+            &[],
+            None,
+            &Authorship::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(read(&photo).unwrap().label, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1661,6 +1714,8 @@ mod tests {
             contact: "ada@example.com".into(),
             location: "Lisbon".into(),
             keywords: vec!["Places > Portugal > Lisbon".into(), "Boats".into()],
+            label: "Green".into(),
+            label_names: Vec::new(),
         };
         write(
             &photo,
