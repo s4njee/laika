@@ -192,7 +192,7 @@ impl Laika {
                 .border_1()
                 .border_color(border_control())
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_SECONDARY))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .on_hover(self.tip(tip))
@@ -203,14 +203,14 @@ impl Laika {
                 .w(px(62.))
                 .flex_none()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child(t)
         };
         let text = |v: &str, placeholder: &str| {
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(if v.is_empty() {
                     TEXT_DIMMER
                 } else {
@@ -423,7 +423,7 @@ impl Laika {
                             div()
                                 .id("album-caption-to-title")
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIM))
                                 .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                                 .on_hover(self.tip(

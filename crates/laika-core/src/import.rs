@@ -33,6 +33,7 @@ pub fn volume_id(v: &Volume) -> String {
     format!("{} :: {mount}", v.label)
 }
 
+#[cfg(unix)]
 fn same_device(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
@@ -41,6 +42,7 @@ fn same_device(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn capacity(mount: &Path) -> (u64, u64) {
     use std::ffi::CString;
     let Ok(c) = CString::new(mount.as_os_str().as_encoded_bytes()) else {
@@ -55,6 +57,20 @@ fn capacity(mount: &Path) -> (u64, u64) {
         st.f_blocks as u64 * st.f_frsize as u64,
         st.f_bavail as u64 * st.f_frsize as u64,
     )
+}
+
+#[cfg(target_os = "windows")]
+fn capacity(mount: &Path) -> (u64, u64) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut wide: Vec<u16> = mount.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated and the output pointers are valid.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) != 0 };
+    if ok { (total, available) } else { (0, 0) }
 }
 
 fn push_volume(out: &mut Vec<Volume>, mount: PathBuf) {
@@ -101,6 +117,44 @@ pub fn detect_volumes() -> Vec<Volume> {
                             push_volume(&mut out, p);
                         }
                     }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            DRIVE_CDROM, DRIVE_REMOVABLE, GetDriveTypeW, GetLogicalDriveStringsW,
+        };
+        let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
+        if needed > 0 {
+            let mut buffer = vec![0u16; needed as usize + 1];
+            // SAFETY: `buffer` has the length supplied to the API.
+            let written =
+                unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+            if written > 0 {
+                let mut start = 0usize;
+                while start < written as usize {
+                    let Some(end) = buffer[start..]
+                        .iter()
+                        .position(|c| *c == 0)
+                        .map(|n| start + n)
+                    else {
+                        break;
+                    };
+                    if end == start {
+                        break;
+                    }
+                    let root = &buffer[start..=end];
+                    // SAFETY: each drive string is NUL-terminated in `buffer`.
+                    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+                    if kind == DRIVE_REMOVABLE || kind == DRIVE_CDROM {
+                        push_volume(
+                            &mut out,
+                            PathBuf::from(String::from_utf16_lossy(&buffer[start..end])),
+                        );
+                    }
+                    start = end + 1;
                 }
             }
         }
@@ -199,6 +253,82 @@ fn scan_entry_metadata(p: &Path) -> ScanEntry {
         content_hash: String::new(),
         previously_imported: false,
     }
+}
+
+/// What an earlier scan learned about a source file. A file whose size
+/// and modification time still match is trusted without reading it again.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Fingerprint {
+    pub size: u64,
+    pub mtime_secs: i64,
+    pub content_hash: String,
+    pub captured_at: String,
+    pub camera: String,
+}
+
+/// Stable key for a scanned file: its path relative to the source root
+/// (cards move between mount points; folders keep their absolute root in
+/// the source name).
+pub fn fingerprint_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Source name the fingerprints of a scan are stored under: the card's
+/// volume id, or the folder's absolute path.
+pub fn fingerprint_source(root: &Path, volume: Option<&Volume>) -> String {
+    match volume {
+        Some(v) => format!("card:{}", volume_id(v)),
+        None => format!(
+            "folder:{}",
+            root.canonicalize()
+                .unwrap_or_else(|_| root.to_path_buf())
+                .to_string_lossy()
+        ),
+    }
+}
+
+/// Scan one file, reusing a matching fingerprint (no EXIF read, no hash —
+/// only a `stat`). Returns the entry and, when the file had to be read,
+/// the fingerprint to remember.
+pub fn scan_entry_cached(
+    p: &Path,
+    known: Option<&Fingerprint>,
+) -> (ScanEntry, Option<Fingerprint>) {
+    if let (Some(k), Ok(meta)) = (known, std::fs::metadata(p)) {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if meta.len() == k.size && mtime == k.mtime_secs && !k.content_hash.is_empty() {
+            return (
+                ScanEntry {
+                    path: p.to_path_buf(),
+                    size: k.size,
+                    mtime_secs: k.mtime_secs,
+                    captured_at: k.captured_at.clone(),
+                    camera: k.camera.clone(),
+                    is_raw: laika_raw::is_raw(p),
+                    content_hash: k.content_hash.clone(),
+                    previously_imported: false,
+                },
+                None,
+            );
+        }
+    }
+    let entry = scan_entry(p);
+    let fresh = (!entry.content_hash.is_empty()).then(|| Fingerprint {
+        size: entry.size,
+        mtime_secs: entry.mtime_secs,
+        content_hash: entry.content_hash.clone(),
+        captured_at: entry.captured_at.clone(),
+        camera: entry.camera.clone(),
+    });
+    (entry, fresh)
 }
 
 /// Read one file's lightweight review metadata without streaming the whole
@@ -455,7 +585,31 @@ pub fn trash_files(paths: &[PathBuf]) -> Result<(), String> {
             ))
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        // Microsoft.VisualBasic's FileIO helper uses the real Recycle Bin and
+        // preserves undo/recovery semantics; PowerShell and the assembly ship
+        // with supported Windows versions.
+        for path in paths {
+            let quoted = path.to_string_lossy().replace('\'', "''");
+            let script = format!(
+                "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{quoted}', 'OnlyErrorDialogs', 'SendToRecycleBin')"
+            );
+            let out = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .map_err(|e| format!("move to Recycle Bin: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "move to Recycle Bin failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = paths;
         Err("move to trash is not supported on this platform".to_string())
@@ -464,27 +618,7 @@ pub fn trash_files(paths: &[PathBuf]) -> Result<(), String> {
 
 /// V05: play a video in the system player (Loupe has no decoder).
 pub fn play_file(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let cmd = ("open", Vec::<String>::new());
-    #[cfg(target_os = "linux")]
-    let cmd = ("xdg-open", Vec::<String>::new());
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let cmd: (&str, Vec<String>) = ("", Vec::new());
-    if cmd.0.is_empty() {
-        return Err("playback is not supported on this platform".to_string());
-    }
-    std::process::Command::new(cmd.0)
-        .args(&cmd.1)
-        .arg(path)
-        .status()
-        .map_err(|e| format!("player failed to start ({e}) — is one installed?"))
-        .and_then(|s| {
-            if s.success() {
-                Ok(())
-            } else {
-                Err("player exited with an error".to_string())
-            }
-        })
+    crate::platform::open_path(path)
 }
 
 /// U17: reveal one file in Finder / the file manager.
@@ -519,7 +653,33 @@ pub fn reveal_in_manager(path: &Path) -> Result<(), String> {
                 }
             })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let target = if path.exists() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(Path::new(".")).to_path_buf()
+        };
+        let status = if target.is_file() {
+            let mut selection = std::ffi::OsString::from("/select,");
+            selection.push(&target);
+            std::process::Command::new("explorer.exe")
+                .arg(selection)
+                .status()
+        } else {
+            std::process::Command::new("explorer.exe")
+                .arg(&target)
+                .status()
+        };
+        status
+            .map_err(|e| format!("show in File Explorer: {e}"))
+            .and_then(|s| {
+                s.success()
+                    .then_some(())
+                    .ok_or_else(|| "File Explorer failed".to_string())
+            })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = path;
         Err("reveal is not supported on this platform".to_string())
@@ -630,7 +790,33 @@ pub fn eject_volume(mount: &Path) -> Result<(), String> {
         }
         Err(format!("could not unmount {}", mount.display()))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let root = mount
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_else(|| mount.to_string_lossy().to_string());
+        let root = format!("{}\\", root.trim_end_matches(['\\', '/']));
+        let quoted = root.replace('\'', "''");
+        let script = format!(
+            "$v=(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{quoted}'); if($null -eq $v){{exit 2}}; $v.InvokeVerb('Eject')"
+        );
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("eject helper failed: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not eject {}: {}",
+                mount.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = mount;
         Err("eject is not supported on this platform".to_string())
@@ -689,9 +875,12 @@ mod tests {
         assert!(all.contains(&"MISC/skip.jpg".to_string()));
         assert!(all.contains(&"PRIVATE/M4ROOT/CLIP001.mp4".to_string()));
         // A symlink to an ancestor must not loop the walk forever.
-        std::os::unix::fs::symlink(dir.join("DCIM"), dir.join("DCIM/100NIKON/loop")).unwrap();
-        assert_eq!(scan_source(&dir, true).len(), 2);
-        assert_eq!(scan_source(&dir, false).len(), 6);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("DCIM"), dir.join("DCIM/100NIKON/loop")).unwrap();
+            assert_eq!(scan_source(&dir, true).len(), 2);
+            assert_eq!(scan_source(&dir, false).len(), 6);
+        }
         let _ = count_unsupported(&dir, false);
         // A non-ASCII capture string never panics the date range.
         let _ = date_range(&[ScanEntry {

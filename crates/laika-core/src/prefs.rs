@@ -74,6 +74,14 @@ pub struct AppPrefs {
     /// Entering the wall also hides the rails and toolbars.
     pub wall_hides_chrome: bool,
     pub filmstrip: FilmstripSize,
+    /// U22: remembered workspace layout. Widths are logical pixels.
+    pub left_rail_visible: bool,
+    pub right_rail_visible: bool,
+    pub filmstrip_visible: bool,
+    pub left_rail_width: u16,
+    pub right_rail_width: u16,
+    /// UI text scale, 100 = design size.
+    pub text_scale_percent: u8,
     // External editing.
     pub editor_app: String,
     pub editor_format: EditorFormat,
@@ -86,6 +94,10 @@ pub struct AppPrefs {
     pub thumb_concurrency: u8,
     /// V32: write a crash report beside the log (opt-in; never sent).
     pub crash_reports: bool,
+    /// Map: load street-map tiles from Esri (off keeps the map local).
+    pub map_tiles: bool,
+    /// S04: Lightroom Classic keyboard map.
+    pub lightroom_keys: bool,
 }
 
 impl Default for AppPrefs {
@@ -103,6 +115,12 @@ impl Default for AppPrefs {
             default_badges: String::new(),
             wall_hides_chrome: false,
             filmstrip: FilmstripSize::Medium,
+            left_rail_visible: true,
+            right_rail_visible: true,
+            filmstrip_visible: true,
+            left_rail_width: 226,
+            right_rail_width: 306,
+            text_scale_percent: 100,
             editor_app: String::new(),
             editor_format: EditorFormat::Tiff,
             editor_naming: "{original}-edit".to_string(),
@@ -110,6 +128,8 @@ impl Default for AppPrefs {
             import_workers: 0,
             thumb_concurrency: 8,
             crash_reports: false,
+            map_tiles: false,
+            lightroom_keys: false,
         }
     }
 }
@@ -120,6 +140,9 @@ impl AppPrefs {
         self.default_columns = self.default_columns.clamp(3, 20);
         self.import_workers = self.import_workers.min(32);
         self.thumb_concurrency = self.thumb_concurrency.clamp(1, 32);
+        self.left_rail_width = self.left_rail_width.clamp(168, 420);
+        self.right_rail_width = self.right_rail_width.clamp(220, 460);
+        self.text_scale_percent = self.text_scale_percent.clamp(85, 150);
         if self.editor_naming.trim().is_empty() {
             self.editor_naming = Self::default().editor_naming;
         }
@@ -163,5 +186,19 @@ mod tests {
         assert_eq!(p.import_worker_count(3), 2);
         p.import_workers = 3;
         assert_eq!(p.import_worker_count(10), 3);
+    }
+
+    #[test]
+    fn accessible_layout_values_clamp() {
+        let p = AppPrefs {
+            left_rail_width: 2,
+            right_rail_width: 900,
+            text_scale_percent: 200,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(p.left_rail_width, 168);
+        assert_eq!(p.right_rail_width, 460);
+        assert_eq!(p.text_scale_percent, 150);
     }
 }

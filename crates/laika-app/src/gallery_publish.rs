@@ -71,17 +71,12 @@ struct RenderJob {
 }
 
 fn default_gallery_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Pictures")
-        .join("Laika Galleries")
+    laika_core::platform::pictures_dir().join("Laika Galleries")
 }
 
 fn fonts_dir() -> Option<PathBuf> {
     // Bundled app: Contents/Resources/fonts; dev: the workspace assets.
-    let exe = std::env::current_exe().ok()?;
-    let bundled = exe.parent()?.parent()?.join("Resources").join("fonts");
+    let bundled = laika_core::platform::resource_dir()?.join("fonts");
     if bundled.join(site::build::FONT_FILES[0]).is_file() {
         return Some(bundled);
     }
@@ -93,9 +88,20 @@ fn fonts_dir() -> Option<PathBuf> {
 
 /// GUI apps get a minimal PATH: look where npm and Homebrew install.
 pub(crate) fn find_wrangler() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = laika_core::platform::home_dir();
+    #[cfg(target_os = "windows")]
+    let mut candidates = {
+        let mut paths = vec![
+            home.join("AppData/Roaming/npm/wrangler.cmd"),
+            home.join(".bun/bin/wrangler.exe"),
+            home.join(".volta/bin/wrangler.cmd"),
+        ];
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            paths.push(PathBuf::from(appdata).join("npm/wrangler.cmd"));
+        }
+        paths
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/bin/wrangler"),
         PathBuf::from("/usr/local/bin/wrangler"),
@@ -104,7 +110,12 @@ pub(crate) fn find_wrangler() -> Option<PathBuf> {
         home.join(".volta/bin/wrangler"),
     ];
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|d| d.join("wrangler")));
+        for dir in std::env::split_paths(&path) {
+            #[cfg(target_os = "windows")]
+            candidates.extend([dir.join("wrangler.cmd"), dir.join("wrangler.exe")]);
+            #[cfg(not(target_os = "windows"))]
+            candidates.push(dir.join("wrangler"));
+        }
     }
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -522,7 +533,7 @@ impl Laika {
         match kind {
             BuildKind::Preview => {
                 let index = out.join("index.html");
-                if let Err(e) = std::process::Command::new("open").arg(&index).spawn() {
+                if let Err(e) = laika_core::platform::open_path(&index) {
                     self.status_note = format!(
                         "preview built at {} but the browser didn't open ({e})",
                         index.display()
@@ -597,18 +608,40 @@ impl Laika {
             std::thread::spawn(move || {
                 use std::io::{BufRead, BufReader};
                 let path = std::env::var("PATH").unwrap_or_default();
-                let child = std::process::Command::new(&wrangler)
+                #[cfg(target_os = "windows")]
+                let mut command = {
+                    let is_script =
+                        wrangler
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| {
+                                e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")
+                            });
+                    if is_script {
+                        let mut cmd = std::process::Command::new("cmd.exe");
+                        cmd.arg("/C").arg(&wrangler);
+                        cmd
+                    } else {
+                        std::process::Command::new(&wrangler)
+                    }
+                };
+                #[cfg(not(target_os = "windows"))]
+                let mut command = std::process::Command::new(&wrangler);
+                command
                     .arg("pages")
                     .arg("deploy")
                     .arg(&dir)
                     .arg("--project-name")
                     .arg(&project)
                     .arg("--commit-dirty=true")
-                    .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"))
                     .env("CI", "1")
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
+                    .stderr(std::process::Stdio::piped());
+                #[cfg(target_os = "macos")]
+                command.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
+                #[cfg(not(target_os = "macos"))]
+                command.env("PATH", path);
+                let child = command.spawn();
                 let mut child = match child {
                     Ok(c) => c,
                     Err(e) => {
@@ -715,7 +748,7 @@ impl Laika {
             div()
                 .w(px(110.))
                 .flex_none()
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(rgb(TEXT_TERTIARY))
                 .child(t.to_string())
         };
@@ -725,7 +758,7 @@ impl Laika {
                 .px(px(11.))
                 .py(px(5.))
                 .rounded(px(4.))
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .when(on, |d| {
                     d.bg(rgb(bg_segment_active())).text_color(rgb(TEXT_PRIMARY))
                 })
@@ -760,7 +793,7 @@ impl Laika {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(19.))
+                            .text_size(sp(19.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
                             .child(format!(
@@ -771,7 +804,7 @@ impl Laika {
                     .child(
                         div()
                             .id("gal-sheet-close")
-                            .text_size(px(15.))
+                            .text_size(sp(15.))
                             .text_color(rgb(TEXT_DIM))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                             .on_click(cx.listener(|this, _, _, cx| this.close_publish_sheet(cx)))
@@ -826,7 +859,7 @@ impl Laika {
                                 .rounded(px(4.))
                                 .bg(rgb(bg_well()))
                                 .overflow_hidden()
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(if g.output_dir.is_empty() { TEXT_DIM } else { TEXT_SECONDARY }))
                                 .child(
                                     dir.as_ref()
@@ -846,7 +879,7 @@ impl Laika {
                             .rounded(px(4.))
                             .border_1()
                             .border_color(border_control())
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|d| d.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| this.choose_gallery_folder(cx)))
@@ -862,7 +895,7 @@ impl Laika {
                                 .rounded(px(4.))
                                 .border_1()
                                 .border_color(border_control())
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .hover(|d| d.bg(rgb(bg_row_hover())))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -891,7 +924,7 @@ impl Laika {
                                     .py(px(5.))
                                     .rounded(px(4.))
                                     .bg(rgb(bg_well()))
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(if g.deploy_project.is_empty() { TEXT_DIM } else { TEXT_SECONDARY }))
                                     .child(if g.deploy_project.is_empty() {
                                         "my-photos".to_string()
@@ -907,7 +940,7 @@ impl Laika {
                 .child(
                     div()
                         .pl(px(110.))
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(if s.wrangler.is_some() { TEXT_DIM } else { WARNING }))
                         .child(match &s.wrangler {
                             Some(p) => format!("wrangler found at {}", p.display()),
@@ -923,7 +956,7 @@ impl Laika {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(summary)
                     .child(div().text_color(rgb(TEXT_DIM)).child(format!(
@@ -944,7 +977,7 @@ impl Laika {
                         div()
                             .flex()
                             .justify_between()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(b.label())
                             .child(div().text_color(rgb(TEXT_DIM)).child(b.current.clone())),
@@ -967,7 +1000,7 @@ impl Laika {
                         .rounded(px(4.))
                         .bg(rgb(0x0C0D0E))
                         .font_family(PLEX_MONO)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .children(log_lines.iter().map(|l| div().child(l.clone()))),
                 )
@@ -977,7 +1010,7 @@ impl Laika {
                     Ok(m) => (m, TEXT_SECONDARY),
                     Err(e) => (e, 0xE56060),
                 };
-                d.child(div().text_size(px(11.5)).text_color(rgb(color)).child(text))
+                d.child(div().text_size(sp(11.5)).text_color(rgb(color)).child(text))
             })
             .when(!s.failures.is_empty(), |d| {
                 d.child(
@@ -985,7 +1018,7 @@ impl Laika {
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(WARNING))
                         .children(s.failures.iter().take(6).map(|(n, e)| div().child(format!("{n}: {e}")))),
                 )
@@ -1001,11 +1034,11 @@ impl Laika {
                         .child(
                             div()
                                 .id("gal-url")
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .text_color(rgb(accent_line()))
                                 .hover(|d| d.underline())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Err(e) = std::process::Command::new("open").arg(&open).spawn() {
+                                    if let Err(e) = laika_core::platform::open_url(&open) {
                                         this.status_note = e.to_string();
                                         cx.notify();
                                     }
@@ -1015,7 +1048,7 @@ impl Laika {
                         .child(
                             div()
                                 .id("gal-url-copy")
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1039,7 +1072,7 @@ impl Laika {
                         d.child(
                             div()
                                 .id("gal-log-copy")
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(TEXT_DIM))
                                 .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                                 .on_click(cx.listener(move |this, _, _, cx| {

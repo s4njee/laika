@@ -188,8 +188,6 @@ pub(crate) type Stroke = ((f32, f32), (f32, f32));
 
 pub(crate) struct GeoUi {
     pub overlay: Overlay,
-    /// Enabled overlays for `O` cycling (bitmask of `Overlay::bit`).
-    pub overlay_set: u8,
     pub overlay_orient: u8,
     pub grid_n: u8,
     pub outside: Outside,
@@ -214,7 +212,6 @@ impl Default for GeoUi {
     fn default() -> Self {
         Self {
             overlay: Overlay::Thirds,
-            overlay_set: Overlay::ALL.iter().fold(0, |m, o| m | o.bit()),
             overlay_orient: 0,
             grid_n: 6,
             outside: Outside::Dim,
@@ -307,7 +304,7 @@ impl Laika {
                     .py(px(3.))
                     .rounded(px(3.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_DIM }))
                     .when(on, |d| d.bg(rgb(bg_segment_active())))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
@@ -362,7 +359,7 @@ impl Laika {
                     .px(px(14.))
                     .pb(px(4.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child("Upright".to_string()),
             )
@@ -372,7 +369,7 @@ impl Laika {
                     .px(px(14.))
                     .pb(px(8.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(note),
             );
@@ -953,7 +950,7 @@ impl Laika {
                         .rounded(px(3.))
                         .bg(rgba(0x000000B3))
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(0xFFFFFF))
                         .child(readout),
                 )
@@ -974,12 +971,7 @@ impl Laika {
                 .iter()
                 .position(|o| *o == self.geo.overlay)
                 .unwrap_or(0);
-            let next = (1..=Overlay::ALL.len())
-                .map(|k| Overlay::ALL[(i + k) % Overlay::ALL.len()])
-                .find(|o| self.geo.overlay_set & o.bit() != 0);
-            if let Some(o) = next {
-                self.geo.overlay = o;
-            }
+            self.geo.overlay = Overlay::ALL[(i + 1) % Overlay::ALL.len()];
             self.status_note = format!("overlay: {}", self.geo.overlay.label());
         }
         self.save_geo_prefs();
@@ -1194,11 +1186,8 @@ impl Laika {
                 self.geo.overlay = *o;
             }
         }
-        if let Some(set) = parts.next().and_then(|v| v.parse::<u8>().ok()) {
-            if set != 0 {
-                self.geo.overlay_set = set & 0x7F;
-            }
-        }
+        // Second field was the old O-cycle set; O now steps through all.
+        let _ = parts.next();
         if let Some(n) = parts.next().and_then(|v| v.parse::<u8>().ok()) {
             self.geo.grid_n = n.clamp(2, 20);
         }
@@ -1217,7 +1206,8 @@ impl Laika {
             &format!(
                 "{},{},{},{}",
                 self.geo.overlay as usize,
-                self.geo.overlay_set,
+                // Kept for the stored format (old O-cycle set: all).
+                Overlay::ALL.iter().fold(0u8, |m, o| m | o.bit()),
                 self.geo.grid_n,
                 self.geo.overlay_orient
             ),
@@ -1240,7 +1230,7 @@ impl Laika {
                     border_control()
                 })
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .child(label)
@@ -1248,7 +1238,7 @@ impl Laika {
         let label = |t: &'static str| {
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child(t.to_string())
         };
@@ -1258,7 +1248,7 @@ impl Laika {
                 div()
                     .min_w(px(38.))
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(this.crop_field_text(k)),
                 false,
@@ -1364,7 +1354,7 @@ impl Laika {
                         border_control()
                     })
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1400,18 +1390,14 @@ impl Laika {
                 .flex_wrap()
                 .items_center()
                 .gap(px(6.))
-                .child(label("Cycle with O:"));
+                .child(label("Overlay (O cycles):"));
             for (i, o) in Overlay::ALL.iter().copied().enumerate() {
-                let enabled = self.geo.overlay_set & o.bit() != 0;
+                // One overlay shows at a time; only it is highlighted.
+                let enabled = self.geo.overlay == o;
                 menu = menu.child(
                     div()
                         .id(("overlay-kind", i))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let set = this.geo.overlay_set ^ o.bit();
-                            // Never empty: the shown overlay stays in.
-                            if set != 0 {
-                                this.geo.overlay_set = set;
-                            }
                             this.geo.overlay = o;
                             this.crop_grid = true;
                             this.save_geo_prefs();
@@ -1466,7 +1452,7 @@ fn resolve_guided(g: &mut edit::CropGeom, aspect: f32) {
 fn label_owned(t: String) -> Div {
     div()
         .font_family(SANS)
-        .text_size(px(10.5))
+        .text_size(sp(10.5))
         .text_color(rgb(TEXT_SECONDARY))
         .child(t)
 }

@@ -22,8 +22,12 @@ pub(crate) enum Command {
     Quit,
     // File
     ImportPhotos,
+    ImportLightroom,
+    ImportPresets,
+    SidecarConflicts,
     Export,
     ExportPrevious,
+    ExportEverything,
     EditExternal,
     Publish,
     Rename,
@@ -57,6 +61,12 @@ pub(crate) enum Command {
     Unflag,
     Label(u8),
     AddToTarget,
+    NewCollection,
+    NewSmartCollection,
+    CreateStack,
+    ToggleStack,
+    Unstack,
+    StackPairs,
     RotateLeft,
     RotateRight,
     FlipHorizontal,
@@ -64,7 +74,9 @@ pub(crate) enum Command {
     DeleteRejected,
     AutoAdvance,
     // Develop
+    Library,
     Develop,
+    WhiteBalancePicker,
     CropTool,
     ApplyCrop,
     CancelCrop,
@@ -76,7 +88,10 @@ pub(crate) enum Command {
     // View
     ViewGrid,
     ViewLoupe,
+    ViewCompare,
+    ViewSurvey,
     ViewTimeline,
+    Map,
     ViewWall,
     ZoomCycle,
     ZoomFit,
@@ -87,9 +102,17 @@ pub(crate) enum Command {
     CropOverlay,
     Slideshow,
     Lights,
+    ToggleLeftRail,
+    ToggleRightRail,
+    ToggleFilmstrip,
+    TextLarger,
+    TextSmaller,
+    TextDefault,
     HideChrome,
     FullScreen,
     // Help
+    CommandPalette,
+    LightroomGuide,
     Shortcuts,
     ShowLog,
     Welcome,
@@ -105,22 +128,73 @@ pub(crate) enum Entry {
 use Command as C;
 use Entry::{Cmd, Sep, Sub};
 
+/// S04: Lightroom Classic keyboard map (app-wide preference).
+static LIGHTROOM_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_lightroom_keys(on: bool) {
+    LIGHTROOM_KEYS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn lightroom_keys() -> bool {
+    LIGHTROOM_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Command {
     /// Title and shortcut (empty = none).
     pub fn title(self) -> (String, &'static str) {
+        let (title, key) = self.base_title();
+        if !lightroom_keys() {
+            return (title, key);
+        }
+        // S04: shortcuts that differ under the Lightroom keyboard map.
+        let lr = match self {
+            C::Library => "⌥⌘1",
+            C::Develop => "D",
+            C::Map => "⌥⌘3",
+            C::WhiteBalancePicker => "W",
+            C::CropTool => "R",
+            C::ViewWall => "",
+            C::RetrySync => "",
+            C::CopySettings => "⇧⌘C",
+            C::PasteSettings => "⇧⌘V",
+            C::Export => "⇧⌘E",
+            C::ImportPhotos => "⇧⌘I",
+            C::RevealInFinder => "⌘R",
+            C::KeywordManager => "⌘K",
+            _ => key,
+        };
+        (title, lr)
+    }
+
+    fn base_title(self) -> (String, &'static str) {
         let s = |t: &str| t.to_string();
         match self {
+            C::Library => (s("Library"), ""),
+            C::WhiteBalancePicker => (s("White Balance Picker"), ""),
+            C::CommandPalette => (s("Find a Command…"), "⇧⌘P"),
+            C::LightroomGuide => (s("Laika for Lightroom Users"), ""),
             C::About => (s("About Laika"), ""),
             C::Preferences => (s("Preferences…"), "⌘,"),
             C::Quit => (s("Quit Laika"), "⌘Q"),
             C::ImportPhotos => (s("Import Photos…"), ""),
+            C::ImportLightroom => (s("Import from Lightroom…"), ""),
+            C::ImportPresets => (s("Import Presets…"), ""),
+            C::SidecarConflicts => (s("Review Sidecar Conflicts…"), ""),
             C::Export => (s("Export…"), ""),
             C::ExportPrevious => (s("Export with Previous"), "⇧E"),
+            C::ExportEverything => (s("Export Everything…"), ""),
             C::EditExternal => (s("Edit in External Editor"), "⌘E"),
             C::Publish => (s("Publish Gallery…"), ""),
             C::Rename => (s("Rename Photos…"), "F2"),
             C::MoveToFolder => (s("Move to Folder…"), ""),
-            C::RevealInFinder => (s("Reveal in Finder"), ""),
+            C::RevealInFinder => (
+                s(if cfg!(target_os = "windows") {
+                    "Show in File Explorer"
+                } else {
+                    "Reveal in Finder"
+                }),
+                "",
+            ),
             C::RelinkMissing => (s("Relink Missing Folder…"), ""),
             C::ManageCatalog => (s("Manage Catalog…"), ""),
             C::NewCatalog => (s("New Catalog…"), ""),
@@ -155,6 +229,12 @@ impl Command {
                 ["", "6", "7", "8", "9", ""][n.min(5) as usize],
             ),
             C::AddToTarget => (s("Add to Target Collection"), "B"),
+            C::NewCollection => (s("New Collection…"), ""),
+            C::NewSmartCollection => (s("New Smart Collection from Filters…"), ""),
+            C::CreateStack => (s("Stack Selected Photos"), ""),
+            C::ToggleStack => (s("Expand / Collapse Stack"), ""),
+            C::Unstack => (s("Unstack Photos"), ""),
+            C::StackPairs => (s("Stack RAW/JPEG Pairs"), ""),
             C::RotateLeft => (s("Rotate Left"), "⌘["),
             C::RotateRight => (s("Rotate Right"), "⌘]"),
             C::FlipHorizontal => (s("Flip Horizontal"), "["),
@@ -177,7 +257,10 @@ impl Command {
             C::BeforeAfter => (s("Before / After Split"), "Y"),
             C::ViewGrid => (s("Grid"), "G"),
             C::ViewLoupe => (s("Loupe"), "E"),
+            C::ViewCompare => (s("Compare"), "C"),
+            C::ViewSurvey => (s("Survey"), "N"),
             C::ViewTimeline => (s("Timeline"), "T"),
+            C::Map => (s("Map"), "M"),
             C::ViewWall => (s("Wall"), "W"),
             C::ZoomCycle => (s("Cycle Zoom"), "Z"),
             C::ZoomFit => (s("Zoom to Fit"), ""),
@@ -188,10 +271,23 @@ impl Command {
             C::CropOverlay => (s("Cycle Crop Overlay"), "O"),
             C::Slideshow => (s("Slideshow"), "⌘↩"),
             C::Lights => (s("Cycle Lights"), "L"),
+            C::ToggleLeftRail => (s("Show / Hide Left Panel"), ""),
+            C::ToggleRightRail => (s("Show / Hide Right Panel"), ""),
+            C::ToggleFilmstrip => (s("Show / Hide Filmstrip"), ""),
+            C::TextLarger => (s("Make Text Larger"), ""),
+            C::TextSmaller => (s("Make Text Smaller"), ""),
+            C::TextDefault => (s("Reset Text Size"), ""),
             C::HideChrome => (s("Hide Panels"), "⇧⇥"),
             C::FullScreen => (s("Full Screen"), "F"),
             C::Shortcuts => (s("Keyboard Shortcuts"), "?"),
-            C::ShowLog => (s("Show Log in Finder"), ""),
+            C::ShowLog => (
+                s(if cfg!(target_os = "windows") {
+                    "Show Log in File Explorer"
+                } else {
+                    "Show Log in Finder"
+                }),
+                "",
+            ),
             C::Welcome => (s("Welcome Screen"), ""),
         }
     }
@@ -202,6 +298,13 @@ impl Command {
         if key.is_empty() {
             title
         } else {
+            let key = if cfg!(target_os = "windows") {
+                key.replace('⇧', "Shift+")
+                    .replace('⌥', "Alt+")
+                    .replace('⌘', "Ctrl+")
+            } else {
+                key.to_string()
+            };
             format!("{title}    {key}")
         }
     }
@@ -209,47 +312,51 @@ impl Command {
 
 /// The whole menu bar (App menu first; macOS names it after the app).
 pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
+    let mut file_menu = vec![
+        Cmd(C::ImportPhotos),
+        Cmd(C::ImportLightroom),
+        Cmd(C::ImportPresets),
+        Cmd(C::SidecarConflicts),
+        Cmd(C::Export),
+        Cmd(C::ExportPrevious),
+        Cmd(C::ExportEverything),
+        Cmd(C::EditExternal),
+        Cmd(C::Publish),
+        Sep,
+        Cmd(C::Rename),
+        Cmd(C::MoveToFolder),
+        Cmd(C::RevealInFinder),
+        Cmd(C::RelinkMissing),
+        Sep,
+        Sub(
+            "Catalog",
+            vec![
+                Cmd(C::ManageCatalog),
+                Cmd(C::NewCatalog),
+                Cmd(C::OpenCatalog),
+                Cmd(C::BackUpCatalog),
+                Sep,
+                Cmd(C::BuildSmartPreviews),
+                Cmd(C::BuildOneToOnePreviews),
+            ],
+        ),
+        Sub(
+            "Backup",
+            vec![Cmd(C::BackupSettings), Cmd(C::SyncNow), Cmd(C::RetrySync)],
+        ),
+    ];
+    if cfg!(target_os = "macos") {
+        file_menu.push(Sub(
+            "Apple Photos",
+            vec![Cmd(C::ApplePhotos), Cmd(C::ApplePhotosSync)],
+        ));
+    }
     vec![
         (
             "Laika",
             vec![Cmd(C::About), Sep, Cmd(C::Preferences), Sep, Cmd(C::Quit)],
         ),
-        (
-            "File",
-            vec![
-                Cmd(C::ImportPhotos),
-                Cmd(C::Export),
-                Cmd(C::ExportPrevious),
-                Cmd(C::EditExternal),
-                Cmd(C::Publish),
-                Sep,
-                Cmd(C::Rename),
-                Cmd(C::MoveToFolder),
-                Cmd(C::RevealInFinder),
-                Cmd(C::RelinkMissing),
-                Sep,
-                Sub(
-                    "Catalog",
-                    vec![
-                        Cmd(C::ManageCatalog),
-                        Cmd(C::NewCatalog),
-                        Cmd(C::OpenCatalog),
-                        Cmd(C::BackUpCatalog),
-                        Sep,
-                        Cmd(C::BuildSmartPreviews),
-                        Cmd(C::BuildOneToOnePreviews),
-                    ],
-                ),
-                Sub(
-                    "Backup",
-                    vec![Cmd(C::BackupSettings), Cmd(C::SyncNow), Cmd(C::RetrySync)],
-                ),
-                Sub(
-                    "Apple Photos",
-                    vec![Cmd(C::ApplePhotos), Cmd(C::ApplePhotosSync)],
-                ),
-            ],
-        ),
+        ("File", file_menu),
         (
             "Edit",
             vec![
@@ -276,6 +383,17 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
                     (1..=5).chain([0]).map(|n| Cmd(C::Label(n))).collect(),
                 ),
                 Cmd(C::AddToTarget),
+                Cmd(C::NewCollection),
+                Cmd(C::NewSmartCollection),
+                Sub(
+                    "Stacking",
+                    vec![
+                        Cmd(C::CreateStack),
+                        Cmd(C::ToggleStack),
+                        Cmd(C::Unstack),
+                        Cmd(C::StackPairs),
+                    ],
+                ),
                 Cmd(C::AutoAdvance),
                 Sep,
                 Cmd(C::RotateLeft),
@@ -289,8 +407,10 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
         (
             "Develop",
             vec![
+                Cmd(C::Library),
                 Cmd(C::Develop),
                 Sep,
+                Cmd(C::WhiteBalancePicker),
                 Cmd(C::CropTool),
                 Cmd(C::ApplyCrop),
                 Cmd(C::CancelCrop),
@@ -309,7 +429,10 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
             vec![
                 Cmd(C::ViewGrid),
                 Cmd(C::ViewLoupe),
+                Cmd(C::ViewCompare),
+                Cmd(C::ViewSurvey),
                 Cmd(C::ViewTimeline),
+                Cmd(C::Map),
                 Cmd(C::ViewWall),
                 Sep,
                 Cmd(C::ZoomCycle),
@@ -322,6 +445,14 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
                 Sep,
                 Cmd(C::Slideshow),
                 Cmd(C::Lights),
+                Sep,
+                Cmd(C::ToggleLeftRail),
+                Cmd(C::ToggleRightRail),
+                Cmd(C::ToggleFilmstrip),
+                Sub(
+                    "Text Size",
+                    vec![Cmd(C::TextLarger), Cmd(C::TextSmaller), Cmd(C::TextDefault)],
+                ),
                 Cmd(C::HideChrome),
                 Cmd(C::FullScreen),
             ],
@@ -329,7 +460,9 @@ pub(crate) fn menu_tree() -> Vec<(&'static str, Vec<Entry>)> {
         (
             "Help",
             vec![
+                Cmd(C::CommandPalette),
                 Cmd(C::Shortcuts),
+                Cmd(C::LightroomGuide),
                 Sep,
                 Cmd(C::Welcome),
                 Cmd(C::ShowLog),
@@ -369,12 +502,19 @@ fn command_id(c: Command) -> usize {
 /// key equivalents (⌘Q, ⌘,, ⌘H); the rest show their key in the title and
 /// stay on the window's own key handler (so fields and dialogs keep them).
 pub(crate) fn install_native_menus(cx: &mut App, handle: WindowHandle<Laika>) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-,", OpenPreferences, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-    ]);
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", OpenPreferences, None),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("alt-cmd-h", HideOthers, None),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("ctrl-,", OpenPreferences, None),
+        ]);
+    }
     // Menu actions arrive while the window is mid-dispatch (it can't be
     // updated re-entrantly), so the work runs right after.
     cx.on_action(move |a: &RunCommand, cx| {
@@ -403,6 +543,12 @@ pub(crate) fn install_native_menus(cx: &mut App, handle: WindowHandle<Laika>) {
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
 
+    refresh_native_menus(cx);
+}
+
+/// Rebuild the menu bar (titles carry shortcuts, which follow the keyboard
+/// map).
+pub(crate) fn refresh_native_menus(cx: &mut App) {
     fn items(entries: &[Entry]) -> Vec<MenuItem> {
         entries
             .iter()
@@ -418,7 +564,7 @@ pub(crate) fn install_native_menus(cx: &mut App, handle: WindowHandle<Laika>) {
     let mut menus: Vec<Menu> = Vec::new();
     for (name, entries) in menu_tree() {
         let mut list = items(&entries);
-        if name == "Laika" {
+        if name == "Laika" && cfg!(target_os = "macos") {
             // macOS app-menu conventions.
             list.insert(list.len() - 1, MenuItem::action("Hide Laika", HideApp));
             list.insert(list.len() - 1, MenuItem::action("Hide Others", HideOthers));
@@ -458,8 +604,12 @@ impl Laika {
                 cx.quit();
             }
             C::ImportPhotos => self.open_import_dialog(cx),
+            C::ImportLightroom => self.open_lightroom_import(cx),
+            C::ImportPresets => self.open_preset_import(cx),
+            C::SidecarConflicts => self.open_conflicts(cx),
             C::Export => self.open_export_dialog(cx),
             C::ExportPrevious => self.export_with_previous(cx),
+            C::ExportEverything => self.open_exit_bundle(cx),
             C::EditExternal => self.edit_in_external_editor(cx),
             C::Publish => self.open_publish(cx),
             C::Rename => self.open_rename(cx),
@@ -488,7 +638,7 @@ impl Laika {
             C::Deselect => self.deselect(cx),
             C::CopySettings => {
                 if let Some(pid) = self.state.primary {
-                    self.copy_settings_from(pid);
+                    self.copy_settings_from(pid, cx);
                 }
             }
             C::PasteSettings => self.paste_settings(cx),
@@ -513,6 +663,12 @@ impl Laika {
             }
             C::Label(n) => self.apply_label(n, cx),
             C::AddToTarget => self.toggle_in_target(cx),
+            C::NewCollection => self.open_name_field(collections::NameMode::New, cx),
+            C::NewSmartCollection => self.open_name_field(collections::NameMode::NewSmart, cx),
+            C::CreateStack => self.create_stack_from_selection(cx),
+            C::ToggleStack => self.toggle_primary_stack(cx),
+            C::Unstack => self.unstack_primary(cx),
+            C::StackPairs => self.stack_raw_jpeg_pairs(cx),
             C::RotateLeft => self.rotate_targets(false, cx),
             C::RotateRight => self.rotate_targets(true, cx),
             C::FlipHorizontal => self.flip_targets(true, cx),
@@ -526,6 +682,27 @@ impl Laika {
                     "auto-advance off".to_string()
                 };
             }
+            C::Library => {
+                self.flush_saves();
+                if self.crop_open {
+                    self.cancel_crop(cx);
+                }
+                self.state.active_module = Module::Library;
+                self.publish_open = false;
+            }
+            C::WhiteBalancePicker => {
+                if self.state.active_module != Module::Develop {
+                    self.run_command(C::Develop, window, cx);
+                }
+                self.wb_pick = !self.wb_pick;
+                self.status_note = if self.wb_pick {
+                    "click neutral gray to set white balance (Esc exits)".to_string()
+                } else {
+                    String::new()
+                };
+            }
+            C::CommandPalette => self.open_palette(cx),
+            C::LightroomGuide => self.open_lightroom_guide(cx),
             C::Develop => {
                 self.flush_saves();
                 self.state.active_module = Module::Develop;
@@ -594,6 +771,9 @@ impl Laika {
                 // U09: the eyedropper is a Develop-mode tool.
                 self.wb_pick = false;
             }
+            C::ViewCompare => self.open_compare(cx),
+            C::ViewSurvey => self.open_survey(cx),
+            C::Map => self.open_map(cx),
             C::ViewTimeline => {
                 self.state.active_module = Module::Library;
                 self.prev_view = ViewMode::Timeline;
@@ -633,6 +813,22 @@ impl Laika {
             }
             C::Slideshow => self.start_slideshow(window, cx),
             C::Lights => self.lights = (self.lights + 1) % 3,
+            C::ToggleLeftRail => self.set_prefs(|p| p.left_rail_visible = !p.left_rail_visible, cx),
+            C::ToggleRightRail => {
+                self.set_prefs(|p| p.right_rail_visible = !p.right_rail_visible, cx)
+            }
+            C::ToggleFilmstrip => {
+                self.set_prefs(|p| p.filmstrip_visible = !p.filmstrip_visible, cx)
+            }
+            C::TextLarger => self.set_prefs(
+                |p| p.text_scale_percent = p.text_scale_percent.saturating_add(5).min(150),
+                cx,
+            ),
+            C::TextSmaller => self.set_prefs(
+                |p| p.text_scale_percent = p.text_scale_percent.saturating_sub(5).max(85),
+                cx,
+            ),
+            C::TextDefault => self.set_prefs(|p| p.text_scale_percent = 100, cx),
             C::HideChrome => self.hide_chrome = !self.hide_chrome,
             C::FullScreen => window.toggle_fullscreen(),
             C::Shortcuts => {
@@ -660,7 +856,7 @@ impl Laika {
             .border_b_1()
             .border_color(hairline())
             .font_family(SANS)
-            .text_size(px(12.));
+            .text_size(sp(12.));
         for (i, (name, _)) in menu_tree().into_iter().enumerate() {
             let open = self.menu_open == Some(i);
             bar = bar.child(
@@ -718,7 +914,7 @@ impl Laika {
                             div()
                                 .px(px(12. + depth as f32 * 12.))
                                 .py(px(3.))
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child(name.to_string()),
                         );
@@ -784,7 +980,7 @@ impl Laika {
                         .border_color(border_control())
                         .shadow_lg()
                         .font_family(SANS)
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .child(list),
                 ),
         )

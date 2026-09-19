@@ -4,6 +4,7 @@ members = [
   "crates/laika-raw",
   "crates/laika-develop",
   "crates/laika-export",
+  "crates/laika-render",
   "crates/laika-app",
 ]
 resolver = "2"

@@ -11,6 +11,7 @@ pub enum Module {
     #[default]
     Library,
     Develop,
+    Map,
     Publish,
 }
 
@@ -96,6 +97,12 @@ pub struct Filters {
     pub collection: Option<i64>,
     #[serde(default)]
     pub collection_name: String,
+    /// U13: saved smart collection whose criteria are currently loaded.
+    /// Matching is still performed by the ordinary filter fields above.
+    #[serde(default)]
+    pub smart_collection: Option<i64>,
+    #[serde(default)]
+    pub smart_collection_name: String,
     pub sort: SortSpec,
 }
 
@@ -117,6 +124,7 @@ impl Filters {
             || self.album.is_some()
             || self.labels != 0
             || self.collection.is_some()
+            || self.smart_collection.is_some()
     }
 
     /// Human list of active constraints (empty-results explanation).
@@ -177,6 +185,9 @@ impl Filters {
         }
         if self.collection.is_some() {
             out.push(format!("collection {}", self.collection_name));
+        }
+        if self.smart_collection.is_some() {
+            out.push(format!("smart {}", self.smart_collection_name));
         }
         out
     }

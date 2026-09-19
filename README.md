@@ -5,13 +5,13 @@
 <h1 align="center">Laika</h1>
 
 <p align="center">
-  <b>A local-first photo catalog, RAW developer, and gallery publisher for macOS.</b><br>
-  Your originals stay on your disk. Your edits stay non-destructive. Nothing leaves your Mac unless you send it.
+  <b>A local-first photo catalog, RAW developer, and gallery publisher for macOS and Windows.</b><br>
+  Your originals stay on your disk. Your edits stay non-destructive. Nothing leaves your computer unless you send it.
 </p>
 
 <p align="center">
   <a href="https://github.com/s4njee/laika/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/s4njee/laika?label=download&color=00C227"></a>
-  <img alt="Platform" src="https://img.shields.io/badge/macOS-Apple%20silicon-1f2229">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-1f2229">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20GPUI-1f2229">
 </p>
 
@@ -22,6 +22,8 @@
 ---
 
 Laika brings the Lightroom-style workflow — import, cull, develop, organize, export, publish — into a single fast native app written in Rust. The interface is drawn with [GPUI](https://github.com/zed-industries/zed), RAW files are decoded with [rawler](https://github.com/dnglab/dnglab), and every develop slider runs on the GPU through [wgpu](https://wgpu.rs). The catalog is one SQLite file; every edit is also written to an `.xmp` sidecar beside the original.
+
+The [catalog, edit, and XMP formats](docs/format/README.md) are public and additive, and releases include `laika-render` so a catalog or sidecar can be rendered to JPEG/TIFF without launching Laika.
 
 ## Highlights
 
@@ -106,14 +108,14 @@ Turn a collection into a website. The Publish module is a full page editor: drag
 | Area | What you get |
 |---|---|
 | **Import** | Memory cards and cameras with verified (hashed) copies and optional second copy · folder and file-name templates · add in place · RAW+JPEG pairs and video · metadata and develop presets on the way in · skip duplicates |
-| **Formats** | RAW via rawler (NEF, CR2/CR3, ARW, RAF, DNG, ORF, RW2, and more) · JPEG, PNG, TIFF, WebP · HEIC via macOS ImageIO · video kept as originals |
+| **Formats** | RAW via rawler (NEF, CR2/CR3, ARW, RAF, DNG, ORF, RW2, and more) · JPEG, PNG, TIFF, WebP · HEIC via macOS ImageIO where needed · video kept as originals |
 | **Export** | JPEG, PNG, WebP, AVIF, TIFF, or Original · size, quality, and file-size limits · naming templates · watermarks (text or graphic) · metadata policy · presets and multi-preset runs · post-export actions |
 | **Sidecars** | Every edit, rating, label, and keyword written to `.xmp` beside the original, and read back when another app changes it |
-| **Backup** | Originals and sidecars to S3-compatible storage (secrets in the macOS Keychain), SFTP, or a mounted SMB/NFS share · per-photo sync state |
-| **Apple Photos** | Import from your Photos library with albums, or add exported photos to an album |
+| **Backup** | Originals and sidecars to S3-compatible storage (secrets in the OS credential store), SFTP, or a mounted SMB/NFS share · per-photo sync state |
+| **Apple Photos** | On macOS, import from your Photos library with albums, or add exported photos to an album |
 | **Catalogs** | Create, open, switch, and relocate catalogs · automatic backups and migrations · integrity check and optimize · smart previews for offline editing |
 
-## Install
+## Install — macOS
 
 1. Download the latest `Laika-…-macos-arm64.dmg` (or `.zip`) from [Releases](https://github.com/s4njee/laika/releases/latest).
 2. Drag **Laika** to Applications.
@@ -123,9 +125,20 @@ On first launch Laika offers to import three sample RAW files so you can try it 
 
 > **Requirements:** macOS 13 or later on Apple silicon.
 
+## Install — Windows preview
+
+Download the `Laika-…-windows-x64.zip` workflow/release artifact, extract the
+whole folder, and run `laika.exe`. Development builds are not code-signed, so
+SmartScreen may require **More info → Run anyway**. Windows support is in native
+validation; see the [Windows handoff and smoke-test guide](docs/windows-port.md).
+
+> **Requirements:** 64-bit Windows 10/11 and a DirectX 12 or Vulkan-capable GPU.
+
 ## Build from source
 
-You need a recent stable Rust toolchain and Xcode command-line tools.
+You need a recent stable Rust toolchain. macOS needs Xcode command-line tools;
+Windows needs Visual Studio 2022 Build Tools with **Desktop development with
+C++** and a Windows SDK.
 
 ```bash
 git clone https://github.com/s4njee/laika.git
@@ -136,8 +149,15 @@ cargo run --release -p laika-app
 To produce the same `.app`, `.zip`, and `.dmg` as the releases:
 
 ```bash
-cargo build --release -p laika-app
+cargo build --release -p laika-app -p laika-render
 scripts/bundle-macos.sh
+```
+
+On Windows, PowerShell can validate and package the complete workspace:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\windows-bootstrap.ps1 -Release
 ```
 
 Run the test suite with `cargo test --workspace`. Every push to `main` publishes a [nightly pre-release](https://github.com/s4njee/laika/releases/tag/nightly), and `v*` tags publish versioned releases through [`.github/workflows/release.yml`](.github/workflows/release.yml).
@@ -161,6 +181,7 @@ Run the test suite with `cargo test --workspace`. Every push to `main` publishes
 | [`laika-raw`](crates/laika-raw) | RAW and raster decoding, previews, EXIF, the linear editing cache |
 | [`laika-develop`](crates/laika-develop) | The wgpu render pipeline and WGSL develop shader |
 | [`laika-export`](crates/laika-export) | Export encoders, watermarks, and the static gallery site builder |
+| [`laika-render`](crates/laika-render) | Headless reference renderer for catalogs and XMP sidecars |
 | [`laika-app`](crates/laika-app) | The GPUI desktop app |
 
 Design notes and the roadmap live in [`plan.md`](plan.md), [`backlog.md`](backlog.md), [`backlogv2.md`](backlogv2.md), and [`photogallery.md`](photogallery.md).

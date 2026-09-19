@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 image = "0.25"
-ravif = "0.13"
+# Avoid a hidden NASM prerequisite on clean Windows developer machines.
+ravif = { version = "0.13", default-features = false, features = ["threading"] }
 resvg = "0.46"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

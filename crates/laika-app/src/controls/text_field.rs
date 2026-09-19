@@ -14,7 +14,7 @@ pub fn text_field(value: &str) -> Div {
         .border_1()
         .border_color(border_control())
         .rounded(px(3.))
-        .text_size(px(12.))
+        .text_size(sp(12.))
         .text_color(rgb(TEXT_PRIMARY))
         .child(value.to_string())
 }
@@ -29,7 +29,7 @@ pub fn url_field(prefix: &str, slug: &str) -> Div {
         .border_color(border_control())
         .rounded(px(3.))
         .font_family(SANS)
-        .text_size(px(11.5))
+        .text_size(sp(11.5))
         .child(div().text_color(rgb(TEXT_DIM)).child(prefix.to_string()))
         .child(div().text_color(rgb(accent_line())).child(slug.to_string()))
 }

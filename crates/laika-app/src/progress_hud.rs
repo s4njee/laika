@@ -106,17 +106,25 @@ impl Laika {
         let button = |id: &'static str, label: &'static str, danger: bool| {
             div()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(label)
                 .px(px(10.))
                 .py(px(4.))
                 .rounded(px(4.))
                 .border_1()
                 .border_color(border_control())
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .text_color(rgb(if danger { 0xE56060 } else { TEXT_SECONDARY }))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .child(label)
         };
         let bar = div()
+            .id("progress-hud-bar")
+            .role(Role::ProgressIndicator)
+            .aria_label(title.clone())
+            .when_some(frac, |d, f| d.aria_numeric_value(f as f64 * 100.))
+            .aria_min_numeric_value(0.)
+            .aria_max_numeric_value(100.)
             .h(px(4.))
             .rounded(px(2.))
             .bg(rgb(track()))
@@ -139,11 +147,16 @@ impl Laika {
                 .occlude()
                 .absolute()
                 // Above the filmstrip in Develop, above the status bar elsewhere.
-                .bottom(px(if self.state.active_module == Module::Develop {
-                    layout::FILMSTRIP() + layout::DEVELOP_TOOLBAR + 12.
-                } else {
-                    layout::STATUS_BAR + 14.
-                }))
+                .bottom(px(
+                    if self.state.active_module == Module::Develop
+                        && self.library.prefs.filmstrip_visible
+                        && !self.chrome_minimal()
+                    {
+                        layout::FILMSTRIP() + layout::DEVELOP_TOOLBAR + 12.
+                    } else {
+                        layout::STATUS_BAR + 14.
+                    },
+                ))
                 .left(px(((vw - HUD_W) / 2.).max(8.)))
                 .w(px(HUD_W))
                 .p(px(14.))
@@ -165,7 +178,7 @@ impl Laika {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(12.5))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .child(title),
@@ -191,7 +204,7 @@ impl Laika {
                 .child(bar)
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .truncate()
                         .child(detail),

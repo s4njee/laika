@@ -67,6 +67,9 @@ fn main() {
     p[10] = 60.0;
     preview.submit(laika_develop::Job {
         params: p,
+        locals: Default::default(),
+        camera_profile: Default::default(),
+        show_mask_overlay: false,
         split: 0.38,
         geom: Default::default(),
         preview_long_edge: laika_develop::PREVIEW_LONG_EDGE,

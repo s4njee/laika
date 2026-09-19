@@ -115,11 +115,23 @@ pub struct Collection {
     pub id: i64,
     pub name: String,
     pub quick: bool,
+    /// Smart collections evaluate `criteria_json` instead of owning rows.
+    pub smart: bool,
+    pub criteria_json: String,
     pub count: usize,
     pub title: String,
     pub description: String,
     /// Cover photo, only while it is still a member.
     pub cover: Option<i64>,
+}
+
+/// U13: one persisted manual photo stack. The first member is its cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhotoStack {
+    pub id: i64,
+    pub count: usize,
+    pub collapsed: bool,
+    pub cover: i64,
 }
 
 impl Collection {
@@ -171,6 +183,17 @@ pub struct BackupProbe {
     pub bytes: u64,
 }
 
+/// U26: result of exporting a portable catalog + sidecar recovery bundle.
+/// Originals are deliberately referenced and checksummed, not duplicated.
+#[derive(Clone, Debug)]
+pub struct PortableBundleReport {
+    pub path: PathBuf,
+    pub photos: usize,
+    pub sidecars: usize,
+    pub missing_originals: usize,
+    pub bytes: u64,
+}
+
 /// V04: folder synchronize comparison.
 #[derive(Clone, Debug, Default)]
 pub struct FolderDiff {
@@ -186,7 +209,18 @@ pub struct FolderDiff {
 
 #[path = "catalog_gallery.rs"]
 mod gallery_store;
+#[path = "catalog_lightroom.rs"]
+mod lightroom_store;
+#[path = "catalog_presets.rs"]
+mod presets_store;
 pub use gallery_store::GallerySummary;
+pub use lightroom_store::{LightroomOptions, LightroomReport, LightroomResolution};
+pub use presets_store::PresetSave;
+#[path = "catalog_sidecar.rs"]
+mod sidecar_store;
+pub use sidecar_store::{
+    LightroomPolicy, MergeOutcome, SideFields, SideGroup, SidecarConflict, changed_since,
+};
 
 pub struct Catalog {
     conn: Connection,
@@ -327,6 +361,7 @@ fn read_lock(path: &Path) -> Option<LockHolder> {
     })
 }
 
+#[cfg(unix)]
 fn this_host() -> String {
     let mut buf = [0i8; 256];
     // SAFETY: gethostname writes at most `len` bytes into a valid buffer.
@@ -336,6 +371,11 @@ fn this_host() -> String {
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     buf[..len].iter().map(|&c| c as u8 as char).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn this_host() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Hostname equality tolerant of `.local`/domain suffixes and case.
@@ -364,11 +404,27 @@ fn on_local_volume(dir: &Path) -> bool {
     st.f_flags & (libc::MNT_LOCAL as u32) != 0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn on_local_volume(_dir: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
+fn on_local_volume(dir: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{DRIVE_FIXED, GetDriveTypeW};
+
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(prefix) = canonical.components().next() else {
+        return false;
+    };
+    let mut root: Vec<u16> = prefix.as_os_str().encode_wide().collect();
+    root.extend(['\\' as u16, 0]);
+    // SAFETY: `root` is a NUL-terminated UTF-16 drive root.
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED }
+}
+
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     // Out-of-range pids would go negative and address a process group.
     if pid == 0 || pid > i32::MAX as u32 {
@@ -381,6 +437,29 @@ fn pid_alive(pid: u32) -> bool {
     }
     // EPERM means the process exists but belongs to another user.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "windows")]
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: the handle is checked and closed exactly once; the query does
+    // not mutate the target process.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        ok && code == STILL_ACTIVE as u32
+    }
 }
 
 fn chrono_sys_secs() -> String {
@@ -916,6 +995,117 @@ pub mod migrations {
         .map_err(|e| format!("galleries: {e}"))
     }
 
+    /// Import scans remember each source file's identity (size + mtime at
+    /// a path on a card or folder) with its content hash and capture
+    /// metadata, so rescanning a card re-reads nothing it already knows.
+    fn migrate_v10(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS source_fingerprints(
+               source TEXT NOT NULL,
+               rel_path TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               mtime INTEGER NOT NULL,
+               file_hash TEXT NOT NULL,
+               captured_at TEXT NOT NULL DEFAULT '',
+               camera TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(source, rel_path)
+             );",
+        )
+        .map_err(|e| format!("source fingerprints: {e}"))
+    }
+
+    /// S01: Lightroom import links — which Lightroom asset or album
+    /// became which Laika photo or collection, so importing the same
+    /// library again updates instead of duplicating.
+    fn migrate_v11(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lightroom_links(
+               library TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               lr_id TEXT NOT NULL,
+               laika_id INTEGER NOT NULL,
+               linked_at TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(library, kind, lr_id)
+             );",
+        )
+        .map_err(|e| format!("lightroom links: {e}"))
+    }
+
+    /// S02: develop presets (Laika's and imported ones). Sparse values:
+    /// only included settings are stored.
+    fn migrate_v12(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS develop_presets(
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL,
+               grp TEXT NOT NULL DEFAULT '',
+               values_json TEXT NOT NULL,
+               supports_amount INTEGER NOT NULL DEFAULT 0,
+               skipped_json TEXT NOT NULL DEFAULT '[]',
+               approx_json TEXT NOT NULL DEFAULT '[]',
+               source TEXT NOT NULL DEFAULT '',
+               digest TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT '',
+               UNIQUE(grp, name)
+             );",
+        )
+        .map_err(|e| format!("develop presets: {e}"))
+    }
+
+    /// S03: sharing sidecars with Lightroom — the last synchronized
+    /// state per photo (three-way merge base) and conflicts awaiting a
+    /// decision.
+    fn migrate_v13(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sidecar_baseline(
+               photo_id INTEGER PRIMARY KEY,
+               fields_json TEXT NOT NULL,
+               updated_at TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS sidecar_conflicts(
+               photo_id INTEGER NOT NULL,
+               grp TEXT NOT NULL,
+               ours_json TEXT NOT NULL,
+               theirs_json TEXT NOT NULL,
+               writer TEXT NOT NULL DEFAULT '',
+               detected_at TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY(photo_id, grp)
+             );",
+        )
+        .map_err(|e| format!("sidecar merge tables: {e}"))
+    }
+
+    /// U13: saved filter criteria become smart collections; manual stacks
+    /// group photos without changing catalog membership or originals.
+    fn migrate_v14(conn: &Connection) -> Result<(), String> {
+        let has_criteria = conn
+            .prepare("SELECT 1 FROM pragma_table_info('collections') WHERE name = 'criteria_json'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())))
+            .is_ok();
+        if !has_criteria {
+            conn.execute_batch(
+                "ALTER TABLE collections ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '';",
+            )
+            .map_err(|e| format!("smart collections: {e}"))?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS photo_stacks(
+               id INTEGER PRIMARY KEY,
+               collapsed INTEGER NOT NULL DEFAULT 1,
+               created_at TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS photo_stack_items(
+               stack_id INTEGER NOT NULL,
+               photo_id INTEGER NOT NULL UNIQUE,
+               position INTEGER NOT NULL,
+               PRIMARY KEY(stack_id, photo_id)
+             );
+             CREATE INDEX IF NOT EXISTS photo_stack_items_stack
+               ON photo_stack_items(stack_id, position);",
+        )
+        .map_err(|e| format!("photo stacks: {e}"))
+    }
+
     pub const MIGRATIONS: &[Migration] = &[
         Migration {
             version: 1,
@@ -962,10 +1152,35 @@ pub mod migrations {
             name: "galleries",
             apply: migrate_v9,
         },
+        Migration {
+            version: 10,
+            name: "import source fingerprints",
+            apply: migrate_v10,
+        },
+        Migration {
+            version: 11,
+            name: "lightroom import links",
+            apply: migrate_v11,
+        },
+        Migration {
+            version: 12,
+            name: "develop presets",
+            apply: migrate_v12,
+        },
+        Migration {
+            version: 13,
+            name: "sidecar merge baseline and conflicts",
+            apply: migrate_v13,
+        },
+        Migration {
+            version: 14,
+            name: "smart collections and photo stacks",
+            apply: migrate_v14,
+        },
     ];
 
     /// Highest schema this build opens. Bump with every `MIGRATIONS` entry.
-    pub const APP_SCHEMA_VERSION: u32 = 9;
+    pub const APP_SCHEMA_VERSION: u32 = 14;
 
     /// Schema version of an open db (0 = pre-versioning prototype era).
     pub fn read_version(conn: &Connection, db_path: &std::path::Path) -> Result<u32, String> {
@@ -1598,7 +1813,7 @@ impl Catalog {
     pub fn collections(&self) -> Vec<Collection> {
         let _ = self.quick_collection_id();
         let mut stmt = match self.conn.prepare(
-            "SELECT c.id, c.name, c.kind,
+            "SELECT c.id, c.name, c.kind, c.criteria_json,
                (SELECT count(*) FROM collection_items i
                   JOIN photos p ON p.id = i.photo_id
                  WHERE i.collection_id = c.id),
@@ -1616,10 +1831,12 @@ impl Catalog {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 quick: r.get::<_, String>(2)? == "quick",
-                count: r.get::<_, i64>(3)? as usize,
-                title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                description: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                cover: r.get::<_, Option<i64>>(6)?,
+                smart: r.get::<_, String>(2)? == "smart",
+                criteria_json: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                count: r.get::<_, i64>(4)? as usize,
+                title: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                description: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                cover: r.get::<_, Option<i64>>(7)?,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -1658,7 +1875,7 @@ impl Catalog {
         let clash: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND kind = 'user'",
+                "SELECT id FROM collections WHERE name = ?1 COLLATE NOCASE AND kind <> 'quick'",
                 [t],
                 |r| r.get(0),
             )
@@ -1677,6 +1894,22 @@ impl Catalog {
                 params![name, chrono_stamp()],
             )
             .map_err(|e| format!("create collection: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn create_smart_collection(&self, name: &str, criteria_json: &str) -> Result<i64, String> {
+        let name = self.check_collection_name(name, None)?;
+        // Validate before persistence so an unreadable smart collection can
+        // never enter the rail.
+        serde_json::from_str::<crate::state::Filters>(criteria_json)
+            .map_err(|e| format!("invalid smart collection criteria: {e}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO collections(name, kind, criteria_json, created_at)
+                 VALUES (?1, 'smart', ?2, ?3)",
+                params![name, criteria_json, chrono_stamp()],
+            )
+            .map_err(|e| format!("create smart collection: {e}"))?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -1729,6 +1962,15 @@ impl Catalog {
     /// Add photos (already-present ones are skipped). Returns how many
     /// were new. V30: new members append to the end of the album order.
     pub fn add_to_collection(&self, id: i64, photos: &[i64]) -> Result<usize, String> {
+        let kind: String = self
+            .conn
+            .query_row("SELECT kind FROM collections WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "collection no longer exists".to_string())?;
+        if kind == "smart" {
+            return Err("smart collections are driven by their saved criteria".to_string());
+        }
         let stamp = chrono_stamp();
         let mut next: i64 = self
             .conn
@@ -1907,6 +2149,161 @@ impl Catalog {
             .map_err(|e| format!("clear collection: {e}"))
     }
 
+    // ---- U13 manual stacks -------------------------------------------------
+
+    pub fn photo_stacks(&self) -> Vec<PhotoStack> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT s.id, s.collapsed, count(i.photo_id),
+                    coalesce((SELECT photo_id FROM photo_stack_items
+                              WHERE stack_id = s.id ORDER BY position LIMIT 1), 0)
+               FROM photo_stacks s
+               JOIN photo_stack_items i ON i.stack_id = s.id
+              GROUP BY s.id, s.collapsed ORDER BY s.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(PhotoStack {
+                id: r.get(0)?,
+                collapsed: r.get::<_, i64>(1)? != 0,
+                count: r.get::<_, i64>(2)? as usize,
+                cover: r.get(3)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn stack_members(&self, stack_id: i64) -> Vec<i64> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT photo_id FROM photo_stack_items
+              WHERE stack_id = ?1 ORDER BY position, photo_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([stack_id], |r| r.get::<_, i64>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn stack_for_photo(&self, photo_id: i64) -> Option<PhotoStack> {
+        let stack_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT stack_id FROM photo_stack_items WHERE photo_id = ?1",
+                [photo_id],
+                |r| r.get(0),
+            )
+            .ok()?;
+        self.photo_stacks().into_iter().find(|s| s.id == stack_id)
+    }
+
+    /// Create one collapsed stack. A photo can belong to only one stack;
+    /// callers must explicitly unstack before regrouping.
+    pub fn create_stack(&self, photos: &[i64]) -> Result<i64, String> {
+        let mut ids = Vec::new();
+        for id in photos {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        if ids.len() < 2 {
+            return Err("select at least two photos to create a stack".to_string());
+        }
+        for id in &ids {
+            let exists: bool = self
+                .conn
+                .query_row("SELECT 1 FROM photos WHERE id = ?1", [id], |_| Ok(()))
+                .is_ok();
+            if !exists {
+                return Err(format!("photo {id} is no longer in the catalog"));
+            }
+            if self.stack_for_photo(*id).is_some() {
+                return Err("one or more selected photos are already stacked".to_string());
+            }
+        }
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("create stack: {e}"))?;
+        let result = (|| {
+            self.conn
+                .execute(
+                    "INSERT INTO photo_stacks(collapsed, created_at) VALUES (1, ?1)",
+                    [chrono_stamp()],
+                )
+                .map_err(|e| e.to_string())?;
+            let stack_id = self.conn.last_insert_rowid();
+            for (position, photo_id) in ids.iter().enumerate() {
+                self.conn
+                    .execute(
+                        "INSERT INTO photo_stack_items(stack_id, photo_id, position)
+                         VALUES (?1, ?2, ?3)",
+                        params![stack_id, photo_id, position as i64],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok::<i64, String>(stack_id)
+        })();
+        match result {
+            Ok(id) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| format!("create stack: {e}"))?;
+                Ok(id)
+            }
+            Err(e) => {
+                self.conn.execute_batch("ROLLBACK").ok();
+                Err(format!("create stack: {e}"))
+            }
+        }
+    }
+
+    pub fn set_stack_collapsed(&self, stack_id: i64, collapsed: bool) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE photo_stacks SET collapsed = ?1 WHERE id = ?2",
+                params![collapsed as u8, stack_id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("update stack: {e}"))
+    }
+
+    /// Remove the whole stack containing `photo_id`; photos and all other
+    /// catalog organization remain untouched.
+    pub fn unstack_photo(&self, photo_id: i64) -> Result<usize, String> {
+        let Some(stack) = self.stack_for_photo(photo_id) else {
+            return Ok(0);
+        };
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("unstack: {e}"))?;
+        let result = self
+            .conn
+            .execute(
+                "DELETE FROM photo_stack_items WHERE stack_id = ?1",
+                [stack.id],
+            )
+            .and_then(|n| {
+                self.conn
+                    .execute("DELETE FROM photo_stacks WHERE id = ?1", [stack.id])
+                    .map(|_| n)
+            });
+        match result {
+            Ok(n) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| format!("unstack: {e}"))?;
+                Ok(n)
+            }
+            Err(e) => {
+                self.conn.execute_batch("ROLLBACK").ok();
+                Err(format!("unstack: {e}"))
+            }
+        }
+    }
+
     /// Save the Quick Collection as a named collection and clear it
     /// (Lightroom's default). Returns the new collection's id.
     pub fn save_quick_collection(&self, name: &str) -> Result<i64, String> {
@@ -2040,6 +2437,8 @@ impl Catalog {
             optics_on: edit.optics_on,
             effects_on: edit.effects_on,
             grading_on: edit.grading_on,
+            locals: edit.locals.sanitized(),
+            camera_profile: edit.camera_profile,
         })
         .unwrap_or_default();
         let history = crate::edit::encode_history(&edit.history);
@@ -2089,6 +2488,8 @@ impl Catalog {
                     e.optics_on,
                     e.effects_on,
                     e.grading_on,
+                    e.locals,
+                    e.camera_profile,
                 );
                 (e.params, e.crop, Some(stored))
             } else if let Ok(params) = serde_json::from_str::<Vec<f32>>(&pjson) {
@@ -2109,7 +2510,7 @@ impl Catalog {
             // geometry and flags stored in params_json.)
             let live_geom = tip
                 .map(|st: &crate::edit::HistoryStep| st.geom)
-                .or(stored.map(|s| s.0))
+                .or_else(|| stored.as_ref().map(|s| s.0))
                 .unwrap_or_default();
             let (curve_on, hsl_on, detail_on, optics_on, effects_on, grading_on) = tip
                 .map(|st| {
@@ -2122,8 +2523,16 @@ impl Catalog {
                         st.grading_on,
                     )
                 })
-                .or(stored.map(|s| (s.1, s.2, s.3, s.4, s.5, s.6)))
+                .or_else(|| stored.as_ref().map(|s| (s.1, s.2, s.3, s.4, s.5, s.6)))
                 .unwrap_or((true, true, true, true, true, true));
+            let locals = tip
+                .map(|st| st.locals.clone())
+                .or_else(|| stored.as_ref().map(|s| s.7.clone()))
+                .unwrap_or_default();
+            let camera_profile = tip
+                .map(|st| st.camera_profile)
+                .or_else(|| stored.as_ref().map(|s| s.8))
+                .unwrap_or_default();
             out.push((
                 pid,
                 crate::edit::Edit {
@@ -2138,6 +2547,8 @@ impl Catalog {
                     optics_on,
                     effects_on,
                     grading_on,
+                    locals,
+                    camera_profile,
                 },
             ));
         }
@@ -2166,6 +2577,14 @@ impl Catalog {
         let mtime = mtime.unwrap_or(0);
         let db_updated = self.edits_updated_at(id);
         let written = self.sidecar_written_at(id);
+        // S03: files shared with Lightroom merge field by field once both
+        // sides have a synchronized baseline.
+        let policy = self.lightroom_policy();
+        if policy.shares() && written.is_some_and(|w| mtime > w + 1) {
+            if self.merge_external_sidecar(id, path, policy)?.is_some() {
+                return Ok(SidecarApply::AppliedExternal);
+            }
+        }
         // No local edits: adopt the sidecar (fresh import or first sight).
         let take_sidecar = match (db_updated, written) {
             (None, _) => true,
@@ -2196,6 +2615,8 @@ impl Catalog {
                     optics_on: true,
                     effects_on: true,
                     grading_on: true,
+                    locals: Default::default(),
+                    camera_profile: Default::default(),
                 },
             )?;
         }
@@ -2240,7 +2661,19 @@ impl Catalog {
             // Already applied above (by name).
             label: cur.label.clone(),
             label_names: cur.label_names.clone(),
+            gps: cur.gps.clone(),
         };
+        // Map: a sidecar location (set here or by another tool) wins.
+        if !side.gps.is_empty()
+            && crate::geo::parse_gps(&side.gps) != crate::geo::parse_gps(&cur.gps)
+        {
+            self.conn
+                .execute(
+                    "UPDATE photos SET exif_gps = ?1 WHERE id = ?2",
+                    params![side.gps, id],
+                )
+                .map_err(|e| format!("sidecar location: {e}"))?;
+        }
         let got_auth = !side.title.is_empty()
             || !side.caption.is_empty()
             || !side.headline.is_empty()
@@ -2289,7 +2722,14 @@ impl Catalog {
         // ride along so neither is wiped by convergence.
         let auth = self.photo_authorship(id);
         let geom = self.geom_of(id);
-        crate::xmp::write(path, params, rating, history, preset, &auth, &geom)?;
+        // S03: conflicted photos wait; Lightroom-led catalogs keep develop.
+        if self.has_sidecar_conflict(id) {
+            return Ok(());
+        }
+        let scope = crate::sidecar::WriteScope {
+            develop: self.lightroom_policy().writes_develop(),
+        };
+        crate::xmp::write_scoped(path, params, rating, history, preset, &auth, &geom, scope)?;
         let mtime = crate::xmp::sidecar_mtime(path).unwrap_or(0);
         self.remember_sidecar_write(id, mtime)
     }
@@ -2313,7 +2753,29 @@ impl Catalog {
                 .map(|p| self.label_names().name(p.label).to_string())
                 .unwrap_or_default(),
             label_names: self.label_names().0.to_vec(),
+            gps: self
+                .photo_by_id(id)
+                .and_then(|p| crate::geo::parse_gps(&p.exif_gps))
+                .map(|(lat, lon)| crate::geo::format_gps(lat, lon))
+                .unwrap_or_default(),
         }
+    }
+
+    /// Map: set or clear a photo's location (decimal pair in `exif_gps`).
+    pub fn set_gps(&self, id: i64, location: Option<(f64, f64)>) -> Result<(), String> {
+        let value = location
+            .filter(|(lat, lon)| {
+                crate::geo::parse_gps(&crate::geo::format_gps(*lat, *lon)).is_some()
+            })
+            .map(|(lat, lon)| crate::geo::format_gps(lat, lon))
+            .unwrap_or_default();
+        self.conn
+            .execute(
+                "UPDATE photos SET exif_gps = ?1 WHERE id = ?2",
+                params![value, id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("set location: {e}"))
     }
 
     /// Epoch secs of the last acknowledged params save, if any.
@@ -2338,7 +2800,12 @@ impl Catalog {
                 params![id, mtime.to_string()],
             )
             .map(|_| ())
-            .map_err(|e| format!("save sidecar state: {e}"))
+            .map_err(|e| format!("save sidecar state: {e}"))?;
+        // S03: what the file holds now is the synchronized state.
+        if let Some(p) = self.photo_by_id(id) {
+            self.record_sidecar_baseline(id, &p.path);
+        }
+        Ok(())
     }
 
     fn sidecar_written_at(&self, id: i64) -> Option<i64> {
@@ -2540,6 +3007,69 @@ impl Catalog {
                 |_| Ok(()),
             )
             .is_ok()
+    }
+
+    /// Known source files for one card or folder source, keyed by path
+    /// relative to the source root.
+    pub fn source_fingerprints(&self, source: &str) -> HashMap<String, crate::import::Fingerprint> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT rel_path, size, mtime, file_hash, captured_at, camera
+               FROM source_fingerprints WHERE source = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        stmt.query_map([source], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                crate::import::Fingerprint {
+                    size: r.get::<_, i64>(1)? as u64,
+                    mtime_secs: r.get(2)?,
+                    content_hash: r.get(3)?,
+                    captured_at: r.get(4)?,
+                    camera: r.get(5)?,
+                },
+            ))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// Remember freshly hashed source files (one transaction).
+    pub fn record_source_fingerprints(
+        &self,
+        source: &str,
+        rows: &[(String, crate::import::Fingerprint)],
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("fingerprints: {e}"))?;
+        {
+            let mut ins = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO source_fingerprints
+                       (source, rel_path, size, mtime, file_hash, captured_at, camera)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| format!("fingerprints: {e}"))?;
+            for (rel, f) in rows {
+                ins.execute(params![
+                    source,
+                    rel,
+                    f.size as i64,
+                    f.mtime_secs,
+                    f.content_hash,
+                    f.captured_at,
+                    f.camera
+                ])
+                .map_err(|e| format!("fingerprints: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("fingerprints: {e}"))
     }
 
     /// Journal one finished import run (diagnostics; best-effort caller).
@@ -3297,6 +3827,25 @@ impl Catalog {
         stmt.query_map([id], |r| r.get(0))
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
+    }
+
+    /// All keyword assignments in one query (large-catalog exports and
+    /// smart-collection evaluation must not issue one query per photo).
+    pub fn keywords_by_photo(&self) -> HashMap<i64, Vec<String>> {
+        let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT photo_id, keyword FROM keywords ORDER BY photo_id, keyword")
+        else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (id, keyword) in rows.flatten() {
+                out.entry(id).or_default().push(keyword);
+            }
+        }
+        out
     }
 
     /// V03: split a typed keyword list on commas/semicolons, trimmed,
@@ -4493,6 +5042,42 @@ impl Catalog {
         self.conn
             .execute("DELETE FROM collection_items WHERE photo_id = ?1", [id])
             .map_err(|e| format!("remove from catalog: {e}"))?;
+        // U13: stack membership is organizational only. A stack needs at
+        // least two members, so removing either of the last two dissolves
+        // the grouping while leaving the remaining photo untouched.
+        let stack_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT stack_id FROM photo_stack_items WHERE photo_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok();
+        self.conn
+            .execute("DELETE FROM photo_stack_items WHERE photo_id = ?1", [id])
+            .map_err(|e| format!("remove from catalog: {e}"))?;
+        if let Some(stack_id) = stack_id {
+            let count: i64 = self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM photo_stack_items WHERE stack_id = ?1",
+                    [stack_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if count < 2 {
+                self.conn
+                    .execute(
+                        "DELETE FROM photo_stack_items WHERE stack_id = ?1",
+                        [stack_id],
+                    )
+                    .and_then(|_| {
+                        self.conn
+                            .execute("DELETE FROM photo_stacks WHERE id = ?1", [stack_id])
+                    })
+                    .map_err(|e| format!("remove from catalog: {e}"))?;
+            }
+        }
         // G01: and gallery membership.
         self.conn
             .execute("DELETE FROM gallery_photos WHERE photo_id = ?1", [id])
@@ -4736,6 +5321,109 @@ impl Catalog {
         let dest = backup_dir.join(format!("laika-{stamp}.db"));
         std::fs::copy(&self.db_path, &dest).map_err(|e| format!("copy backup: {e}"))?;
         Ok(dest)
+    }
+
+    /// Export the complete SQLite catalog plus byte-identical XMP sidecars
+    /// and a checksummed original-file manifest. The bundle never modifies
+    /// or silently copies originals; their absolute locations and import-time
+    /// hashes make the boundary explicit for migration and restore planning.
+    pub fn export_portable_bundle(&self, parent: &Path) -> Result<PortableBundleReport, String> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| format!("checkpoint: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        let base = format!(
+            "{}-{}-catalog-sidecars.laika-bundle",
+            crate::sync::sanitize_catalog(&self.catalog_name()),
+            chrono_stamp()
+        );
+        let dest = crate::import::unique_dest_name(parent, &base);
+        let tmp = parent.join(format!(".{base}.part-{}", std::process::id()));
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+        }
+        let result = (|| -> Result<PortableBundleReport, String> {
+            let side_dir = tmp.join("sidecars");
+            std::fs::create_dir_all(&side_dir)
+                .map_err(|e| format!("create {}: {e}", side_dir.display()))?;
+            let catalog_copy = tmp.join("catalog.db");
+            std::fs::copy(&self.db_path, &catalog_copy)
+                .map_err(|e| format!("copy catalog: {e}"))?;
+            Self::probe_backup(&catalog_copy)?;
+
+            let photos = self.all_photos();
+            let mut sidecars = 0usize;
+            let mut missing_originals = 0usize;
+            let mut total_bytes = std::fs::metadata(&catalog_copy)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let mut entries = Vec::with_capacity(photos.len());
+            for photo in &photos {
+                let original = PathBuf::from(&photo.path);
+                let original_present = original.is_file();
+                missing_originals += (!original_present) as usize;
+                let sidecar = crate::sidecar::path_for(&photo.path);
+                let side_path = Path::new(&sidecar);
+                let mut bundled_sidecar = None;
+                let mut sidecar_hash = None;
+                if side_path.is_file() {
+                    let safe_name = format!("{}-{}.xmp", photo.id, photo.filename);
+                    let rel = PathBuf::from("sidecars").join(safe_name);
+                    let copied = tmp.join(&rel);
+                    std::fs::copy(side_path, &copied)
+                        .map_err(|e| format!("copy {}: {e}", side_path.display()))?;
+                    let hash = hash_file(&copied)?;
+                    total_bytes += std::fs::metadata(&copied).map(|m| m.len()).unwrap_or(0);
+                    sidecars += 1;
+                    bundled_sidecar = Some(rel.to_string_lossy().to_string());
+                    sidecar_hash = Some(hash);
+                }
+                entries.push(serde_json::json!({
+                    "id": photo.id,
+                    "original_path": photo.path,
+                    "original_filename": photo.filename,
+                    "original_blake3": photo.blake3,
+                    "original_present": original_present,
+                    "remote_key": photo.remote_key,
+                    "sidecar": bundled_sidecar,
+                    "sidecar_blake3": sidecar_hash,
+                }));
+            }
+            let manifest = serde_json::json!({
+                "format": "laika-catalog-sidecars",
+                "version": 1,
+                "created_at": chrono_stamp(),
+                "catalog": "catalog.db",
+                "catalog_name": self.catalog_name(),
+                "originals_included": false,
+                "photos": entries,
+            });
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+                .map_err(|e| format!("encode manifest: {e}"))?;
+            std::fs::write(tmp.join("manifest.json"), &manifest_bytes)
+                .map_err(|e| format!("write manifest: {e}"))?;
+            total_bytes += manifest_bytes.len() as u64;
+            let readme = "Laika portable catalog + sidecar bundle\n\n\
+                catalog.db contains ratings, organization, edit history, and settings.\n\
+                sidecars/ contains byte-identical XMP files, including metadata Laika does not understand.\n\
+                Originals are not duplicated here. manifest.json records each original's path, BLAKE3 hash,\n\
+                remote backup key, presence, and sidecar checksum. Keep or restore the originals separately.\n";
+            std::fs::write(tmp.join("README.txt"), readme)
+                .map_err(|e| format!("write README: {e}"))?;
+            total_bytes += readme.len() as u64;
+            std::fs::rename(&tmp, &dest).map_err(|e| format!("finish {}: {e}", dest.display()))?;
+            Ok(PortableBundleReport {
+                path: dest,
+                photos: photos.len(),
+                sidecars,
+                missing_originals,
+                bytes: total_bytes,
+            })
+        })();
+        if result.is_err() {
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+        result
     }
 
     /// Validate a backup file before restoring it: readable SQLite with an
@@ -5175,6 +5863,8 @@ impl Catalog {
             picked: snap.picked,
             rejected: snap.rejected,
             color_label: snap.color_label,
+            locals: snap.locals.clone(),
+            camera_profile: snap.camera_profile,
         })
         .map_err(|e| format!("save snapshot: {e}"))?;
         // Same-name snapshots replace (one row per treatment name).
@@ -5236,6 +5926,8 @@ impl Catalog {
                         picked: j.picked,
                         rejected: j.rejected,
                         color_label: j.color_label,
+                        locals: j.locals,
+                        camera_profile: j.camera_profile,
                     },
                 ))
             })
@@ -5427,25 +6119,18 @@ struct EditJson {
     effects_on: bool,
     #[serde(default = "crate::edit::flag_on")]
     grading_on: bool,
+    #[serde(default)]
+    locals: crate::edit::LocalEdits,
+    #[serde(default)]
+    camera_profile: crate::edit::CameraProfile,
 }
 
-/// Default catalog + cache locations (macOS app-support, XDG cache elsewhere).
+/// Default catalog + cache locations in the platform's per-user directories.
 pub fn default_dirs() -> (PathBuf, PathBuf) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    if cfg!(target_os = "macos") {
-        (
-            PathBuf::from(format!(
-                "{home}/Library/Application Support/Laika/catalog.db"
-            )),
-            PathBuf::from(format!("{home}/Library/Application Support/Laika/cache")),
-        )
-    } else {
-        let base = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"));
-        (
-            PathBuf::from(format!("{base}/laika/catalog.db")),
-            PathBuf::from(format!("{base}/laika/cache")),
-        )
-    }
+    (
+        crate::platform::data_dir().join("catalog.db"),
+        crate::platform::cache_dir(),
+    )
 }
 
 #[cfg(test)]
@@ -5679,6 +6364,8 @@ mod tests {
                 optics_on: true,
                 effects_on: true,
                 grading_on: true,
+                locals: Default::default(),
+                camera_profile: Default::default(),
             },
         )
         .unwrap();
@@ -5830,6 +6517,53 @@ mod tests {
         // the library.
         cat.forget_photos_links(&[id]);
         assert!(plan(&c, &cat.photos_links(), &HashSet::new(), &s).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_fingerprints_skip_known_files_and_notice_changes() {
+        use crate::import::{Fingerprint, fingerprint_key, fingerprint_source, scan_entry_cached};
+        let dir = workdir("fingerprints");
+        let db = dir.join("c.db");
+        let card = dir.join("card").join("DCIM").join("100NIKON");
+        std::fs::create_dir_all(&card).unwrap();
+        let a = card.join("DSC_0001.JPG");
+        let b = card.join("DSC_0002.JPG");
+        jpeg(&a, 40, 30);
+        jpeg(&b, 50, 30);
+        let root = dir.join("card");
+        let source = fingerprint_source(&root, None);
+        assert!(source.starts_with("folder:"));
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        // First scan reads and hashes everything.
+        let known = cat.source_fingerprints(&source);
+        assert!(known.is_empty());
+        let mut fresh: Vec<(String, Fingerprint)> = Vec::new();
+        let mut first = Vec::new();
+        for p in [&a, &b] {
+            let key = fingerprint_key(&root, p);
+            let (entry, fp) = scan_entry_cached(p, known.get(&key));
+            assert!(!entry.content_hash.is_empty());
+            fresh.push((key, fp.expect("read fresh")));
+            first.push(entry);
+        }
+        assert_eq!(fresh[0].0, "DCIM/100NIKON/DSC_0001.JPG");
+        cat.record_source_fingerprints(&source, &fresh).unwrap();
+        // Rescan: nothing is re-read, and identity matches the first scan.
+        let known = cat.source_fingerprints(&source);
+        assert_eq!(known.len(), 2);
+        for (p, before) in [&a, &b].into_iter().zip(&first) {
+            let (entry, fp) = scan_entry_cached(p, known.get(&fingerprint_key(&root, p)));
+            assert!(fp.is_none(), "reused, not re-read");
+            assert_eq!(entry.content_hash, before.content_hash);
+            assert_eq!(entry.captured_at, before.captured_at);
+        }
+        // A changed file (new content, new mtime) is read again.
+        jpeg(&b, 64, 64);
+        filetime_set(&b, 1_600_000_000);
+        let (entry, fp) = scan_entry_cached(&b, known.get(&fingerprint_key(&root, &b)));
+        assert!(fp.is_some(), "size/mtime changed → re-read");
+        assert_ne!(entry.content_hash, first[1].content_hash);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6130,6 +6864,52 @@ mod tests {
         );
         cat.delete_collection(saved).unwrap();
         assert_eq!(cat.collections().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn u13_smart_collections_and_stacks_persist_without_touching_originals() {
+        let dir = workdir("u13-smart-stacks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.jpg");
+        let b_path = dir.join("b.jpg");
+        jpeg(&a_path, 32, 24);
+        jpeg(&b_path, 32, 24);
+        let db = dir.join("c.db");
+        let cache = dir.join("cache");
+        let (a, b, smart, stack) = {
+            let cat = Catalog::open(&db, "c", &dir).unwrap();
+            let a = cat.import_file(&a_path, &cache).unwrap().unwrap();
+            let b = cat.import_file(&b_path, &cache).unwrap().unwrap();
+            let mut filters = crate::state::Filters::default();
+            filters.min_stars = 4;
+            let criteria = serde_json::to_string(&filters).unwrap();
+            let smart = cat
+                .create_smart_collection("Four stars", &criteria)
+                .unwrap();
+            assert!(cat.add_to_collection(smart, &[a]).is_err());
+            let saved = cat
+                .collections()
+                .into_iter()
+                .find(|c| c.id == smart)
+                .unwrap();
+            assert!(saved.smart && saved.criteria_json == criteria && saved.count == 0);
+            let stack = cat.create_stack(&[a, b]).unwrap();
+            assert!(cat.create_stack(&[a, b]).is_err(), "one stack per photo");
+            assert_eq!(cat.stack_members(stack), vec![a, b]);
+            (a, b, smart, stack)
+        };
+        let cat = Catalog::open(&db, "c", &dir).unwrap();
+        assert!(cat.collections().iter().any(|c| c.id == smart && c.smart));
+        assert_eq!(cat.photo_stacks()[0].id, stack);
+        cat.set_stack_collapsed(stack, false).unwrap();
+        assert!(!cat.stack_for_photo(a).unwrap().collapsed);
+        assert_eq!(cat.unstack_photo(b).unwrap(), 2);
+        assert!(cat.photo_stacks().is_empty());
+        assert!(cat.photo_by_id(a).is_some() && cat.photo_by_id(b).is_some());
+        assert!(a_path.exists() && b_path.exists());
+        cat.delete_collection(smart).unwrap();
+        assert!(a_path.exists() && b_path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6966,6 +7746,8 @@ mod tests {
             picked: false,
             rejected: false,
             color_label: 0,
+            locals: Default::default(),
+            camera_profile: Default::default(),
         };
         cat.save_snapshot(id, "s1", &snap).unwrap();
         let saved = cat.snapshot_removed(id).expect("snapshot");
@@ -7385,6 +8167,8 @@ mod tests {
                     picked: false,
                     rejected: false,
                     color_label: 0,
+                    locals: Default::default(),
+                    camera_profile: Default::default(),
                 },
             );
             cat.save_params(id, &e).unwrap();
@@ -7416,6 +8200,48 @@ mod tests {
         let bogus = dir.join("bogus.db");
         std::fs::write(&bogus, b"not sqlite").unwrap();
         assert!(Catalog::probe_backup(&bogus).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn portable_bundle_keeps_catalog_and_foreign_sidecar_bytes() {
+        let dir = workdir("u26-bundle");
+        let originals = dir.join("shoot");
+        std::fs::create_dir_all(&originals).unwrap();
+        let photo = originals.join("frame.jpg");
+        jpeg(&photo, 48, 32);
+        let cat = Catalog::open(&dir.join("cat.db"), "Migration Test", &dir).unwrap();
+        let id = cat
+            .import_file(&photo, &dir.join("cache"))
+            .unwrap()
+            .unwrap();
+        let sidecar = crate::sidecar::path_for(&photo.to_string_lossy());
+        let adobe = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:foreign="https://example.test/" foreign:opaque="keep-me"/></rdf:RDF></x:xmpmeta>"#;
+        std::fs::write(&sidecar, adobe).unwrap();
+        cat.set_rating(id, 4).unwrap();
+
+        let report = cat.export_portable_bundle(&dir.join("exports")).unwrap();
+        assert_eq!(
+            (report.photos, report.sidecars, report.missing_originals),
+            (1, 1, 0)
+        );
+        let catalog_copy = report.path.join("catalog.db");
+        assert_eq!(Catalog::probe_backup(&catalog_copy).unwrap().photos, 1);
+        let copied = report
+            .path
+            .join("sidecars")
+            .join(format!("{id}-frame.jpg.xmp"));
+        assert_eq!(std::fs::read(copied).unwrap(), adobe);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report.path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["format"], "laika-catalog-sidecars");
+        assert_eq!(manifest["originals_included"], false);
+        assert_eq!(manifest["photos"][0]["original_present"], true);
+        assert_eq!(
+            manifest["photos"][0]["original_blake3"],
+            hash_file(&photo).unwrap()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7560,6 +8386,8 @@ mod tests {
                 optics_on: true,
                 effects_on: true,
                 grading_on: true,
+                locals: Default::default(),
+                camera_profile: Default::default(),
             },
         )
         .unwrap();
@@ -7748,6 +8576,8 @@ mod tests {
                 picked: false,
                 rejected: false,
                 color_label: 0,
+                locals: Default::default(),
+                camera_profile: Default::default(),
             };
             e.ensure_baseline(base);
             let mut p1 = crate::edit::defaults();
@@ -7769,6 +8599,24 @@ mod tests {
                     picked: true,
                     rejected: false,
                     color_label: 0,
+                    locals: crate::edit::LocalEdits {
+                        masks: vec![crate::edit::LocalMask {
+                            id: 1,
+                            name: "Sky".into(),
+                            shape: crate::edit::MaskShape::Linear {
+                                start: [0.1, 0.2],
+                                end: [0.9, 0.7],
+                            },
+                            feather: 0.6,
+                            invert: false,
+                            adjustment: crate::edit::LocalAdjustment {
+                                exposure: -0.5,
+                                ..Default::default()
+                            },
+                        }],
+                        heals: Vec::new(),
+                    },
+                    camera_profile: crate::edit::CameraProfile::Neutral,
                 },
             );
             cat.save_params(id, &e).unwrap();
@@ -7791,6 +8639,8 @@ mod tests {
         assert_eq!(e.history[1].label, "Exposure");
         assert_eq!(e.history[1].rating, 4);
         assert!(e.history[1].picked);
+        assert_eq!(e.locals.masks.len(), 1);
+        assert_eq!(e.camera_profile, crate::edit::CameraProfile::Neutral);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7820,6 +8670,8 @@ mod tests {
             picked: true,
             rejected: false,
             color_label: 4,
+            locals: Default::default(),
+            camera_profile: Default::default(),
         };
         let row = cat.save_snapshot(7, "Warm", &snap).unwrap();
         assert!(row > 0);

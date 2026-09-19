@@ -16,7 +16,7 @@ pub fn primary(label: &str) -> Div {
         .hover(|s| s.bg(rgb(accent_fill_hover())))
         .text_color(rgb(accent_on_fill()))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(11.5))
+        .text_size(sp(11.5))
         .child(label.to_string())
 }
 
@@ -32,6 +32,6 @@ pub fn outline(label: &str) -> Div {
         .hover(|s| s.border_color(rgba(0xFFFFFF3D)))
         .text_color(rgb(TEXT_SECONDARY))
         .font_weight(FontWeight::MEDIUM)
-        .text_size(px(11.))
+        .text_size(sp(11.))
         .child(label.to_string())
 }

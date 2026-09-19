@@ -8,8 +8,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -23,8 +23,11 @@ use laika_core::sync::SyncSettings;
 
 mod activity;
 mod albums;
+mod batch_edit;
+mod coexist_ui;
 mod collections;
 mod commands;
+mod compare_survey;
 mod controls;
 mod diagnostics;
 mod gallery_canvas;
@@ -32,9 +35,13 @@ mod gallery_inspector;
 mod gallery_publish;
 mod gallery_ui;
 mod geometry;
+mod lightroom_mode;
+mod lightroom_ui;
+mod map_view;
 mod photos_ingest;
 mod photos_sync;
 mod prefs_ui;
+mod presets_ui;
 mod progress_hud;
 mod slideshow;
 mod theme;
@@ -103,7 +110,7 @@ fn input_box(text: &str, placeholder: bool) -> Div {
         .bg(rgb(bg_well()))
         .border_1()
         .border_color(border_control())
-        .text_size(px(12.))
+        .text_size(sp(12.))
         .truncate()
         .text_color(rgb(if placeholder {
             TEXT_DIM
@@ -164,6 +171,8 @@ struct Thumb {
 struct ImportPreview {
     entry_index: usize,
     image: Option<Arc<RenderImage>>,
+    /// The loader already asked for this preview (success or not).
+    tried: bool,
 }
 
 struct ImportProgress {
@@ -223,7 +232,6 @@ struct ImportProgress {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImportStage {
     Pick,
-    Scanning,
     Review,
     Running,
     Done,
@@ -257,7 +265,7 @@ impl ExportMeta {
     }
 }
 
-use laika_export::formats::{ExportFormat, ExportFormatOpts};
+use laika_export::formats::{ExportFormat, ExportFormatOpts, OutputSharpening};
 use laika_export::watermark::{WatermarkMode, WatermarkSpec};
 
 /// V15: one Remove undo unit — full row snapshots for every photo
@@ -538,6 +546,25 @@ struct ExportRun {
     failed: Vec<(String, String)>,
 }
 
+/// S07: full-catalog, application-independent exit bundle UI.
+#[derive(Debug, Default)]
+struct ExitBundleUi {
+    open: bool,
+    dest: Option<PathBuf>,
+    output: Option<PathBuf>,
+    copy_originals: bool,
+    rendered_jpegs: bool,
+    run: Option<ExitBundleRun>,
+    report: Vec<String>,
+    error: String,
+}
+
+#[derive(Debug)]
+struct ExitBundleRun {
+    progress: Arc<Mutex<laika_core::exit_bundle::ExitBundleProgress>>,
+    cancel: Arc<AtomicBool>,
+}
+
 /// U10: a run is finished when every file was attempted or it was
 /// cancelled (cancelled runs accept retries and fresh starts).
 fn run_finished(r: &ExportRun) -> bool {
@@ -582,6 +609,8 @@ struct ExportItem {
     out_path: PathBuf,
     is_video: bool,
     params: [f32; edit::PARAM_COUNT],
+    locals: edit::LocalEdits,
+    camera_profile: edit::CameraProfile,
     /// Acknowledged geometry as a render struct (drafts never export).
     geom: laika_develop::CropRender,
     rating: u8,
@@ -626,6 +655,10 @@ enum PickerTarget {
     CacheDir,
     /// U10: destination folder for file export.
     ExportDest,
+    /// U26: parent folder for a portable catalog + sidecar bundle.
+    BundleDest,
+    /// S07: parent folder for the complete leave-Laika bundle.
+    ExitBundleDest,
 }
 
 struct ImportDialog {
@@ -639,6 +672,10 @@ struct ImportDialog {
     volume: Option<laika_core::import::Volume>,
     scanning_done: usize,
     scanning_total: usize,
+    /// The source is still being checked; review fills in as it goes.
+    scanning: bool,
+    /// Files reused from an earlier scan (no card reads).
+    scan_reused: usize,
     entries: Vec<laika_core::import::ScanEntry>,
     thumb_count: usize,
     copy_mode: bool,
@@ -785,9 +822,24 @@ fn fmt_bytes(bytes: u64) -> String {
 enum ViewMode {
     Grid,
     Loupe,
+    Compare,
+    Survey,
     Wall,
     /// V18: capture-ordered timeline (year/month/day + events).
     Timeline,
+}
+
+#[derive(Clone, Copy)]
+enum RailSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+struct RailResize {
+    side: RailSide,
+    start_x: f32,
+    start_width: f32,
 }
 
 /// V18: owned timeline row (uniform height for `uniform_list`).
@@ -829,6 +881,8 @@ struct CellData {
     filename: String,
     stars: u8,
     dot: u32,
+    /// Human-readable sync state; the dot is never the only cue.
+    sync_label: &'static str,
     tint: (u32, u32),
     thumb: Option<Arc<RenderImage>>,
     selected: bool,
@@ -886,6 +940,9 @@ struct DevSession {
     last_preset: Option<String>,
     /// Crop tool open: frames render after-only (no before/after split).
     hide_split: bool,
+    locals: edit::LocalEdits,
+    camera_profile: edit::CameraProfile,
+    mask_overlay: bool,
 }
 
 impl DevSession {
@@ -912,6 +969,9 @@ impl DevSession {
         }
         self.renderer.submit(laika_develop::Job {
             params: *values,
+            locals: self.locals.clone(),
+            camera_profile: self.camera_profile,
+            show_mask_overlay: self.mask_overlay,
             split: if self.hide_split { 0. } else { self.split },
             geom,
             preview_long_edge,
@@ -1010,6 +1070,23 @@ enum Panel {
     Grading,
     /// V22: Upright + perspective sliders + constrain.
     Transform,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LocalAction {
+    AddBrush,
+    AddLinear,
+    AddRadial,
+    AddHeal,
+    Delete(u64),
+    Invert(u64),
+    Feather(u64, f32),
+    Exposure(u64, f32),
+    ToggleErase(u64),
+    Move(u64, f32, f32),
+    Size(u64, f32),
+    MoveHeal(u64, f32, f32, bool),
+    HealSize(u64, f32),
 }
 
 /// Color Grading panel view (Lightroom's mode tabs).
@@ -1314,8 +1391,12 @@ struct Laika {
     /// U10: file-export dialog (destination, naming, JPEG options).
     export_open: bool,
     export_dialog: Option<ExportDialog>,
+    /// S07: full-catalog portable export and its background progress.
+    exit_bundle: ExitBundleUi,
     /// U05: source gallery previews (managed lifecycle via `stale`).
     review_thumbs: Vec<ImportPreview>,
+    /// Review preview loader is running (single flight).
+    review_loading: bool,
     /// U17: photo ids whose originals are absent from disk.
     offline: HashSet<i64>,
     /// U17: catalog management modal.
@@ -1345,8 +1426,21 @@ struct Laika {
     geo: geometry::GeoUi,
     /// V13: label names, collections, Quick Collection, target.
     coll: collections::CollState,
+    /// U11: Compare candidate and Survey session-only removals.
+    review: compare_survey::ReviewUi,
     /// G04: the Publish module's gallery editor.
     gal: gallery_ui::GalleryUi,
+    map: map_view::MapUi,
+    lr: lightroom_ui::LrUi,
+    presets: presets_ui::PresetUi,
+    batch: batch_edit::BatchUi,
+    /// U22: live rail widths (persisted when a resize gesture ends).
+    left_rail_width: f32,
+    right_rail_width: f32,
+    rail_resize: Option<RailResize>,
+    coexist: coexist_ui::CoexistUi,
+    palette: lightroom_mode::PaletteUi,
+    guide: lightroom_mode::GuideUi,
     /// V32: About window and first-run welcome.
     diag: diagnostics::DiagUi,
     /// V31: open in-window menu (index into the menu tree).
@@ -1497,6 +1591,9 @@ struct Laika {
     sync_last_ok: Option<Instant>,
     sync_last_error: String,
     sync_current: String,
+    /// Pause claims of new durable queue entries. Transfers already in
+    /// flight finish and verify; queued work remains intact for resume.
+    sync_paused: bool,
     sync_open: bool,
     /// Backup dialog: a connection test is running.
     sync_testing: bool,
@@ -1564,43 +1661,7 @@ impl Laika {
         let mut out: Vec<&DbPhoto> = self
             .photos
             .iter()
-            .filter(|p| {
-                if let Some(scope) = f.folder.as_ref() {
-                    let folder = self
-                        .catalog
-                        .as_ref()
-                        .map(|c| c.folder_of(&p.path))
-                        .unwrap_or_else(|| "(root)".to_string());
-                    if &folder != scope {
-                        return false;
-                    }
-                }
-                if let Some(album) = f.album.as_ref() {
-                    if !self.in_apple_album(album, p.id) {
-                        return false;
-                    }
-                }
-                // V13: collection scope (labels match in the pure matcher).
-                if let Some(cid) = f.collection {
-                    if !self.in_collection(cid, p.id) {
-                        return false;
-                    }
-                }
-                let kws = self
-                    .photo_keywords
-                    .get(&p.id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                if !f.matches_db(p, kws) {
-                    return false;
-                }
-                // U17: missing-only is runtime filesystem state, applied
-                // here (not in the pure DB matcher).
-                if f.missing_only && !self.offline.contains(&p.id) {
-                    return false;
-                }
-                true
-            })
+            .filter(|p| self.photo_matches_filters(f, p))
             .collect();
         out.sort_by(|a, b| f.compare_db(a, b));
         let mut ids: Vec<i64> = out.into_iter().map(|p| p.id).collect();
@@ -1613,6 +1674,39 @@ impl Laika {
             }
         }
         ids
+    }
+
+    /// Shared matcher for the live filter and saved smart-collection counts.
+    fn photo_matches_filters(&self, f: &laika_core::state::Filters, p: &DbPhoto) -> bool {
+        if let Some(scope) = f.folder.as_ref() {
+            let folder = self
+                .catalog
+                .as_ref()
+                .map(|c| c.folder_of(&p.path))
+                .unwrap_or_else(|| "(root)".to_string());
+            if &folder != scope {
+                return false;
+            }
+        }
+        if let Some(album) = f.album.as_ref() {
+            if !self.in_apple_album(album, p.id) {
+                return false;
+            }
+        }
+        if let Some(cid) = f.collection {
+            if !self.in_collection(cid, p.id) {
+                return false;
+            }
+        }
+        let kws = self
+            .photo_keywords
+            .get(&p.id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if !f.matches_db(p, kws) {
+            return false;
+        }
+        !f.missing_only || self.offline.contains(&p.id)
     }
 
     /// V05: complete pairs over the current rows (memoized per frame;
@@ -1646,20 +1740,24 @@ impl Laika {
     /// toggled JPEG side) when grouping is on.
     fn grid_photos(&self) -> Vec<&DbPhoto> {
         let all = self.filtered();
-        if !self.pair_grouped {
-            return all;
+        let mut hidden = self.collapsed_stack_hidden();
+        if self.pair_grouped {
+            hidden.extend(
+                self.pair_rows()
+                    .iter()
+                    .filter(|p| {
+                        !self.coll.stack_by_photo.contains_key(&p.raw_id)
+                            && !self.coll.stack_by_photo.contains_key(&p.jpeg_id)
+                    })
+                    .map(|p| {
+                        if self.pair_view_jpeg.get(&p.raw_id).copied().unwrap_or(false) {
+                            p.raw_id
+                        } else {
+                            p.jpeg_id
+                        }
+                    }),
+            );
         }
-        let pairs = self.pair_rows();
-        let hidden: std::collections::HashSet<i64> = pairs
-            .iter()
-            .map(|p| {
-                if self.pair_view_jpeg.get(&p.raw_id).copied().unwrap_or(false) {
-                    p.raw_id
-                } else {
-                    p.jpeg_id
-                }
-            })
-            .collect();
         all.into_iter()
             .filter(|p| !hidden.contains(&p.id))
             .collect()
@@ -1740,20 +1838,24 @@ impl Laika {
     /// frame's memoized list).
     fn ordered_ids_fresh(&self) -> Vec<i64> {
         let all = self.filtered_fresh();
-        if !self.pair_grouped {
-            return all.into_iter().map(|p| p.id).collect();
+        let mut hidden = self.collapsed_stack_hidden();
+        if self.pair_grouped {
+            hidden.extend(
+                self.pair_rows()
+                    .iter()
+                    .filter(|p| {
+                        !self.coll.stack_by_photo.contains_key(&p.raw_id)
+                            && !self.coll.stack_by_photo.contains_key(&p.jpeg_id)
+                    })
+                    .map(|p| {
+                        if self.pair_view_jpeg.get(&p.raw_id).copied().unwrap_or(false) {
+                            p.raw_id
+                        } else {
+                            p.jpeg_id
+                        }
+                    }),
+            );
         }
-        let pairs = self.pair_rows();
-        let hidden: std::collections::HashSet<i64> = pairs
-            .iter()
-            .map(|p| {
-                if self.pair_view_jpeg.get(&p.raw_id).copied().unwrap_or(false) {
-                    p.raw_id
-                } else {
-                    p.jpeg_id
-                }
-            })
-            .collect();
         all.into_iter()
             .filter(|p| !hidden.contains(&p.id))
             .map(|p| p.id)
@@ -2063,6 +2165,58 @@ impl Laika {
         self.hide_chrome || self.lights >= 1
     }
 
+    fn left_rail_shown(&self) -> bool {
+        !self.chrome_hidden() && self.library.prefs.left_rail_visible
+    }
+
+    fn right_rail_shown(&self) -> bool {
+        !self.chrome_hidden() && self.library.prefs.right_rail_visible
+    }
+
+    fn rail_resize_handle(&self, side: RailSide, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (id, label, value) = match side {
+            RailSide::Left => (
+                "left-rail-resize",
+                "Resize left panel",
+                self.left_rail_width,
+            ),
+            RailSide::Right => (
+                "right-rail-resize",
+                "Resize right panel",
+                self.right_rail_width,
+            ),
+        };
+        div()
+            .id(id)
+            .w(px(5.))
+            .h_full()
+            .flex_none()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(rgb(bg_app()))
+            .hover(|s| s.bg(rgb(accent_line())))
+            .role(Role::Splitter)
+            .aria_label(label)
+            .aria_orientation(Orientation::Horizontal)
+            .aria_numeric_value(value as f64)
+            .aria_min_numeric_value(168.)
+            .aria_max_numeric_value(460.)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let width = match side {
+                        RailSide::Left => this.left_rail_width,
+                        RailSide::Right => this.right_rail_width,
+                    };
+                    this.rail_resize = Some(RailResize {
+                        side,
+                        start_x: ev.position.x.as_f32(),
+                        start_width: width,
+                    });
+                    cx.notify();
+                }),
+            )
+    }
+
     /// V17: canvas background (lights-out is pure black).
     fn canvas_bg(&self, normal: u32) -> u32 {
         if self.lights >= 2 { 0x000000 } else { normal }
@@ -2364,6 +2518,12 @@ impl Laika {
         self.detail_loading = Some(id);
         self.detail_error = None;
         let values = self.effective_values(id, self.values);
+        let (locals, camera_profile) = self
+            .state
+            .edits
+            .get(&id)
+            .map(|e| (e.locals.clone(), e.camera_profile))
+            .unwrap_or_default();
         let split = self.dev.as_ref().map(|d| d.split).unwrap_or(0.);
         let geom = self.render_geom(id);
         if !self.ensure_dev(cx) {
@@ -2392,8 +2552,14 @@ impl Laika {
                             _ if raw_source => laika_raw::decode::decode(&path)?,
                             _ => laika_raw::decode::linear_from_raster(&path, None)?,
                         };
-                        let mut frame =
-                            renderer.render_export(linear.clone(), values, split, geom)?;
+                        let mut frame = renderer.render_export_with(
+                            linear.clone(),
+                            values,
+                            locals,
+                            camera_profile,
+                            split,
+                            geom,
+                        )?;
                         // Displayed through GPUI: swizzle off the UI thread.
                         rgba_to_bgra_in_place(&mut frame.rgba);
                         Ok::<_, String>((linear, frame))
@@ -2885,7 +3051,30 @@ impl Laika {
             .map(|cat| cat.photo_authorship(pid))
             .unwrap_or_default();
         let geom = self.sidecar_geom(pid);
-        match laika_core::xmp::write(
+        // S03: a photo changed in both apps waits for a decision; while
+        // Lightroom leads, develop fields stay Lightroom's.
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|c| c.has_sidecar_conflict(pid))
+        {
+            self.sidecar_pending.remove(&pid);
+            return;
+        }
+        // S03: Lightroom changed this file since Laika last saw it — merge
+        // that first (a real conflict must not be overwritten), then write.
+        if self.coexist.policy.shares()
+            && self
+                .catalog
+                .as_ref()
+                .is_some_and(|c| c.sidecar_changed_externally(pid, &photo.path))
+        {
+            self.sidecar_pending.remove(&pid);
+            self.coexist.deferred.insert(pid);
+            self.coexist.check_soon = true;
+            return;
+        }
+        match laika_core::xmp::write_scoped(
             &photo.path,
             &values,
             photo.rating,
@@ -2893,6 +3082,9 @@ impl Laika {
             preset.as_deref(),
             &auth,
             &geom,
+            laika_core::sidecar::WriteScope {
+                develop: self.coexist.policy.writes_develop(),
+            },
         ) {
             Ok(()) => {
                 self.last_sidecar_write = Some(now);
@@ -3104,6 +3296,7 @@ impl Laika {
                 }
             }
             text_input::FieldId::SearchQuery => self.state.filters.search.clone(),
+            text_input::FieldId::Palette => String::new(),
             text_input::FieldId::FilterPresetName => String::new(),
             text_input::FieldId::DateFrom => {
                 self.state.filters.date_from.clone().unwrap_or_default()
@@ -3199,6 +3392,18 @@ impl Laika {
             text_input::FieldId::KwImportPath => self.kw_import_path.clone(),
             text_input::FieldId::KwExportPath => self.kw_export_path.clone(),
             text_input::FieldId::TimelineJump => self.tl_jump.clone(),
+            text_input::FieldId::DevelopPresetName => self
+                .presets
+                .editor
+                .as_ref()
+                .map(|e| e.name.clone())
+                .unwrap_or_default(),
+            text_input::FieldId::DevelopPresetGroup => self
+                .presets
+                .editor
+                .as_ref()
+                .map(|e| e.group.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -3402,9 +3607,10 @@ impl Laika {
                 let v = buf.trim();
                 if !v.is_empty() {
                     let expanded = match v.strip_prefix("~/") {
-                        Some(rest) => {
-                            format!("{}/{rest}", std::env::var("HOME").unwrap_or_default())
-                        }
+                        Some(rest) => laika_core::platform::home_dir()
+                            .join(rest)
+                            .to_string_lossy()
+                            .to_string(),
                         None => v.to_string(),
                     };
                     if !std::path::Path::new(&expanded).is_file() {
@@ -3429,7 +3635,7 @@ impl Laika {
                 self.persist_sync_settings()
             }
             F::SharePath => {
-                text_input::validate_required(buf, "the mounted folder, like /Volumes/photos")?;
+                text_input::validate_required(buf, "a mounted folder or network path")?;
                 self.sync_settings.share_path = buf.trim().to_string();
                 self.persist_sync_settings()
             }
@@ -3572,6 +3778,8 @@ impl Laika {
                     None => Err("no import dialog is open".to_string()),
                 }
             }
+            // S04: the palette runs its selection itself (Enter).
+            F::Palette => Ok(()),
             F::SearchQuery => {
                 if buf.chars().count() > 200 {
                     return Err("keep the search under 200 characters".to_string());
@@ -3957,6 +4165,25 @@ impl Laika {
                 cx.notify();
                 Ok(())
             }
+            F::DevelopPresetName => {
+                text_input::validate_short(buf, "preset name")?;
+                if buf.trim().is_empty() {
+                    return Err("name the preset".to_string());
+                }
+                let Some(editor) = self.presets.editor.as_mut() else {
+                    return Err("open the preset editor first".to_string());
+                };
+                editor.name = buf.trim().to_string();
+                Ok(())
+            }
+            F::DevelopPresetGroup => {
+                text_input::validate_short(buf, "preset group")?;
+                let Some(editor) = self.presets.editor.as_mut() else {
+                    return Err("open the preset editor first".to_string());
+                };
+                editor.group = buf.trim().to_string();
+                Ok(())
+            }
         }
     }
 
@@ -4027,7 +4254,9 @@ impl Laika {
     /// Tab order inside the open modal (focus trap); empty when no modal.
     fn modal_fields(&self) -> Vec<text_input::FieldId> {
         use text_input::FieldId as F;
-        if self.publish_open {
+        if self.presets.editor.is_some() {
+            vec![F::DevelopPresetName, F::DevelopPresetGroup]
+        } else if self.publish_open {
             vec![F::PublishTitle, F::PublishSlug]
         } else if self.settings_open {
             vec![
@@ -4199,6 +4428,14 @@ impl Laika {
         self.help_open = false;
         self.settings_open = false;
         self.apple.open = false;
+        self.lr.open = false;
+        self.presets.import = None;
+        self.presets.editor = None;
+        self.batch.copy = None;
+        self.cancel_preset_preview(cx);
+        self.coexist.conflicts_open = false;
+        self.palette.open = false;
+        self.guide.open = false;
         self.manage_open = false;
         self.confirm = None;
         self.sync_dialog = None;
@@ -4226,6 +4463,9 @@ impl Laika {
         {
             self.export_open = false;
         }
+        // The exit export also survives closing its modal; invoking the
+        // command again reopens the live progress view.
+        self.exit_bundle.open = false;
         self.defocus_field();
         self.focused_param = self.return_focus.take();
         cx.notify();
@@ -4848,6 +5088,9 @@ impl Laika {
             self.state.primary = None;
         }
         self.refresh_photos(cx);
+        // Collection counts and manual-stack folding are catalog-derived;
+        // a removed row may change either immediately.
+        self.load_collections();
     }
 
     /// U14: undo the last mutating action over every photo it touched.
@@ -5125,20 +5368,34 @@ impl Laika {
         cx.notify();
     }
 
-    /// Ask macOS to mount the share (Finder handles credentials and the
-    /// keychain), then adopt `/Volumes/<share>` once it appears.
+    /// Ask the OS to mount/open a network share, then adopt the expected
+    /// mount location when the platform exposes one.
     fn connect_share(&mut self, cx: &mut Context<Self>) {
         let Some(url) = self.sync_settings.share_url() else {
             self.sync_last_error = "enter the server and share first".to_string();
             cx.notify();
             return;
         };
-        if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
+        #[cfg(target_os = "windows")]
+        let opened = if self.sync_settings.share_kind == laika_core::sync::ShareKind::Smb {
+            self.sync_settings
+                .share_mount_guess()
+                .ok_or_else(|| "enter the server and share first".to_string())
+                .and_then(|path| laika_core::platform::open_path(&path))
+        } else {
+            Err(
+                "Windows NFS shares must be mounted first; use Choose folder after mounting"
+                    .to_string(),
+            )
+        };
+        #[cfg(not(target_os = "windows"))]
+        let opened = laika_core::platform::open_url(&url);
+        if let Err(e) = opened {
             self.sync_last_error = format!("could not open {url}: {e}");
             cx.notify();
             return;
         }
-        self.status_note = format!("connecting to {url} — approve the login if macOS asks");
+        self.status_note = format!("connecting to {url} — approve credentials if the OS asks");
         let guess = self.sync_settings.share_mount_guess();
         cx.notify();
         let Some(guess) = guess else { return };
@@ -5228,11 +5485,12 @@ impl Laika {
             return;
         }
         let dest = self.sync_settings.describe();
+        let destination_id = format!("{dest}|immutable-keys-v1");
         let n = self
             .catalog
             .as_ref()
             .map(|c| {
-                if c.rebase_backup_destination(&dest) {
+                if c.rebase_backup_destination(&destination_id) {
                     eprintln!("[sync] destination changed to {dest}: re-queueing");
                 }
                 c.enqueue_unsynced()
@@ -5241,6 +5499,7 @@ impl Laika {
         if self.sync_started.is_none() {
             self.sync_started = Some(Instant::now());
         }
+        self.sync_paused = false;
         eprintln!("[sync] enqueued {n} unsynced");
         self.pump_sync(cx);
         self.refresh_sync_state(cx);
@@ -5256,6 +5515,7 @@ impl Laika {
         if n > 0 && self.sync_started.is_none() {
             self.sync_started = Some(Instant::now());
         }
+        self.sync_paused = false;
         self.sync_last_error.clear();
         self.pump_sync(cx);
         self.refresh_sync_state(cx);
@@ -5319,10 +5579,21 @@ impl Laika {
         .detach();
     }
 
+    fn toggle_sync_pause(&mut self, cx: &mut Context<Self>) {
+        self.sync_paused = !self.sync_paused;
+        if self.sync_paused {
+            self.status_note = "backup paused — active transfers will finish safely".to_string();
+        } else {
+            self.status_note = "backup resumed".to_string();
+            self.pump_sync(cx);
+        }
+        cx.notify();
+    }
+
     /// Claim jobs while under the concurrency limit (3). DB work stays on
     /// the UI thread; only the transfer runs in the background.
     fn pump_sync(&mut self, cx: &mut Context<Self>) {
-        if !self.sync_configured() {
+        if !self.sync_configured() || self.sync_paused {
             return;
         }
         while self.sync_inflight < 3 {
@@ -5332,11 +5603,12 @@ impl Laika {
                 let (local, hash, captured) = c.job_inputs(job.photo_id, &job.kind)?;
                 let catalog = c.catalog_name();
                 let sidecar = job.kind == "sidecar";
-                let remote = laika_core::sync::remote_key(
+                let remote = laika_core::sync::versioned_remote_key(
                     &catalog,
                     &captured,
                     std::path::Path::new(&local),
                     sidecar,
+                    &hash,
                 );
                 // remote_key hashes the XMP filename for sidecars; rebuild
                 // from the original path so the layout is `<file>.xmp`.
@@ -5345,11 +5617,12 @@ impl Laika {
                         .find(job.photo_id)
                         .map(|p| p.path.clone())
                         .unwrap_or_default();
-                    laika_core::sync::remote_key(
+                    laika_core::sync::versioned_remote_key(
                         &catalog,
                         &captured,
                         std::path::Path::new(&orig),
                         true,
+                        &hash,
                     )
                 } else {
                     remote
@@ -5514,6 +5787,9 @@ impl Laika {
         }
         let (queued, failed) = self.queue_depth();
         let left = queued + self.sync_inflight;
+        if self.sync_paused && left > 0 {
+            return format!("{} · paused · {left} left", self.sync_settings.describe());
+        }
         if failed > 0 && left == 0 {
             return format!("s3://{} · {failed} failed", self.sync_settings.bucket);
         }
@@ -5577,6 +5853,8 @@ impl Laika {
             picked,
             rejected,
             color_label,
+            locals: edit.map(|e| e.locals.clone()).unwrap_or_default(),
+            camera_profile: edit.map(|e| e.camera_profile).unwrap_or_default(),
         }
     }
 
@@ -5764,6 +6042,7 @@ impl Laika {
             if let Some(base) = self.gesture_base.take() {
                 before.params = base;
             }
+            let before_params = before.params;
             let edit = self.state.edit(pid);
             edit.params = values;
             self.record_step(pid, label, value, before);
@@ -5775,6 +6054,7 @@ impl Laika {
             self.last_was_meta = false;
             self.last_was_remove = false;
             self.redo_batch.clear();
+            self.auto_sync_after_primary(pid, before_params, label, value, cx);
         }
         self.edits_dirty = true;
         self.submit_dev(cx);
@@ -5799,11 +6079,12 @@ impl Laika {
             return;
         }
         let dest = self.sync_settings.describe();
+        let destination_id = format!("{dest}|immutable-keys-v1");
         let n = self
             .catalog
             .as_ref()
             .map(|c| {
-                if c.rebase_backup_destination(&dest) {
+                if c.rebase_backup_destination(&destination_id) {
                     eprintln!("[sync] destination changed to {dest}: re-queueing");
                 }
                 c.enqueue_unsynced()
@@ -5867,6 +6148,9 @@ impl Laika {
                     split_hold: None,
                     last_preset: None,
                     hide_split: false,
+                    locals: Default::default(),
+                    camera_profile: Default::default(),
+                    mask_overlay: false,
                 });
                 true
             }
@@ -6036,6 +6320,13 @@ impl Laika {
             .map(|id| self.effective_values(id, self.values))
             .unwrap_or_else(edit::defaults);
         if let Some(dev) = self.dev.as_mut() {
+            if let Some(e) = pid.and_then(|id| self.state.edits.get(&id)) {
+                dev.locals = e.locals.clone();
+                dev.camera_profile = e.camera_profile;
+            } else {
+                dev.locals = Default::default();
+                dev.camera_profile = Default::default();
+            }
             dev.hide_split = self.crop_open;
             let edge = if self.dragging.is_some()
                 || self.wheel_drag.is_some()
@@ -6637,6 +6928,12 @@ impl Laika {
                 opts.avif_depth = dp;
             }
         }
+        opts.output_sharpening = match get("export_output_sharpen").as_str() {
+            "low" => OutputSharpening::Low,
+            "standard" => OutputSharpening::Standard,
+            "high" => OutputSharpening::High,
+            _ => OutputSharpening::Off,
+        };
         d.format_opts = opts;
         // V28: watermark (validated ranges; text/graphic free-form).
         let mut wm = WatermarkSpec::default();
@@ -6705,6 +7002,15 @@ impl Laika {
         cat.set_import_default("export_png_level", &d.format_opts.png_level.to_string());
         cat.set_import_default("export_avif_speed", &d.format_opts.avif_speed.to_string());
         cat.set_import_default("export_avif_depth", &d.format_opts.avif_depth.to_string());
+        cat.set_import_default(
+            "export_output_sharpen",
+            match d.format_opts.output_sharpening {
+                OutputSharpening::Off => "off",
+                OutputSharpening::Low => "low",
+                OutputSharpening::Standard => "standard",
+                OutputSharpening::High => "high",
+            },
+        );
         // V28: watermark.
         cat.set_import_default("export_wm_mode", d.watermark.mode.label());
         cat.set_import_default("export_wm_text", &d.watermark.text);
@@ -7049,6 +7355,8 @@ impl Laika {
                 out_path: out,
                 is_video,
                 params,
+                locals: edit.map(|e| e.locals.clone()).unwrap_or_default(),
+                camera_profile: edit.map(|e| e.camera_profile).unwrap_or_default(),
                 geom: self.acknowledged_export_geom(*id),
                 rating: p.rating,
                 creator: p.creator.clone(),
@@ -7423,7 +7731,14 @@ impl Laika {
                 Ok(Err(e)) | Err(e) => return fail(laika_raw::decode::failure_reason(&e)),
             }
         };
-        let frame = match renderer.render_export(linear.clone(), item.params, 0., item.geom) {
+        let frame = match renderer.render_export_with(
+            linear.clone(),
+            item.params,
+            item.locals.clone(),
+            item.camera_profile,
+            0.,
+            item.geom,
+        ) {
             Ok(f) => f,
             Err(e) => return fail(format!("render failed: {e}")),
         };
@@ -7634,7 +7949,37 @@ impl Laika {
                                     .iter()
                                     .map(|p| p.to_string_lossy().to_string())
                                     .collect();
-                                std::process::Command::new(&script).args(&files).output()
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let ext = std::path::Path::new(&script)
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_ascii_lowercase();
+                                    if ext == "cmd" || ext == "bat" {
+                                        std::process::Command::new("cmd")
+                                            .args(["/C", &script])
+                                            .args(&files)
+                                            .output()
+                                    } else if ext == "ps1" {
+                                        std::process::Command::new("powershell.exe")
+                                            .args([
+                                                "-NoProfile",
+                                                "-ExecutionPolicy",
+                                                "Bypass",
+                                                "-File",
+                                                &script,
+                                            ])
+                                            .args(&files)
+                                            .output()
+                                    } else {
+                                        std::process::Command::new(&script).args(&files).output()
+                                    }
+                                }
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    std::process::Command::new(&script).args(&files).output()
+                                }
                             })
                             .await;
                         entity
@@ -7736,6 +8081,8 @@ impl Laika {
             volume: None,
             scanning_done: 0,
             scanning_total: 0,
+            scanning: false,
+            scan_reused: 0,
             entries: Vec::new(),
             thumb_count: 0,
             // V31: defaults come from Preferences → File Handling.
@@ -7767,6 +8114,7 @@ impl Laika {
         if let Some(cat) = self.catalog.as_ref() {
             let mp = cat.get_import_default("meta_preset");
             let dp = cat.get_import_default("dev_preset");
+            let dp_ok = !dp.is_empty() && self.preset_key_exists(&dp);
             if let Some(d) = self.import_dialog.as_mut() {
                 if !mp.is_empty() {
                     if let Some(p) = cat
@@ -7782,7 +8130,7 @@ impl Laika {
                         d.meta.keywords = p.keywords;
                     }
                 }
-                if !dp.is_empty() && PRESETS.iter().any(|(n, _, _, _)| *n == dp) {
+                if dp_ok {
                     d.meta.dev_preset = Some(dp);
                 }
             }
@@ -7891,6 +8239,14 @@ impl Laika {
                 self.cache_dir = dir;
                 self.manage_note = "cache moved — new previews land here".to_string();
                 self.kick_cache_audit(cx);
+            }
+            PickerTarget::BundleDest => {
+                self.export_portable_bundle(dir, cx);
+            }
+            PickerTarget::ExitBundleDest => {
+                self.exit_bundle.dest = Some(dir);
+                self.exit_bundle.error.clear();
+                cx.notify();
             }
         }
     }
@@ -8118,6 +8474,7 @@ impl Laika {
         self.load_apple_sync();
         // V05: grouping preference is per catalog.
         if let Some(cat) = self.catalog.as_ref() {
+            laika_core::sidecar::set_adobe_naming(cat.lightroom_policy().shares());
             self.pair_grouped = match cat.get_import_default("pair_grouped").as_str() {
                 "" => self.library.prefs.group_pairs_default,
                 v => v != "0",
@@ -8289,10 +8646,21 @@ impl Laika {
         volume: Option<laika_core::import::Volume>,
         cx: &mut Context<Self>,
     ) {
+        // Previously known files on this source: a matching size + mtime
+        // skips the EXIF read and the full-file hash (a card that was
+        // imported before rescans with a `stat` per file).
+        let source_key = laika_core::import::fingerprint_source(&root, volume.as_ref());
+        let known = self
+            .catalog
+            .as_ref()
+            .map(|c| c.source_fingerprints(&source_key))
+            .unwrap_or_default();
         let Some(d) = self.import_dialog.as_mut() else {
             return;
         };
-        d.stage = ImportStage::Scanning;
+        // Review opens immediately and fills in while the source is checked.
+        d.stage = ImportStage::Review;
+        d.scanning = true;
         d.source_path = Some(root.clone());
         d.source_label = label;
         d.source_error.clear();
@@ -8300,6 +8668,8 @@ impl Laika {
         d.volume = volume;
         d.scanning_done = 0;
         d.scanning_total = 0;
+        d.scan_reused = 0;
+        d.thumb_count = 0;
         d.entries.clear();
         d.cancel = Arc::new(AtomicBool::new(false));
         d.report = None;
@@ -8310,148 +8680,195 @@ impl Laika {
             }
         }
         let cancel = d.cancel.clone();
+        let started = Instant::now();
         cx.notify();
+        let known = Arc::new(known);
         cx.spawn(async move |entity, cx| {
-            let scanned = cx
+            let scan_root = root.clone();
+            let (paths, skipped) = cx
                 .background_spawn(async move {
-                    let paths = laika_core::import::scan_source(&root, card_mode);
+                    let paths = laika_core::import::scan_source(&scan_root, card_mode);
                     // V05: unsupported strays are counted, never imported.
-                    let skipped = laika_core::import::count_unsupported(&root, card_mode);
+                    let skipped = laika_core::import::count_unsupported(&scan_root, card_mode);
                     (paths, skipped)
                 })
                 .await;
-            let (paths, skipped) = scanned;
             let total = paths.len();
             entity
-                .update(cx, |this, _| {
+                .update(cx, |this, cx| {
                     if let Some(d) = this.import_dialog.as_mut() {
                         d.scanning_total = total;
                         d.skipped = skipped;
                     }
+                    cx.notify();
                 })
                 .ok();
-            entity.update(cx, |_, cx| cx.notify()).ok();
-            // Review metadata and content identity. Work stays off the UI
-            // thread, but returns once per file so large cards visibly move.
-            // Gallery pixels are loaded lazily after review opens.
-            let mut entries = Vec::with_capacity(total);
-            for p in paths {
+            // A few files at a time: known files cost only a `stat`; new
+            // ones read EXIF and hash in parallel. Each batch lands in the
+            // review as soon as it is checked.
+            for batch in paths.chunks(4) {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let entry = cx
-                    .background_spawn(async move { laika_core::import::scan_entry(&p) })
-                    .await;
-                entries.push(entry);
-                let done = entries.len();
-                entity
-                    .update(cx, |this, cx| {
-                        if let Some(d) = this.import_dialog.as_mut() {
-                            d.scanning_done = done;
-                        }
-                        cx.notify();
+                let jobs = batch.iter().cloned().map(|p| {
+                    let key = laika_core::import::fingerprint_key(&root, &p);
+                    let known = known.clone();
+                    cx.background_spawn(async move {
+                        let (entry, fresh) =
+                            laika_core::import::scan_entry_cached(&p, known.get(&key));
+                        (entry, fresh.map(|f| (key, f)))
                     })
-                    .ok();
+                });
+                let results = futures::future::join_all(jobs).await;
+                let alive = entity
+                    .update(cx, |this, cx| {
+                        this.add_scan_results(results, &source_key, &cancel, cx)
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
             }
             entity
-                .update(cx, |this, cx| this.finish_scan(entries, cx))
+                .update(cx, |this, cx| this.finish_scan(started, &cancel, cx))
                 .ok();
         })
         .detach();
     }
 
-    fn finish_scan(
+    /// Append one checked batch to the review: import-history match,
+    /// placeholders, remembered fingerprints, and more previews. False when
+    /// the dialog moved on (stop scanning).
+    fn add_scan_results(
         &mut self,
-        mut entries: Vec<laika_core::import::ScanEntry>,
+        results: Vec<(
+            laika_core::import::ScanEntry,
+            Option<(String, laika_core::import::Fingerprint)>,
+        )>,
+        source_key: &str,
+        scan: &Arc<AtomicBool>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let volume_id = match self.import_dialog.as_ref() {
+            // Only this scan's review (a newer scan has its own token).
+            Some(d)
+                if d.stage == ImportStage::Review && d.scanning && Arc::ptr_eq(&d.cancel, scan) =>
+            {
+                d.volume.as_ref().map(laika_core::import::volume_id)
+            }
+            _ => return false,
+        };
+        let mut fresh = Vec::new();
+        let mut entries = Vec::with_capacity(results.len());
+        let mut reused = 0;
+        for (mut entry, fp) in results {
+            match fp {
+                Some(f) => fresh.push(f),
+                None => reused += 1,
+            }
+            if let (Some(cat), false) = (self.catalog.as_ref(), entry.content_hash.is_empty()) {
+                entry.previously_imported = cat.hash_exists(&entry.content_hash)
+                    || volume_id
+                        .as_ref()
+                        .is_some_and(|volume| cat.card_has_hash(&entry.content_hash, volume));
+            }
+            entries.push(entry);
+        }
+        if let Some(cat) = self.catalog.as_ref() {
+            if let Err(e) = cat.record_source_fingerprints(source_key, &fresh) {
+                eprintln!("[import] {e}");
+            }
+        }
+        let Some(d) = self.import_dialog.as_mut() else {
+            return false;
+        };
+        for entry in entries {
+            self.review_thumbs.push(ImportPreview {
+                entry_index: d.entries.len(),
+                image: None,
+                tried: false,
+            });
+            d.entries.push(entry);
+        }
+        d.scanning_done = d.entries.len();
+        d.scan_reused += reused;
+        cx.notify();
+        self.kick_import_preview_load(cx);
+        true
+    }
+
+    fn finish_scan(&mut self, started: Instant, scan: &Arc<AtomicBool>, cx: &mut Context<Self>) {
         let Some(d) = self.import_dialog.as_mut() else {
             return;
         };
+        if !d.scanning || !Arc::ptr_eq(&d.cancel, scan) {
+            return;
+        }
+        d.scanning = false;
         if d.cancel.load(Ordering::Relaxed) {
             d.stage = ImportStage::Pick;
             d.entries.clear();
+            self.review_thumbs.clear();
             cx.notify();
             return;
         }
-        d.scanning_done = entries.len();
-        if entries.is_empty() {
+        eprintln!(
+            "[import] scanned {} files on {} in {:.1}s ({} known, {} read)",
+            d.entries.len(),
+            d.source_label,
+            started.elapsed().as_secs_f32(),
+            d.scan_reused,
+            d.entries.len() - d.scan_reused
+        );
+        if d.entries.is_empty() {
             d.stage = ImportStage::Pick;
             d.source_error = format!(
                 "No supported photos were found in {}. Check that the card is readable and contains a DCIM folder.",
                 d.source_label
             );
             self.status_note = d.source_error.clone();
-            cx.notify();
-            return;
         }
-        // Compare the scanned hashes with both this card's durable history
-        // and the active library. This drives gallery dimming and lets the
-        // new-only option filter before any copy work begins.
-        let volume_id = d.volume.as_ref().map(laika_core::import::volume_id);
-        if let Some(cat) = self.catalog.as_ref() {
-            for entry in &mut entries {
-                if entry.content_hash.is_empty() {
-                    continue;
-                }
-                entry.previously_imported = cat.hash_exists(&entry.content_hash)
-                    || volume_id
-                        .as_ref()
-                        .is_some_and(|volume| cat.card_has_hash(&entry.content_hash, volume));
-            }
-        }
-        // Open review immediately with named placeholders. Preview pixels
-        // stream in afterward instead of blocking the whole card here.
-        self.review_thumbs = (0..entries.len())
-            .map(|entry_index| ImportPreview {
-                entry_index,
-                image: None,
-            })
-            .collect();
-        d.entries = entries;
-        d.thumb_count = 0;
-        d.stage = ImportStage::Review;
         cx.notify();
-        self.kick_import_preview_load(cx);
     }
 
-    /// Stream source previews into the review grid one at a time. RAW
-    /// extraction can take seconds on some cameras, so none of this work may
-    /// gate opening the review screen or run on GPUI's small-stack workers.
+    /// Stream source previews into the review grid one at a time, new
+    /// photos first. Single flight: entries added while it runs are picked
+    /// up by the same loop. RAW extraction can take seconds on some
+    /// cameras, so none of this may block review or use small-stack workers.
     fn kick_import_preview_load(&mut self, cx: &mut Context<Self>) {
-        let jobs: Vec<(usize, PathBuf)> = self
-            .import_dialog
-            .as_ref()
-            .filter(|d| d.stage == ImportStage::Review)
-            .map(|d| {
-                d.entries
-                    .iter()
-                    .enumerate()
-                    .map(|(entry_index, entry)| (entry_index, entry.path.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if jobs.is_empty() {
+        if self.review_loading {
             return;
         }
-
+        self.review_loading = true;
         cx.spawn(async move |entity, cx| {
-            for (entry_index, path) in jobs {
-                let expected_path = path.clone();
-                let still_reviewing = entity
+            loop {
+                // Next preview to fetch: untried new photos, then the rest.
+                let next = entity
                     .update(cx, |this, _| {
-                        this.import_dialog.as_ref().is_some_and(|d| {
-                            d.stage == ImportStage::Review
-                                && d.entries
-                                    .get(entry_index)
-                                    .is_some_and(|entry| entry.path == expected_path)
-                        })
+                        let d = this
+                            .import_dialog
+                            .as_ref()
+                            .filter(|d| d.stage == ImportStage::Review)?;
+                        let pick = |want_new: bool| {
+                            this.review_thumbs.iter().position(|p| {
+                                !p.tried
+                                    && d.entries
+                                        .get(p.entry_index)
+                                        .is_some_and(|e| e.previously_imported != want_new)
+                            })
+                        };
+                        let i = pick(true).or_else(|| pick(false))?;
+                        let entry_index = this.review_thumbs[i].entry_index;
+                        let path = d.entries[entry_index].path.clone();
+                        this.review_thumbs[i].tried = true;
+                        Some((i, path))
                     })
-                    .unwrap_or(false);
-                if !still_reviewing {
+                    .ok()
+                    .flatten();
+                let Some((slot, path)) = next else {
                     break;
-                }
-
+                };
+                let expected_path = path.clone();
                 let jpeg = cx
                     .background_spawn(async move {
                         laika_raw::on_big_stack(move || {
@@ -8464,21 +8881,21 @@ impl Laika {
                         .unwrap_or(None)
                     })
                     .await;
-
                 let keep_loading = entity
                     .update(cx, |this, cx| {
                         let Some(d) = this.import_dialog.as_mut() else {
                             return false;
                         };
-                        if d.stage != ImportStage::Review
-                            || d.entries
-                                .get(entry_index)
-                                .is_none_or(|entry| entry.path != expected_path)
-                        {
+                        let matches = this.review_thumbs.get(slot).is_some_and(|p| {
+                            d.entries
+                                .get(p.entry_index)
+                                .is_some_and(|entry| entry.path == expected_path)
+                        });
+                        if d.stage != ImportStage::Review || !matches {
                             return false;
                         }
                         if let Some(image) = jpeg.as_deref().and_then(render_image_from_jpeg) {
-                            if let Some(preview) = this.review_thumbs.get_mut(entry_index) {
+                            if let Some(preview) = this.review_thumbs.get_mut(slot) {
                                 if let Some(old) = preview.image.replace(image) {
                                     this.stale.push(old);
                                 }
@@ -8493,6 +8910,9 @@ impl Laika {
                     break;
                 }
             }
+            entity
+                .update(cx, |this, _| this.review_loading = false)
+                .ok();
         })
         .detach();
     }
@@ -8576,6 +8996,12 @@ impl Laika {
 
     /// Start the run from the dialog review state.
     fn start_dialog_run(&mut self, cx: &mut Context<Self>) {
+        if self.import_dialog.as_ref().is_some_and(|d| d.scanning) {
+            self.status_note =
+                "still checking the card — import starts once every photo is checked".to_string();
+            cx.notify();
+            return;
+        }
         let (cfg, entries) = match self.import_dialog.as_ref() {
             Some(d) if d.stage == ImportStage::Review => {
                 let selected = selected_import_entries(&d.entries, d.is_card && d.new_only);
@@ -8633,7 +9059,7 @@ impl Laika {
                             .meta
                             .dev_preset
                             .as_deref()
-                            .and_then(Self::develop_preset_params),
+                            .and_then(|k| self.develop_preset_params_any(k)),
                         offset_min: d.meta.offset_min,
                     },
                     selected,
@@ -8870,7 +9296,7 @@ impl Laika {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .text_color(rgb(if active {
                         accent_line()
                     } else {
@@ -8915,7 +9341,7 @@ impl Laika {
                     .gap(px(10.))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_DIM))
                             .child("Shoot text".to_string()),
                     )
@@ -8924,7 +9350,7 @@ impl Laika {
                             text_input::FieldId::NameShoot,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(shoot_value),
                             false,
@@ -8937,7 +9363,7 @@ impl Laika {
             col = col
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child("FOLDER TEMPLATE"),
                 )
@@ -8948,7 +9374,7 @@ impl Laika {
                         text_input::FieldId::NameFolderCustom,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if form.folder_custom.is_empty() {
                                 "type a folder template…".to_string()
@@ -8965,7 +9391,7 @@ impl Laika {
         col = col
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_TERTIARY))
                     .child("FILE NAMES"),
             )
@@ -8976,7 +9402,7 @@ impl Laika {
                     text_input::FieldId::NameRenameCustom,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(if form.rename_custom.is_empty() {
                             "type a rename template…".to_string()
@@ -8997,7 +9423,7 @@ impl Laika {
                 .gap(px(10.))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_DIM))
                         .child("Start number".to_string()),
                 )
@@ -9006,7 +9432,7 @@ impl Laika {
                         text_input::FieldId::NameSeqStart,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(form.seq_start.to_string()),
                         false,
@@ -9021,7 +9447,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(0xE56060))
                     .child(e),
             );
@@ -9029,7 +9455,7 @@ impl Laika {
         col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .line_height(relative(1.7))
                 .text_color(rgb(TEXT_DIMMER))
                 .children(lines.iter().map(|l| div().child(l.clone()))),
@@ -9981,6 +10407,8 @@ impl Laika {
                         picked: false,
                         rejected: false,
                         color_label: 0,
+                        locals: Default::default(),
+                        camera_profile: Default::default(),
                     });
                     edit.push_snap("Preset", &name, snap);
                     self.persist_photo(id);
@@ -10004,6 +10432,8 @@ impl Laika {
         // An Apple Photos run waiting on this import links its photos now
         // (or starts its own import if it was waiting for this one).
         self.continue_apple_ingest(cx);
+        // S01: a Lightroom import waiting on its files applies now.
+        self.continue_lightroom_import(cx);
     }
 
     // ---- thumbnails ---------------------------------------------------------
@@ -10354,6 +10784,17 @@ impl Laika {
             Some(f) if f.id == id => text_input::render_editor(f, mask).into_any_element(),
             _ => static_body
                 .id(("field", field_tag(id)))
+                .role(if mask {
+                    Role::PasswordInput
+                } else {
+                    Role::TextInput
+                })
+                .aria_label(id.accessible_name())
+                .aria_value(if mask {
+                    "•".repeat(self.committed_text(id).chars().count())
+                } else {
+                    self.committed_text(id)
+                })
                 .on_hover(self.tip(tip))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.focus_field(id, cx);
@@ -10368,6 +10809,8 @@ impl Laika {
         let (text, dot) = self.save_status();
         div()
             .id("save-pill")
+            .role(Role::Button)
+            .aria_label(text.clone())
             .flex()
             .items_center()
             .gap(px(6.))
@@ -10377,7 +10820,7 @@ impl Laika {
             .border_color(border_control())
             .rounded(px(4.))
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(TEXT_TERTIARY))
             .hover(|s| s.bg(rgb(bg_row_hover())))
             .on_hover(self.tip("Save state — click to flush now or retry"))
@@ -10408,10 +10851,11 @@ impl Laika {
 
     fn top_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let _p = crate::ProfSpan("top_bar", Instant::now());
+        let compact = window.viewport_size().width.as_f32() <= 1280.;
         let tabs = [
             ("LIBRARY", Module::Library),
             ("DEVELOP", Module::Develop),
-            ("MAP", Module::Library),
+            ("MAP", Module::Map),
             ("PUBLISH", Module::Publish),
         ];
         div()
@@ -10426,6 +10870,8 @@ impl Laika {
             .child(
                 div()
                     .id("add-import-photos")
+                    .role(Role::Button)
+                    .aria_label("Add or import photos")
                     .flex()
                     .items_center()
                     .gap(px(7.))
@@ -10436,17 +10882,15 @@ impl Laika {
                     .bg(rgb(accent_fill()))
                     .font_family(SANS)
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(accent_on_fill()))
                     .hover(|s| s.bg(rgb(accent_fill_hover())))
-                    .on_hover(self.tip(
-                        "Add photos to this library from an SD card or folder",
-                    ))
+                    .on_hover(self.tip("Add photos to this library from an SD card or folder"))
                     .on_click(cx.listener(|this, _, _, cx| this.open_import_dialog(cx)))
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(15.))
+                            .text_size(sp(15.))
                             .line_height(relative(1.))
                             .child("+"),
                     )
@@ -10454,7 +10898,7 @@ impl Laika {
             )
             .child(
                 div()
-                    .w(px(150.))
+                    .w(px(if compact { 86. } else { 150. }))
                     .flex()
                     .items_center()
                     .gap(px(9.))
@@ -10468,15 +10912,18 @@ impl Laika {
                         rgb(TEXT_PRIMARY),
                         window,
                     ))
-                    .when(self.state.active_module == Module::Library, |d| {
-                        d.child(
-                            div()
-                                .font_family(SANS)
-                                .text_size(px(9.))
-                                .text_color(rgb(TEXT_DIM))
-                                .child(env!("CARGO_PKG_VERSION")),
-                        )
-                    }),
+                    .when(
+                        !compact && self.state.active_module == Module::Library,
+                        |d| {
+                            d.child(
+                                div()
+                                    .font_family(SANS)
+                                    .text_size(sp(9.))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(env!("CARGO_PKG_VERSION")),
+                            )
+                        },
+                    ),
             )
             .child(
                 div()
@@ -10486,33 +10933,26 @@ impl Laika {
                         let active = match (m, self.state.active_module) {
                             (Module::Library, Module::Library) if *name == "LIBRARY" => true,
                             (Module::Develop, Module::Develop) => true,
+                            (Module::Map, Module::Map) => true,
                             (Module::Publish, Module::Publish) => true,
                             _ => false,
                         };
                         let m = *m;
                         let name = *name;
-                        // U01: MAP is not a working view (dropped from the
-                        // prototype) so it renders dimmed and explains itself
-                        // instead of silently swallowing clicks.
-                        let disabled = name == "MAP";
+                        let disabled = false;
                         div()
                             .id(name)
+                            .role(Role::Tab)
+                            .aria_label(name)
+                            .aria_selected(active)
                             .px(px(13.))
                             .py(px(6.))
                             .rounded(px(4.))
                             .when(active, |d| d.bg(rgb(bg_tab_active())))
-                            .when(!active && !disabled, |d| {
-                                d.hover(|s| s.bg(rgb(bg_row_hover())))
-                            })
-                            .when(disabled, |d| {
-                                d.on_hover(self.tip("Map is not in the prototype"))
-                            })
+                            .when(!active, |d| d.hover(|s| s.bg(rgb(bg_row_hover()))))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if name == "MAP" {
-                                    this.status_note =
-                                        "map view is not in the prototype — Library covers EXIF and storage"
-                                            .to_string();
-                                    cx.notify();
+                                    this.open_map(cx);
                                     return;
                                 }
                                 // U02: never switch modules dirty.
@@ -10547,54 +10987,112 @@ impl Laika {
                             ))
                     })),
             )
-            .child(div().flex_1())
-            .child(self.save_pill(cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(match self.state.active_module {
-                        Module::Develop => {
-                            let name = self
-                                .primary_photo()
-                                .map(|p| p.filename.clone())
-                                .unwrap_or_default();
+            .when(!compact, |bar| {
+                bar.child(
+                    div().ml(px(8.)).flex().items_center().gap(px(2.)).children(
+                        [
+                            (
+                                0usize,
+                                "◧",
+                                "Toggle left panel",
+                                self.library.prefs.left_rail_visible,
+                            ),
+                            (
+                                1usize,
+                                "▭",
+                                "Toggle filmstrip",
+                                self.library.prefs.filmstrip_visible,
+                            ),
+                            (
+                                2usize,
+                                "◨",
+                                "Toggle right panel",
+                                self.library.prefs.right_rail_visible,
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(kind, icon, label, on)| {
                             div()
-                                .id("develop-pill")
+                                .id(("workspace-toggle", kind))
+                                .size(px(26.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.))
+                                .text_size(sp(14.))
+                                .text_color(rgb(if on { TEXT_SECONDARY } else { TEXT_DIMMER }))
+                                .when(on, |d| d.bg(rgb(bg_tab_active())))
+                                .hover(|s| s.bg(rgb(bg_row_hover())))
+                                .role(Role::Button)
+                                .aria_label(label)
+                                .aria_toggled(if on { Toggled::True } else { Toggled::False })
+                                .on_hover(self.tip(label))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_prefs(
+                                        move |p| match kind {
+                                            0 => p.left_rail_visible = !p.left_rail_visible,
+                                            1 => p.filmstrip_visible = !p.filmstrip_visible,
+                                            _ => p.right_rail_visible = !p.right_rail_visible,
+                                        },
+                                        cx,
+                                    )
+                                }))
+                                .child(icon)
+                        }),
+                    ),
+                )
+                .child(div().flex_1())
+                .children(self.conflicts_pill(cx))
+                .child(self.save_pill(cx))
+                .child(
+                    div().flex().items_center().gap(px(10.)).child(
+                        match self.state.active_module {
+                            Module::Develop => {
+                                let name = self
+                                    .primary_photo()
+                                    .map(|p| p.filename.clone())
+                                    .unwrap_or_default();
+                                div()
+                                    .id("develop-pill")
+                                    .font_family(SANS)
+                                    .text_size(sp(10.5))
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!("{name} · edits stored locally · .xmp sidecar"))
+                            }
+                            _ => div()
+                                .id("sync-pill")
+                                .role(Role::Button)
+                                .aria_label(self.sync_pill())
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(10.))
+                                .py(px(5.))
+                                .border_1()
+                                .border_color(border_control())
+                                .rounded(px(4.))
                                 .font_family(SANS)
-                                .text_size(px(10.5))
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(format!("{name} · edits stored locally · .xmp sidecar"))
-                        }
-                        _ => div()
-                            .id("sync-pill")
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .px(px(10.))
-                            .py(px(5.))
-                            .border_1()
-                            .border_color(border_control())
-                            .rounded(px(4.))
-                            .font_family(SANS)
-                            .text_size(px(10.5))
-                            .text_color(rgb(TEXT_TERTIARY))
-                            .on_hover(self.tip("Backup status — click for settings"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.sync_open {
-                                    this.close_modals(cx);
-                                } else {
-                                    this.open_sync(cx);
-                                }
-                            }))
-                            .child(div().size(px(6.)).rounded_full().bg(rgb(self.sync_dot())))
-                            .child(self.sync_pill()),
-                    }),
-            )
+                                .text_size(sp(10.5))
+                                .text_color(rgb(TEXT_TERTIARY))
+                                .on_hover(self.tip("Backup status — click for settings"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.sync_open {
+                                        this.close_modals(cx);
+                                    } else {
+                                        this.open_sync(cx);
+                                    }
+                                }))
+                                .child(div().size(px(6.)).rounded_full().bg(rgb(self.sync_dot())))
+                                .child(self.sync_pill()),
+                        },
+                    ),
+                )
+            })
             .child(
                 div()
                     .id("settings-button")
+                    .role(Role::Button)
+                    .aria_label("Settings")
                     .ml(px(10.))
                     .size(px(26.))
                     .flex()
@@ -10603,7 +11101,7 @@ impl Laika {
                     .rounded(px(5.))
                     .border_1()
                     .border_color(border_control())
-                    .text_size(px(15.))
+                    .text_size(sp(15.))
                     .text_color(rgb(if self.settings_open {
                         accent_line()
                     } else {
@@ -10628,17 +11126,23 @@ impl Laika {
         // V17: rails flank the center only when chrome shows (order
         // preserved: left, center, right).
         let mut row = div().flex_1().min_h_0().flex();
-        if !self.chrome_hidden() {
-            row = row.child(self.library_left(window, cx));
+        if self.left_rail_shown() {
+            row = row
+                .child(self.library_left(window, cx))
+                .child(self.rail_resize_handle(RailSide::Left, cx));
         }
         row = row.child(match self.view {
             ViewMode::Grid => self.library_center(window, cx),
             ViewMode::Loupe => self.loupe_center(window, cx),
+            ViewMode::Compare => self.compare_center(window, cx),
+            ViewMode::Survey => self.survey_center(window, cx),
             ViewMode::Wall => self.wall_center(window, cx),
             ViewMode::Timeline => self.timeline_center(window, cx),
         });
-        if !self.chrome_hidden() {
-            row = row.child(self.library_right(window, cx));
+        if self.right_rail_shown() {
+            row = row
+                .child(self.rail_resize_handle(RailSide::Right, cx))
+                .child(self.library_right(window, cx));
         }
         row
     }
@@ -10680,7 +11184,7 @@ impl Laika {
             .min()
             .unwrap_or(0);
         div()
-            .w(px(layout::RAIL_LIBRARY_LEFT))
+            .w(px(self.left_rail_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -10698,7 +11202,7 @@ impl Laika {
                         div()
                             .id("catalog-manage")
                             .pt(px(8.))
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_DIM))
                             .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                             .on_hover(self.tip("Back up, restore, rebuild previews, recheck"))
@@ -10800,7 +11304,7 @@ impl Laika {
                         d.child(
                             div()
                                 .px(px(14.))
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("No folders yet"),
                         )
@@ -10836,7 +11340,7 @@ impl Laika {
                 .child(
                     div()
                         .pt(px(8.))
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_DIM))
                         .child(if open { "Hide" } else { "Show" }),
                 ),
@@ -10909,13 +11413,13 @@ impl Laika {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child("Overlay"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(format!("{overlay} ›")),
                             ),
@@ -10926,7 +11430,7 @@ impl Laika {
                     .px(px(14.))
                     .pt(px(8.))
                     .pb(px(2.))
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child("Badges"),
             );
@@ -11010,7 +11514,7 @@ impl Laika {
                     .when(on, |d| {
                         d.child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(sp(9.))
                                 .line_height(relative(1.))
                                 .text_color(rgb(accent_on_fill()))
                                 .child("\u{2713}"),
@@ -11019,7 +11523,7 @@ impl Laika {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .text_color(rgb(if on { TEXT_SECONDARY } else { TEXT_MUTED }))
                     .child(label.to_string()),
             )
@@ -11091,7 +11595,7 @@ impl Laika {
                             .id(("preset-del", pi))
                             .px(px(6.))
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .hover(|s| s.text_color(rgb(0xE56060)))
                             .on_hover(self.tip("Delete this preset"))
@@ -11226,7 +11730,7 @@ impl Laika {
                     .px(px(14.))
                     .pt(px(10.))
                     .pb(px(4.))
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child("Capture date"),
             )
@@ -11337,7 +11841,7 @@ impl Laika {
                         .mb(px(2.))
                         .border_b_1()
                         .border_color(hairline())
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .line_height(relative(1.35))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(self.status_note.clone()),
@@ -11351,7 +11855,7 @@ impl Laika {
                     .gap(px(8.))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(title),
@@ -11360,7 +11864,7 @@ impl Laika {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_DIM))
                             .child(caption.clone()),
                     ),
@@ -11394,7 +11898,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(0xE56060))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_import(cx)))
@@ -11407,7 +11911,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -11429,11 +11933,25 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx)))
                             .child("Sync now"),
+                        div()
+                            .id("sync-pause")
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(border_control())
+                            .font_family(SANS)
+                            .text_size(sp(10.))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .hover(|s| s.bg(rgb(bg_row_hover())))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sync_pause(cx)))
+                            .when(queued + self.sync_inflight == 0, |d| d.hidden())
+                            .child(if self.sync_paused { "Resume" } else { "Pause" }),
                         div()
                             .id("sync-retry")
                             .px(px(8.))
@@ -11442,7 +11960,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(if failed > 0 { 0xE56060 } else { TEXT_DIM }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| this.retry_failed_sync(cx)))
@@ -11456,7 +11974,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -11492,6 +12010,16 @@ impl Laika {
                 "Backup".to_string(),
                 frac,
                 format!("error: {}", self.sync_last_error),
+            );
+        }
+        if self.sync_paused && queued + self.sync_inflight > 0 {
+            return (
+                "Backup paused".to_string(),
+                frac,
+                format!(
+                    "{} left · active transfers finish safely",
+                    queued + self.sync_inflight
+                ),
             );
         }
         if queued + self.sync_inflight > 0 {
@@ -11567,7 +12095,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Rename selected photos (F2)"))
@@ -11583,7 +12111,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Export selected photos to JPEG files"))
@@ -11660,8 +12188,10 @@ impl Laika {
         let active = match self.view {
             ViewMode::Grid => 0,
             ViewMode::Loupe => 1,
-            ViewMode::Wall => 2,
-            ViewMode::Timeline => 3,
+            ViewMode::Compare => 2,
+            ViewMode::Survey => 3,
+            ViewMode::Wall => 4,
+            ViewMode::Timeline => 5,
         };
         div()
             .flex()
@@ -11669,21 +12199,20 @@ impl Laika {
             .rounded(px(4.))
             .p(px(2.))
             .children(
-                ["GRID", "LOUPE", "WALL", "TIMELINE", "COMPARE"]
+                ["GRID", "LOUPE", "COMPARE", "SURVEY", "WALL", "TIMELINE"]
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
                         let on = i == active;
                         let label = *name;
-                        // U01: COMPARE is not a working view — dimmed and
-                        // explains itself instead of swallowing clicks.
-                        let disabled = label == "COMPARE";
                         let tip = match label {
                             "GRID" => "Grid view (G)",
                             "LOUPE" => "Single-photo view (E)",
+                            "COMPARE" => "Compare Select and Candidate (C)",
+                            "SURVEY" => "Survey the selected group (N)",
                             "WALL" => "Flush thumbnail wall (W)",
                             "TIMELINE" => "Capture-ordered timeline (T)",
-                            _ => "Compare view is not wired yet",
+                            _ => "Library view",
                         };
                         div()
                             .id(("view", i))
@@ -11696,6 +12225,8 @@ impl Laika {
                                 match label {
                                     "GRID" => this.view = ViewMode::Grid,
                                     "LOUPE" => this.view = ViewMode::Loupe,
+                                    "COMPARE" => this.open_compare(cx),
+                                    "SURVEY" => this.open_survey(cx),
                                     "TIMELINE" => {
                                         this.prev_view = ViewMode::Timeline;
                                         this.view = ViewMode::Timeline;
@@ -11706,10 +12237,7 @@ impl Laika {
                                         }
                                         this.view = ViewMode::Wall;
                                     }
-                                    _ => {
-                                        this.status_note =
-                                            "compare view is not wired yet".to_string();
-                                    }
+                                    _ => {}
                                 }
                                 cx.notify();
                             }))
@@ -11719,13 +12247,7 @@ impl Laika {
                                 FontWeight::MEDIUM,
                                 10.5,
                                 0.06,
-                                rgb(if on {
-                                    TEXT_PRIMARY
-                                } else if disabled {
-                                    TEXT_DIMMER
-                                } else {
-                                    TEXT_MUTED
-                                }),
+                                rgb(if on { TEXT_PRIMARY } else { TEXT_MUTED }),
                                 window,
                             ))
                     }),
@@ -11873,7 +12395,7 @@ impl Laika {
                 div()
                     .id("sort-field")
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                     .on_hover(
@@ -11898,7 +12420,7 @@ impl Laika {
                 div()
                     .id("sort-dir")
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                     .on_hover(self.tip("Sort direction"))
@@ -11925,7 +12447,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("SIZE"),
             )
@@ -12031,11 +12553,11 @@ impl Laika {
     /// V18: one grid cell from a photo (shared by grid + timeline so
     /// badges, overlays, and selection render identically).
     fn cell_for(&self, p: &DbPhoto, in_pair: bool) -> CellData {
-        let dot = match p.sync {
-            SyncState::Synced => accent_line(),
-            SyncState::Pending => WARNING,
-            SyncState::Failed => 0xE56060,
-            SyncState::Local => TEXT_DIM,
+        let (dot, sync_label) = match p.sync {
+            SyncState::Synced => (accent_line(), "Synced"),
+            SyncState::Pending => (WARNING, "Sync pending"),
+            SyncState::Failed => (0xE56060, "Sync failed"),
+            SyncState::Local => (TEXT_DIM, "Local only"),
         };
         let video = laika_raw::media_kind(std::path::Path::new(&p.path))
             == Some(laika_raw::MediaKind::Video);
@@ -12044,6 +12566,7 @@ impl Laika {
             filename: p.filename.clone(),
             stars: p.rating,
             dot,
+            sync_label,
             tint: placeholder_tint(&p.blake3),
             thumb: self.thumbs.get(&p.id).map(|t| t.image.clone()),
             selected: self.state.selection.contains(&p.id),
@@ -12082,7 +12605,14 @@ impl Laika {
             menu: self.menu_req.clone(),
             offline: self.offline.contains(&p.id),
             pair: in_pair,
-            kind: file_kind(&p.filename, in_pair),
+            kind: {
+                let base = file_kind(&p.filename, in_pair);
+                match self.stack_for_photo(p.id) {
+                    Some(stack) if p.id == stack.cover => format!("{base} · STACK {}", stack.count),
+                    Some(_) => format!("{base} · STACK"),
+                    None => base,
+                }
+            },
             video,
             duration: Self::duration_label(p.duration_ms),
             caption_below: None,
@@ -12104,32 +12634,40 @@ impl Laika {
             return 0.;
         }
         let slots = self.caption_slots() as f32;
-        CAPTION_PAD_TOP + CAPTION_PAD_BOTTOM + (slots + 1.) * CAPTION_LINE_H + slots * CAPTION_GAP
+        let scale = theme::text_scale_percent() as f32 / 100.;
+        (CAPTION_PAD_TOP + CAPTION_PAD_BOTTOM + (slots + 1.) * CAPTION_LINE_H + slots * CAPTION_GAP)
+            * scale
     }
 
-    fn grid_body(&self, cx: &mut Context<Self>) -> Div {
+    fn grid_body(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         if self.photos.is_empty() && self.import.is_none() {
-            return div().flex_1().flex().items_center().justify_center().child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .font_family(SANS)
-                            .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
-                            .child("catalog is empty — add photos from an SD card or folder"),
-                    )
-                    // U01: the empty state offers the same working import action.
-                    .child(
-                        div()
-                            .id("empty-import")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_import_dialog(cx)))
-                            .child(button::primary("Add/Import Photos")),
-                    ),
-            );
+            return div()
+                .id("empty-grid")
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .font_family(SANS)
+                                .text_size(sp(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child("catalog is empty — add photos from an SD card or folder"),
+                        )
+                        // U01: the empty state offers the same working import action.
+                        .child(
+                            div()
+                                .id("empty-import")
+                                .on_click(cx.listener(|this, _, _, cx| this.open_import_dialog(cx)))
+                                .child(button::primary("Add/Import Photos")),
+                        ),
+                );
         }
         // U12: filters match nothing — explain the active constraints and
         // offer a working reset (never a bare empty grid).
@@ -12140,29 +12678,35 @@ impl Laika {
             } else {
                 format!("nothing matches {}", labels.join(" · "))
             };
-            return div().flex_1().flex().items_center().justify_center().child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .font_family(SANS)
-                            .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
-                            .child(why),
-                    )
-                    .child(
-                        div()
-                            .id("empty-reset")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.filters = Default::default();
-                                cx.notify();
-                            }))
-                            .child(button::outline("Reset filters")),
-                    ),
-            );
+            return div()
+                .id("empty-filter-grid")
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .font_family(SANS)
+                                .text_size(sp(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child(why),
+                        )
+                        .child(
+                            div()
+                                .id("empty-reset")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.filters = Default::default();
+                                    cx.notify();
+                                }))
+                                .child(button::outline("Reset filters")),
+                        ),
+                );
         }
         let (rows, _window) = self.grid_rows_data();
         let handle = self.list_handle.clone();
@@ -12173,6 +12717,9 @@ impl Laika {
         let cols = self.state.thumb_columns.max(3) as usize;
         let meter = self.grid_box.clone();
         div()
+            .id("photo-grid")
+            .role(Role::Grid)
+            .aria_label("Photo grid")
             .relative()
             .flex_1()
             .min_h_0()
@@ -12311,7 +12858,7 @@ impl Laika {
                     .py(px(4.))
                     .rounded(px(3.))
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_DIM }))
                     .when(on, |d| d.bg(rgb(bg_segment_active())))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
@@ -12631,7 +13178,7 @@ impl Laika {
                     .bottom(px(34.))
                     .font_family(SANS)
                     .font_weight(FontWeight::MEDIUM)
-                    .text_size(px(9.))
+                    .text_size(sp(9.))
                     .text_color(rgba(0xFFFFFFBF))
                     .child(label),
             )
@@ -12697,7 +13244,7 @@ impl Laika {
             .border_t_1()
             .border_color(hairline())
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(TEXT_DIM));
         if let Some(pair) = self.pair_of_primary() {
             let showing_jpeg = self
@@ -12804,7 +13351,7 @@ impl Laika {
             .border_t_1()
             .border_color(hairline())
             .font_family(SANS)
-            .text_size(px(10.))
+            .text_size(sp(10.))
             .text_color(rgb(TEXT_DIM))
             .child(format!("{filtered} of {} photos", self.photos.len()))
             .child(
@@ -12912,7 +13459,7 @@ impl Laika {
             .py(px(4.))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child("Pair".to_string()),
             )
@@ -12925,7 +13472,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip("Switch the displayed pair side"))
@@ -12966,7 +13513,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(0xE56060))
                             .child("OFFLINE — original missing from disk".to_string()),
                     )
@@ -12991,7 +13538,7 @@ impl Laika {
             div().px(px(14.)).child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(format!(
                         "{n} photo{} targeted",
@@ -13032,7 +13579,7 @@ impl Laika {
             .border_1()
             .border_color(border_control())
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(if enabled { TEXT_SECONDARY } else { TEXT_DIMMER }));
         if enabled {
             btn.hover(|s| s.bg(rgb(bg_row_hover())))
@@ -13372,7 +13919,7 @@ impl Laika {
         if scope == laika_core::catalog::Catalog::PHOTOS_FOLDER {
             return div().px(px(14.)).py(px(8.)).child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .line_height(relative(1.4))
                     .text_color(rgb(TEXT_DIM))
                     .child(
@@ -13433,7 +13980,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(format!("{scope} · {photos} photos")),
             );
@@ -13441,7 +13988,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(0xE56060))
                     .child(format!("{missing} offline")),
             );
@@ -13457,7 +14004,7 @@ impl Laika {
                     text_input::FieldId::FolderName,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIMMER))
                         .child(hint.to_string()),
                     false,
@@ -13705,7 +14252,7 @@ impl Laika {
                     .w(px(64.))
                     .flex_none()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child(label.to_string()),
             )
@@ -13714,7 +14261,7 @@ impl Laika {
                     id,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(if empty { TEXT_DIMMER } else { TEXT_SECONDARY }))
                         .child(if empty { "—".to_string() } else { v }),
                     false,
@@ -13734,7 +14281,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(format!("{scope_n} photos — empty leaves unchanged")),
             );
@@ -13804,7 +14351,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Preset".to_string()),
                     )
@@ -13823,7 +14370,7 @@ impl Laika {
                                     .border_1()
                                     .border_color(border_control())
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Apply preset (batch: filled fields only)"))
@@ -13847,7 +14394,7 @@ impl Laika {
                         text_input::FieldId::MetaPresetName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if self.meta_preset_name.is_empty() {
                                 "preset name…".to_string()
@@ -13914,14 +14461,14 @@ impl Laika {
                         .gap(px(10.))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(TEXT_DIM))
                                 .child(k.clone()),
                         )
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(v.clone()),
                         )
@@ -13950,12 +14497,42 @@ impl Laika {
             .as_ref()
             .map(|cat| cat.keyword_nodes().into_iter().collect())
             .unwrap_or_default();
+        let typed = self
+            .field
+            .as_ref()
+            .filter(|f| f.id == text_input::FieldId::MetaKeywords)
+            .map(|f| {
+                f.buffer
+                    .rsplit([',', ';'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase()
+            })
+            .unwrap_or_default();
+        let mut suggestions: Vec<String> = if typed.is_empty() {
+            Vec::new()
+        } else {
+            includes
+                .keys()
+                .filter(|path| {
+                    !union.iter().any(|u| u.eq_ignore_ascii_case(path))
+                        && path.to_lowercase().contains(&typed)
+                })
+                .cloned()
+                .collect()
+        };
+        suggestions.sort_by_key(|path| {
+            let lower = path.to_lowercase();
+            (!lower.starts_with(&typed), lower)
+        });
+        suggestions.truncate(5);
         let mut col = div().flex().flex_col().gap(px(6.)).px(px(14.));
         if scope.len() > 1 {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(format!("union over {} photos — click removes", scope.len())),
             );
@@ -13964,7 +14541,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("no keywords yet".to_string()),
             );
@@ -13984,7 +14561,7 @@ impl Laika {
                                 .py(px(3.))
                                 .rounded(px(2.))
                                 .bg(rgb(bg_chip()))
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(if excluded {
                                     TEXT_DIMMER
                                 } else {
@@ -14029,7 +14606,7 @@ impl Laika {
                         text_input::FieldId::MetaKeywords,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .child("add keywords…".to_string()),
                         false,
@@ -14046,7 +14623,7 @@ impl Laika {
                         .border_1()
                         .border_color(border_control())
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .hover(|s| s.bg(rgb(bg_row_hover())))
                         .on_hover(self.tip("Keyword manager (K): hierarchy, sets, import/export"))
@@ -14057,6 +14634,43 @@ impl Laika {
                         .child("Manage".to_string()),
                 ),
         );
+        if !suggestions.is_empty() {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(border_control())
+                    .children(suggestions.into_iter().enumerate().map(|(i, keyword)| {
+                        let label = keyword.clone();
+                        div()
+                            .id(("keyword-suggestion", i))
+                            .role(Role::Button)
+                            .aria_label(format!("Add keyword {label}"))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .font_family(SANS)
+                            .text_size(sp(10.5))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .hover(|s| s.bg(rgb(bg_row_hover())))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let scope = this.meta_scope();
+                                this.field = None;
+                                this.commit_meta_patch(
+                                    scope,
+                                    MetaPatch {
+                                        keywords_add: vec![keyword.clone()],
+                                        ..Default::default()
+                                    },
+                                    "Add keyword".to_string(),
+                                    cx,
+                                );
+                            }))
+                            .child(label)
+                    })),
+            );
+        }
         col
     }
 
@@ -14277,6 +14891,8 @@ impl Laika {
                             "Checksum".into(),
                             format!("blake3 {}…", p.blake3.chars().take(12).collect::<String>()),
                         ),
+                        // S03: who wrote the sidecar last.
+                        ("Sidecar".into(), self.sidecar_writer_label(p.id, &p.path)),
                     ]
                     .into_iter(),
                 );
@@ -14285,7 +14901,7 @@ impl Laika {
             None => vec![("File".into(), "—".into())],
         };
         div()
-            .w(px(layout::RAIL_LIBRARY_RIGHT))
+            .w(px(self.right_rail_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -14305,7 +14921,7 @@ impl Laika {
                             .flex()
                             .justify_between()
                             .font_family(SANS)
-                            .text_size(px(9.5))
+                            .text_size(sp(9.5))
                             .text_color(rgb(TEXT_DIM))
                             .child(shot),
                     ),
@@ -14324,7 +14940,8 @@ impl Laika {
                     .pb(px(14.))
                     .children(
                         [2usize, 3, 4, 5].map(|i| self.slider_row(i, slider::KNOB_LIBRARY, cx)),
-                    ),
+                    )
+                    .children([2usize, 3, 4, 5].map(|i| self.quick_adjust_row(i, cx))),
             )
             .child(section_header::section_header("Metadata", false, window))
             .child(
@@ -14340,14 +14957,14 @@ impl Laika {
                             .gap(px(10.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(k.clone()),
                             )
                             .child(
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(v.clone()),
                             )
@@ -14400,56 +15017,30 @@ impl Laika {
     fn develop(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         // V17: rails flank the center only when chrome shows.
         let mut row = div().flex_1().min_h_0().flex();
-        if !self.chrome_hidden() {
-            row = row.child(self.develop_left(window, cx));
+        if self.left_rail_shown() {
+            row = row
+                .child(self.develop_left(window, cx))
+                .child(self.rail_resize_handle(RailSide::Left, cx));
         }
         row = row.child(self.develop_center(window, cx));
-        if !self.chrome_hidden() {
-            row = row.child(self.develop_right(window, cx));
+        if self.right_rail_shown() {
+            row = row
+                .child(self.rail_resize_handle(RailSide::Right, cx))
+                .child(self.develop_right(window, cx));
         }
         row
     }
 
     fn develop_left(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         div()
-            .w(px(layout::RAIL_DEVELOP_LEFT))
+            .w(px(self.left_rail_width))
             .flex_none()
             .flex()
             .flex_col()
             .bg(rgb(bg_panel()))
             .border_r_1()
             .border_color(hairline())
-            .child(section_header::section_header("Presets", false, window))
-            .child(div().flex().flex_col().gap(px(1.)).px(px(6.)).children(
-                PRESETS.iter().enumerate().map(|(i, (name, from, to, _))| {
-                    let active = i == self.preset;
-                    div()
-                        .id(("preset", i))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .px(px(8.))
-                        .py(px(5.))
-                        .rounded(px(3.))
-                        .text_size(px(11.5))
-                        .text_color(rgb(if active { TEXT_PRIMARY } else { TEXT_SECONDARY }))
-                        .when(active, |d| d.bg(rgb(bg_row_active())))
-                        .when(!active, |d| d.hover(|s| s.bg(rgb(bg_row_hover()))))
-                        .on_click(cx.listener(move |this, _, _, cx| this.apply_preset(i, cx)))
-                        .child(
-                            div()
-                                .w(px(18.))
-                                .h(px(12.))
-                                .rounded(px(1.))
-                                .bg(linear_gradient(
-                                    135.,
-                                    linear_color_stop(rgb(*from), 0.),
-                                    linear_color_stop(rgb(*to), 1.),
-                                )),
-                        )
-                        .child(*name)
-                }),
-            ))
+            .child(self.preset_rail(window, cx))
             .child(section_header::section_header("History", false, window))
             .child(self.history_list(cx))
             .child(self.snapshot_section(window, cx))
@@ -14461,7 +15052,7 @@ impl Laika {
                     .px(px(14.))
                     .py(px(12.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .line_height(relative(1.6))
                     .text_color(rgb(TEXT_DIM))
                     .child("non-destructive / original untouched on disk"),
@@ -14519,14 +15110,14 @@ impl Laika {
                     }))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(if hot { accent_line() } else { TEXT_SECONDARY }))
                             .child(label.clone()),
                     )
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_DIM))
                             .child(value.clone()),
                     )
@@ -14588,7 +15179,7 @@ impl Laika {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(label),
                             ),
@@ -14598,7 +15189,7 @@ impl Laika {
                             .id(("snapshot-del", si))
                             .px(px(6.))
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .hover(|s| s.text_color(rgb(0xE56060)))
                             .on_hover(self.tip("Delete this snapshot"))
@@ -14620,7 +15211,7 @@ impl Laika {
                         text_input::FieldId::SnapshotName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .child("Name this treatment…".to_string()),
                         false,
@@ -14718,7 +15309,7 @@ impl Laika {
     /// trackpad); only cells in view are built, so large catalogs stay
     /// cheap per frame.
     fn filmstrip_strip(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        (!self.chrome_minimal()).then(|| {
+        (!self.chrome_minimal() && self.library.prefs.filmstrip_visible).then(|| {
             const FILM_PAD: f32 = 10.;
             const FILM_GAP: f32 = 6.;
             let photos = self.filmstrip_photos();
@@ -14764,8 +15355,32 @@ impl Laika {
                     let has_thumb = thumb.is_some();
                     let (a, b) = placeholder_tint(&p.blake3);
                     let pid = p.id;
+                    let sync_label = match p.sync {
+                        SyncState::Synced => "Synced",
+                        SyncState::Pending => "Sync pending",
+                        SyncState::Failed => "Sync failed",
+                        SyncState::Local => "Local only",
+                    };
+                    let flag_label = if p.picked {
+                        "picked"
+                    } else if p.rejected {
+                        "rejected"
+                    } else {
+                        "unflagged"
+                    };
+                    let accessible = format!(
+                        "{}, {}, {} stars, {}, {}",
+                        p.filename,
+                        if current { "selected" } else { "not selected" },
+                        p.rating,
+                        flag_label,
+                        sync_label
+                    );
                     div()
                         .id(("film", pid as usize))
+                        .role(Role::Button)
+                        .aria_label(accessible)
+                        .aria_selected(current)
                         .absolute()
                         .left(px(FILM_PAD + i as f32 * pitch))
                         .top(px(cell_top))
@@ -14782,7 +15397,11 @@ impl Laika {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // U03: filmstrip clicks unify selection and
                             // primary like grid clicks do.
-                            this.select_navigate(pid, SelectMode::Set, cx);
+                            if this.view == ViewMode::Compare {
+                                this.set_compare_candidate(pid, cx);
+                            } else {
+                                this.select_navigate(pid, SelectMode::Set, cx);
+                            }
                         }))
                         .on_mouse_down(
                             MouseButton::Right,
@@ -14792,7 +15411,17 @@ impl Laika {
                                 cx.notify();
                             }),
                         )
-                        .children(thumb.map(|image| img(ImageSource::Render(image)).size_full()))
+                        // The whole picture sits inside the frame: portrait
+                        // thumbnails letterbox instead of spilling below it.
+                        .overflow_hidden()
+                        .children(thumb.map(|image| {
+                            img(ImageSource::Render(image))
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .object_fit(ObjectFit::Contain)
+                        }))
                         // V13: label swatch in the corner.
                         .when(p.label > 0, |d| {
                             d.child(
@@ -14803,6 +15432,41 @@ impl Laika {
                                     .child(collections::label_swatch(p.label, 7.)),
                             )
                         })
+                        .when(current, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .left(px(3.))
+                                    .top(px(3.))
+                                    .px(px(4.))
+                                    .py(px(1.))
+                                    .rounded(px(2.))
+                                    .bg(rgba(0x000000CC))
+                                    .text_size(sp(9.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child("✓ SELECTED"),
+                            )
+                        })
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(3.))
+                                .bottom(px(3.))
+                                .px(px(3.))
+                                .py(px(1.))
+                                .rounded(px(2.))
+                                .bg(rgba(0x000000CC))
+                                .text_size(sp(8.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(match p.sync {
+                                    SyncState::Synced => accent_line(),
+                                    SyncState::Pending => WARNING,
+                                    SyncState::Failed => 0xE56060,
+                                    SyncState::Local => TEXT_TERTIARY,
+                                }))
+                                .child(sync_label),
+                        )
                         .when(!has_thumb, |d| {
                             d.bg(linear_gradient(
                                 160.,
@@ -14980,6 +15644,18 @@ impl Laika {
                     let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
                     let cmd = ev.modifiers.platform || ev.modifiers.control;
                     if this.crop_open {
+                        // Double-click inside the box applies the crop
+                        // (like Enter); handles and the outside keep
+                        // their drag meaning.
+                        if ev.click_count >= 2
+                            && !cmd
+                            && !this.geo.straighten_tool
+                            && this.crop_hit(pos) == Some(zoom::CropHandle::Move)
+                        {
+                            this.crop_drag = None;
+                            this.apply_crop(cx);
+                            return;
+                        }
                         // V22: straighten line (tool or ⌘-drag) before handles.
                         if !this.straighten_press(pos, cmd, cx) {
                             this.crop_press_start(pos, cx);
@@ -15077,7 +15753,7 @@ impl Laika {
                     .py(px(4.))
                     .bg(rgba(0x0000008C))
                     .font_family(SANS)
-                    .text_size(px(9.5))
+                    .text_size(sp(9.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(format!(
                         "{dims}{}{}",
@@ -15136,7 +15812,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("\\ before/after · Y split · P pick"),
                     ),
@@ -15396,6 +16072,228 @@ impl Laika {
         cx.notify();
     }
 
+    fn commit_develop_state(
+        &mut self,
+        pid: i64,
+        label: &str,
+        value: &str,
+        before: edit::Snap,
+        cx: &mut Context<Self>,
+    ) {
+        self.record_step(pid, label, value, before);
+        self.last_batch = vec![pid];
+        self.last_was_meta = false;
+        self.last_was_remove = false;
+        self.redo_batch.clear();
+        self.edits_dirty = true;
+        self.persist_edits();
+        self.submit_dev(cx);
+        self.sync_derived(pid, cx);
+        cx.notify();
+    }
+
+    /// U20: Laika-owned profile choices. These names intentionally do not
+    /// imply Adobe/DCP compatibility; Standard is the historical renderer.
+    fn set_camera_profile(&mut self, profile: edit::CameraProfile, cx: &mut Context<Self>) {
+        let Some(pid) = self.state.primary else {
+            return;
+        };
+        if self.state.edit(pid).camera_profile == profile {
+            return;
+        }
+        let before = self.snap_current(pid);
+        self.state.edit(pid).camera_profile = profile;
+        self.commit_develop_state(pid, "Camera Profile", &format!("{profile:?}"), before, cx);
+    }
+
+    /// U19: mutate one editable local object as one undoable history step.
+    fn local_action(&mut self, action: LocalAction, cx: &mut Context<Self>) {
+        let Some(pid) = self.state.primary else {
+            return;
+        };
+        let before = self.snap_current(pid);
+        let locals = &mut self.state.edit(pid).locals;
+        let (label, value) = match action {
+            LocalAction::AddBrush => {
+                let id = locals.next_id();
+                locals.masks.push(edit::LocalMask {
+                    id,
+                    name: format!("Brush {id}"),
+                    shape: edit::MaskShape::Brush {
+                        points: vec![edit::BrushPoint {
+                            position: [0.5, 0.5],
+                            radius: 0.12,
+                            flow: 1.,
+                            erase: false,
+                        }],
+                    },
+                    feather: 0.5,
+                    invert: false,
+                    adjustment: edit::LocalAdjustment {
+                        exposure: 0.5,
+                        ..Default::default()
+                    },
+                });
+                ("Local Brush", "add".to_string())
+            }
+            LocalAction::AddLinear => {
+                let id = locals.next_id();
+                locals.masks.push(edit::LocalMask {
+                    id,
+                    name: format!("Linear {id}"),
+                    shape: edit::MaskShape::Linear {
+                        start: [0.2, 0.5],
+                        end: [0.8, 0.5],
+                    },
+                    feather: 0.5,
+                    invert: false,
+                    adjustment: edit::LocalAdjustment {
+                        exposure: 0.5,
+                        ..Default::default()
+                    },
+                });
+                ("Linear Gradient", "add".to_string())
+            }
+            LocalAction::AddRadial => {
+                let id = locals.next_id();
+                locals.masks.push(edit::LocalMask {
+                    id,
+                    name: format!("Radial {id}"),
+                    shape: edit::MaskShape::Radial {
+                        center: [0.5, 0.5],
+                        radius: [0.25, 0.2],
+                        rotation: 0.,
+                    },
+                    feather: 0.5,
+                    invert: false,
+                    adjustment: edit::LocalAdjustment {
+                        exposure: 0.5,
+                        ..Default::default()
+                    },
+                });
+                ("Radial Gradient", "add".to_string())
+            }
+            LocalAction::AddHeal => {
+                let id = locals.next_id();
+                locals.heals.push(edit::HealSpot {
+                    id,
+                    target: [0.5, 0.5],
+                    source: [0.62, 0.5],
+                    radius: 0.04,
+                    feather: 0.5,
+                });
+                ("Spot Heal", "add".to_string())
+            }
+            LocalAction::Delete(id) => {
+                locals.masks.retain(|m| m.id != id);
+                locals.heals.retain(|h| h.id != id);
+                ("Local Mask", "delete".to_string())
+            }
+            LocalAction::Invert(id) => {
+                if let Some(m) = locals.masks.iter_mut().find(|m| m.id == id) {
+                    m.invert = !m.invert;
+                }
+                ("Local Mask", "invert".to_string())
+            }
+            LocalAction::Feather(id, delta) => {
+                if let Some(m) = locals.masks.iter_mut().find(|m| m.id == id) {
+                    m.feather = (m.feather + delta).clamp(0., 1.);
+                }
+                ("Mask Feather", format!("{delta:+.2}"))
+            }
+            LocalAction::Exposure(id, delta) => {
+                if let Some(m) = locals.masks.iter_mut().find(|m| m.id == id) {
+                    m.adjustment.exposure = (m.adjustment.exposure + delta).clamp(-5., 5.);
+                }
+                ("Mask Exposure", format!("{delta:+.2} EV"))
+            }
+            LocalAction::ToggleErase(id) => {
+                if let Some(edit::LocalMask {
+                    shape: edit::MaskShape::Brush { points },
+                    ..
+                }) = locals.masks.iter_mut().find(|m| m.id == id)
+                {
+                    if let Some(p) = points.last_mut() {
+                        p.erase = !p.erase;
+                    }
+                }
+                ("Brush Erase", "toggle".to_string())
+            }
+            LocalAction::Move(id, dx, dy) => {
+                if let Some(m) = locals.masks.iter_mut().find(|m| m.id == id) {
+                    let move_point = |p: &mut [f32; 2]| {
+                        p[0] = (p[0] + dx).clamp(0., 1.);
+                        p[1] = (p[1] + dy).clamp(0., 1.);
+                    };
+                    match &mut m.shape {
+                        edit::MaskShape::Brush { points } => {
+                            for p in points {
+                                move_point(&mut p.position);
+                            }
+                        }
+                        edit::MaskShape::Linear { start, end } => {
+                            move_point(start);
+                            move_point(end);
+                        }
+                        edit::MaskShape::Radial { center, .. } => move_point(center),
+                    }
+                }
+                ("Mask Position", format!("{dx:+.2}, {dy:+.2}"))
+            }
+            LocalAction::Size(id, delta) => {
+                if let Some(m) = locals.masks.iter_mut().find(|m| m.id == id) {
+                    match &mut m.shape {
+                        edit::MaskShape::Brush { points } => {
+                            for p in points {
+                                p.radius = (p.radius + delta).clamp(0.005, 1.);
+                            }
+                        }
+                        edit::MaskShape::Linear { start, end } => {
+                            let cx = (start[0] + end[0]) * 0.5;
+                            let cy = (start[1] + end[1]) * 0.5;
+                            let scale = (1. + delta * 4.).clamp(0.2, 1.8);
+                            for p in [start, end] {
+                                p[0] = (cx + (p[0] - cx) * scale).clamp(0., 1.);
+                                p[1] = (cy + (p[1] - cy) * scale).clamp(0., 1.);
+                            }
+                        }
+                        edit::MaskShape::Radial { radius, .. } => {
+                            radius[0] = (radius[0] + delta).clamp(0.005, 1.);
+                            radius[1] = (radius[1] + delta).clamp(0.005, 1.);
+                        }
+                    }
+                }
+                ("Mask Size", format!("{delta:+.2}"))
+            }
+            LocalAction::MoveHeal(id, dx, dy, donor) => {
+                if let Some(h) = locals.heals.iter_mut().find(|h| h.id == id) {
+                    let p = if donor { &mut h.source } else { &mut h.target };
+                    p[0] = (p[0] + dx).clamp(0., 1.);
+                    p[1] = (p[1] + dy).clamp(0., 1.);
+                }
+                (
+                    if donor { "Heal Donor" } else { "Heal Target" },
+                    format!("{dx:+.2}, {dy:+.2}"),
+                )
+            }
+            LocalAction::HealSize(id, delta) => {
+                if let Some(h) = locals.heals.iter_mut().find(|h| h.id == id) {
+                    h.radius = (h.radius + delta).clamp(0.005, 1.);
+                }
+                ("Heal Size", format!("{delta:+.2}"))
+            }
+        };
+        self.commit_develop_state(pid, label, &value, before, cx);
+    }
+
+    fn toggle_mask_overlay(&mut self, cx: &mut Context<Self>) {
+        if let Some(dev) = self.dev.as_mut() {
+            dev.mask_overlay = !dev.mask_overlay;
+        }
+        self.submit_dev(cx);
+        cx.notify();
+    }
+
     /// U18: reset one panel to defaults (values + enable) as one step.
     fn reset_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
         let Some(pid) = self.state.primary else {
@@ -15635,7 +16533,7 @@ impl Laika {
                             border_control()
                         })
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                         .on_hover(self.tip("Lock the crop box to this ratio"))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -15661,7 +16559,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Crop".to_string()),
                     )
@@ -15671,7 +16569,7 @@ impl Laika {
                             text_input::FieldId::CropCustom,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child(self.crop_aspect_text()),
                             false,
@@ -15692,7 +16590,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if self.crop_grid {
                                 accent_line()
                             } else {
@@ -15715,7 +16613,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_TERTIARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Full frame, zero angle, no mirrors"))
@@ -15739,7 +16637,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_TERTIARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Straighten 1° counter-clockwise"))
@@ -15753,7 +16651,7 @@ impl Laika {
                             text_input::FieldId::CropAngle,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child(self.crop_angle_text()),
                             false,
@@ -15770,7 +16668,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_TERTIARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Straighten 1° clockwise"))
@@ -15792,7 +16690,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if flip_h { accent_line() } else { TEXT_TERTIARY }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Mirror left–right"))
@@ -15814,7 +16712,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if flip_v { accent_line() } else { TEXT_TERTIARY }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Mirror top–bottom"))
@@ -15833,7 +16731,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_TERTIARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Drop the draft, keep the old composition (Esc)"))
@@ -15850,7 +16748,7 @@ impl Laika {
                             .rounded(px(3.))
                             .bg(rgb(accent_fill()))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(accent_on_fill()))
                             .hover(|s| s.bg(rgb(accent_fill_hover())))
                             .on_hover(self.tip("Apply as one undo step (Enter)"))
@@ -15927,6 +16825,21 @@ impl Laika {
 
     /// U08: press on the Develop stage while cropping — handle resize,
     /// interior move, or (outside the box) rotate about the frame center.
+    /// Which part of the crop box a window position hits (None when the
+    /// box isn't laid out yet); outside the box is `Rotate`.
+    fn crop_hit(&self, pos: (f32, f32)) -> Option<zoom::CropHandle> {
+        let draft = self.crop_draft?;
+        let g = self.stage_geom()?;
+        let (x, y, w, h) = self.crop_box_px(&g)?;
+        let b = self.viewport_box.get();
+        let (ox, oy) = (b.origin.x.as_f32(), b.origin.y.as_f32());
+        Some(
+            zoom::crop_handle_at(pos.0, pos.1, ox + x, oy + y, w, h)
+                .map(|m| zoom::mirror_handle(m, draft.flip_h, draft.flip_v))
+                .unwrap_or(zoom::CropHandle::Rotate),
+        )
+    }
+
     fn crop_press_start(&mut self, pos: (f32, f32), cx: &mut Context<Self>) {
         if self.state.primary.is_none() {
             return;
@@ -16109,10 +17022,10 @@ impl Laika {
                         .left(px(fx))
                         .top(px((fy - 20.).max(0.)))
                         .font_family(SANS)
-                        .text_size(px(9.))
+                        .text_size(sp(9.))
                         .text_color(rgba(0xFFFFFFBF))
                         .child(format!(
-                            "{angle:+.1}° · drag inside to move · handles resize · drag outside to rotate · ⌘-drag straightens · O overlay · X swap · arrows nudge · Enter applies · Esc cancels"
+                            "{angle:+.1}° · drag inside to move · handles resize · drag outside to rotate · ⌘-drag straightens · O overlay · X swap · arrows nudge · Enter or double-click applies · Esc cancels"
                         )),
                 ),
         )
@@ -16659,7 +17572,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(label),
             )
@@ -16676,7 +17589,7 @@ impl Laika {
                         border_control()
                     })
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(if self.clip_overlay {
                         accent_line()
                     } else {
@@ -16728,7 +17641,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child("White balance".to_string()),
             )
@@ -16748,7 +17661,7 @@ impl Laika {
                                 .border_1()
                                 .border_color(border_control())
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_TERTIARY))
                                 .hover(|s| s.bg(rgb(bg_row_hover())))
                                 .on_hover(self.tip("Set Temp; tint stays unless As Shot"))
@@ -16777,7 +17690,7 @@ impl Laika {
                             .border_1()
                             .border_color(border_control())
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_TERTIARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Gray-world Auto from the preview mean"))
@@ -16799,7 +17712,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if self.wb_pick {
                                 accent_line()
                             } else {
@@ -16828,26 +17741,69 @@ impl Laika {
         let Some(d) = self.export_dialog.as_ref() else {
             return div();
         };
-        match d.format {
+        let format = d.format;
+        let sharpening = d.format_opts.output_sharpening;
+        let detail = match format {
             ExportFormat::Jpeg => self.export_jpeg_opts(cx),
             ExportFormat::Png => self.export_png_opts(cx),
             ExportFormat::WebP => div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Lossless WebP (no lossy encoder offline)".to_string()),
             ExportFormat::Avif => self.export_avif_opts(cx),
             ExportFormat::Tiff => div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Uncompressed 8-bit TIFF".to_string()),
             ExportFormat::Original => div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Source file copied as-is, sidecar per policy".to_string()),
+        };
+        if format == ExportFormat::Original {
+            return detail;
         }
+        div().flex().flex_col().gap(px(7.)).child(detail).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .font_family(SANS)
+                        .text_size(sp(10.5))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Output sharpening".to_string()),
+                )
+                .child(
+                    div()
+                        .id("export-output-sharpen")
+                        .px(px(9.))
+                        .py(px(4.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(border_control())
+                        .font_family(SANS)
+                        .text_size(sp(10.5))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(d) = this.export_dialog.as_mut() {
+                                d.format_opts.output_sharpening =
+                                    match d.format_opts.output_sharpening {
+                                        OutputSharpening::Off => OutputSharpening::Low,
+                                        OutputSharpening::Low => OutputSharpening::Standard,
+                                        OutputSharpening::Standard => OutputSharpening::High,
+                                        OutputSharpening::High => OutputSharpening::Off,
+                                    };
+                            }
+                            cx.notify();
+                        }))
+                        .child(format!("{sharpening:?}")),
+                ),
+        )
     }
 
     /// V27: JPEG size-cap editor.
@@ -16864,7 +17820,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("Max MB".to_string()),
             )
@@ -16873,7 +17829,7 @@ impl Laika {
                     text_input::FieldId::ExportMaxMb,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(if max_mb == 0 {
                             "no limit".to_string()
@@ -16897,7 +17853,7 @@ impl Laika {
         let mut row = div().flex().items_center().gap(px(6.)).child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Compression".to_string()),
         );
@@ -16916,7 +17872,7 @@ impl Laika {
                         border_control()
                     })
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip("PNG compression effort"))
@@ -16933,7 +17889,7 @@ impl Laika {
         row.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child("8-bit".to_string()),
         )
@@ -16959,7 +17915,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip("Slower encode (better compression)"))
@@ -16976,7 +17932,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(format!("speed {speed} · {depth}-bit")),
             )
@@ -16989,7 +17945,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip("Faster encode"))
@@ -17011,7 +17967,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip("Toggle 8/10-bit output depth"))
@@ -17047,7 +18003,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Watermark".to_string()),
                 )
@@ -17073,7 +18029,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Watermark stamped post-resize (settings persist)"))
@@ -17100,7 +18056,7 @@ impl Laika {
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("Text".to_string()),
                         )
@@ -17109,7 +18065,7 @@ impl Laika {
                                 text_input::FieldId::ExportWmText,
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(if wm.text.is_empty() {
                                         "type watermark…".to_string()
@@ -17130,7 +18086,7 @@ impl Laika {
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("Font".to_string()),
                         )
@@ -17139,7 +18095,7 @@ impl Laika {
                                 text_input::FieldId::ExportWmFont,
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(wm.font.clone()),
                                 false,
@@ -17175,7 +18131,7 @@ impl Laika {
                                     border_control()
                                 })
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(if shadow_on {
                                     accent_line()
                                 } else {
@@ -17213,7 +18169,7 @@ impl Laika {
                                             border_control()
                                         })
                                         .font_family(SANS)
-                                        .text_size(px(10.5))
+                                        .text_size(sp(10.5))
                                         .text_color(rgb(if on {
                                             accent_line()
                                         } else {
@@ -17246,7 +18202,7 @@ impl Laika {
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("File".to_string()),
                         )
@@ -17255,7 +18211,7 @@ impl Laika {
                                 text_input::FieldId::ExportWmGraphic,
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(if missing {
                                         accent_line()
                                     } else {
@@ -17283,7 +18239,7 @@ impl Laika {
                     col = col.child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(accent_line()))
                             .child("file not found — export will refuse to start".to_string()),
                     );
@@ -17306,7 +18262,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Margin".to_string()),
                     )
@@ -17315,7 +18271,7 @@ impl Laika {
                             text_input::FieldId::ExportWmMargin,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(format!("{}px", wm.margin_px)),
                             false,
@@ -17346,7 +18302,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child(label_text),
             )
@@ -17359,7 +18315,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip(tip))
@@ -17375,7 +18331,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(value),
             )
@@ -17388,7 +18344,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip(tip))
@@ -17427,7 +18383,7 @@ impl Laika {
                             border_control()
                         })
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                         .hover(|s| s.bg(rgb(bg_row_hover())))
                         .on_hover(self.tip("Watermark anchor (margins pin the edges)"))
@@ -17454,7 +18410,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("Anchor".to_string()),
             )
@@ -17476,7 +18432,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("After".to_string()),
             )
@@ -17498,7 +18454,7 @@ impl Laika {
                                 border_control()
                             })
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_hover(self.tip("Post-export action (stored per preset)"))
@@ -17519,7 +18475,7 @@ impl Laika {
                     text_input::FieldId::ExportPostScript,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(if script.is_empty() {
                             "path to script…".to_string()
@@ -17552,7 +18508,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Preset".to_string()),
                 )
@@ -17561,7 +18517,7 @@ impl Laika {
                         text_input::FieldId::ExportPresetName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if pname.is_empty() {
                                 "name…".to_string()
@@ -17576,7 +18532,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("in".to_string()),
                 )
@@ -17585,7 +18541,7 @@ impl Laika {
                         text_input::FieldId::ExportPresetFolder,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if pfolder.is_empty() {
                                 "folder…".to_string()
@@ -17626,7 +18582,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Apply".to_string()),
                     )
@@ -17649,7 +18605,7 @@ impl Laika {
                                     .border_1()
                                     .border_color(border_control())
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Load this preset into the dialog"))
@@ -17670,7 +18626,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Run".to_string()),
                     )
@@ -17693,7 +18649,7 @@ impl Laika {
                                         border_control()
                                     })
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip(
@@ -17716,7 +18672,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_DIMMER))
                             .child(if run_set.is_empty() {
                                 "exports the dialog values".to_string()
@@ -18032,7 +18988,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .text_color(rgb(TEXT_PRIMARY))
                         .child("Keywords".to_string()),
                 )
@@ -18075,7 +19031,7 @@ impl Laika {
                                     .border_1()
                                     .border_color(border_control())
                                     .font_family(SANS)
-                                    .text_size(px(10.))
+                                    .text_size(sp(10.))
                                     .text_color(rgb(if inc { accent_line() } else { TEXT_DIMMER }))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Toggle export inclusion"))
@@ -18102,7 +19058,7 @@ impl Laika {
                                         border_control()
                                     })
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(if on {
                                         accent_line()
                                     } else {
@@ -18123,7 +19079,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(format!("…{} more", nodes.len() - shown)),
             );
@@ -18132,7 +19088,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("no keywords — assign some from the rail first".to_string()),
             );
@@ -18152,7 +19108,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Rename".to_string()),
                     )
@@ -18161,7 +19117,7 @@ impl Laika {
                             text_input::FieldId::KwRename,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(sel.clone()),
                             false,
@@ -18187,7 +19143,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Merge into".to_string()),
                     )
@@ -18196,7 +19152,7 @@ impl Laika {
                             text_input::FieldId::KwMergeInto,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child("target path…".to_string()),
                             false,
@@ -18214,7 +19170,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Synonyms".to_string()),
                     )
@@ -18230,7 +19186,7 @@ impl Laika {
                                     .py(px(3.))
                                     .rounded(px(2.))
                                     .bg(rgb(bg_chip()))
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Click removes this synonym"))
@@ -18246,7 +19202,7 @@ impl Laika {
                             text_input::FieldId::KwSynonym,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child("add…".to_string()),
                             false,
@@ -18271,7 +19227,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Sets".to_string()),
                 )
@@ -18291,7 +19247,7 @@ impl Laika {
                                     .border_1()
                                     .border_color(border_control())
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Click applies the set to the scope"))
@@ -18307,7 +19263,7 @@ impl Laika {
                                     .border_1()
                                     .border_color(border_control())
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIMMER))
                                     .hover(|s| s.bg(rgb(bg_row_hover())))
                                     .on_hover(self.tip("Delete this set"))
@@ -18324,7 +19280,7 @@ impl Laika {
                         text_input::FieldId::KwSetName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .child("set name…".to_string()),
                         false,
@@ -18342,7 +19298,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("File".to_string()),
                 )
@@ -18351,7 +19307,7 @@ impl Laika {
                         text_input::FieldId::KwImportPath,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if self.kw_import_path.is_empty() {
                                 "import path…".to_string()
@@ -18373,7 +19329,7 @@ impl Laika {
                         text_input::FieldId::KwExportPath,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(if self.kw_export_path.is_empty() {
                                 "export path…".to_string()
@@ -18394,6 +19350,488 @@ impl Laika {
         modal::modal_shell(col)
     }
 
+    // ---- S07 complete exit bundle -------------------------------------------
+
+    fn open_exit_bundle(&mut self, cx: &mut Context<Self>) {
+        if self.catalog.is_none() {
+            self.status_note = "no catalog is open — open one first".to_string();
+            cx.notify();
+            return;
+        }
+        self.close_modals(cx);
+        self.exit_bundle.open = true;
+        self.exit_bundle.error.clear();
+        cx.notify();
+    }
+
+    fn open_exit_bundle_picker(&mut self, cx: &mut Context<Self>) {
+        self.open_folder_picker(
+            PickerTarget::ExitBundleDest,
+            "Choose a parent folder for Export Everything",
+            cx,
+        );
+    }
+
+    fn start_exit_bundle(&mut self, cx: &mut Context<Self>) {
+        if self.exit_bundle.run.is_some() {
+            return;
+        }
+        self.flush_saves();
+        let Some(parent) = self.exit_bundle.dest.clone() else {
+            self.exit_bundle.error = "choose a destination folder first".to_string();
+            cx.notify();
+            return;
+        };
+        let options = laika_core::exit_bundle::ExitBundleOptions {
+            copy_originals: self.exit_bundle.copy_originals,
+            rendered_jpegs: self.exit_bundle.rendered_jpegs,
+        };
+        if options.rendered_jpegs && !self.ensure_dev(cx) {
+            self.exit_bundle.error =
+                "rendered JPEGs need an available GPU; turn that option off to continue"
+                    .to_string();
+            cx.notify();
+            return;
+        }
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        let plan = match cat.plan_exit_bundle(&parent, options) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.exit_bundle.error = e;
+                cx.notify();
+                return;
+            }
+        };
+        let bundle_path = plan.destination.clone();
+        let core_steps = plan.total_steps();
+        let render_ids: Vec<i64> = if options.rendered_jpegs {
+            self.photos
+                .iter()
+                .filter(|p| {
+                    laika_raw::media_kind(std::path::Path::new(&p.path))
+                        != Some(laika_raw::MediaKind::Video)
+                })
+                .map(|p| p.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (mut render_plan, _, mut render_plan_errors) = if options.rendered_jpegs {
+            let render_dest = bundle_path.join("Rendered JPEGs");
+            let settings = ExportSettings {
+                dest: render_dest.to_string_lossy().to_string(),
+                naming: "{original}-{seq:05}".to_string(),
+                quality: 92,
+                long_edge: None,
+                meta: ExportMeta::All,
+                collision: ExportCollision::Overwrite,
+                format: ExportFormat::Jpeg,
+                format_opts: ExportFormatOpts::default(),
+                watermark: WatermarkSpec::default(),
+                post_action: ExportPostAction::None,
+                script: String::new(),
+            };
+            self.plan_for(&render_ids, &render_dest, &settings, "")
+        } else {
+            (Vec::new(), 0, Vec::new())
+        };
+        // This option promises full-resolution output. Smart-preview fallbacks
+        // are useful for ordinary exports but must be reported, not silently
+        // mixed into an archival exit bundle.
+        let mut offline_smart = Vec::new();
+        render_plan.retain(|item| {
+            if item.smart {
+                offline_smart.push((
+                    item.out_name.clone(),
+                    "original is offline — relink it for a full-resolution JPEG".to_string(),
+                ));
+                false
+            } else {
+                true
+            }
+        });
+        render_plan_errors.extend(offline_smart);
+        // A paused run may already contain expensive full-resolution renders.
+        // Trust them only when the previous manifest hash still matches, then
+        // let the final verifier record them again in the fresh manifest.
+        let verified_renders: HashSet<PathBuf> = std::fs::read(bundle_path.join("manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|manifest| manifest["files"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record["kind"] == "rendered-jpeg")
+            .filter_map(|record| {
+                let rel = record["path"].as_str()?;
+                let expected = record["blake3"].as_str()?;
+                let path = bundle_path.join(rel);
+                (laika_core::catalog::hash_file(&path).ok().as_deref() == Some(expected))
+                    .then_some(path)
+            })
+            .collect();
+        render_plan.retain(|item| !verified_renders.contains(&item.out_path));
+        let expected_rendered = render_ids.len();
+        let render_extra = render_plan.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(laika_core::exit_bundle::ExitBundleProgress {
+            done: 0,
+            total: core_steps + render_extra,
+            current: "Preparing catalog snapshot".to_string(),
+        }));
+        self.exit_bundle.run = Some(ExitBundleRun {
+            progress: progress.clone(),
+            cancel: cancel.clone(),
+        });
+        self.exit_bundle.output = Some(bundle_path.clone());
+        self.exit_bundle.report.clear();
+        self.exit_bundle.error.clear();
+
+        // Refresh the modal while the filesystem worker reports progress.
+        let pulse_cancel = cancel.clone();
+        cx.spawn(async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let keep = entity
+                    .update(cx, |this, cx| {
+                        let keep = this
+                            .exit_bundle
+                            .run
+                            .as_ref()
+                            .is_some_and(|r| Arc::ptr_eq(&r.cancel, &pulse_cancel));
+                        if keep {
+                            cx.notify();
+                        }
+                        keep
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let renderer = self.dev.as_ref().map(|d| d.renderer.clone());
+        let cache_dir = self.cache_dir.clone();
+        let full_linear = self.full_linear.clone();
+        cx.spawn(async move |entity, cx| {
+            let progress_core = progress.clone();
+            let cancel_core = cancel.clone();
+            let core_result = cx
+                .background_spawn(async move {
+                    plan.run(&cancel_core, |mut p| {
+                        p.total += render_extra;
+                        if let Ok(mut live) = progress_core.lock() {
+                            *live = p;
+                        }
+                    })
+                })
+                .await;
+            let mut report = match core_result {
+                Ok(report) => report,
+                Err(e) => {
+                    entity
+                        .update(cx, |this, cx| {
+                            this.exit_bundle.run = None;
+                            this.exit_bundle.error = e;
+                            cx.notify();
+                        })
+                        .ok();
+                    return;
+                }
+            };
+
+            let mut render_errors: Vec<String> = render_plan_errors
+                .into_iter()
+                .map(|(name, reason)| format!("{name}: {reason}"))
+                .collect();
+            if options.rendered_jpegs {
+                if let Err(e) = std::fs::create_dir_all(bundle_path.join("Rendered JPEGs")) {
+                    render_errors.push(format!("create Rendered JPEGs: {e}"));
+                }
+                let mut linear_cache = full_linear;
+                for (index, item) in render_plan.into_iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        render_errors.push("rendering paused by user".to_string());
+                        break;
+                    }
+                    if let Ok(mut live) = progress.lock() {
+                        live.done = core_steps + index;
+                        live.total = core_steps + render_extra;
+                        live.current = format!("JPEG · {}", item.out_name);
+                    }
+                    let outcome = cx
+                        .background_spawn({
+                            let renderer = renderer.clone();
+                            let cache_dir = cache_dir.clone();
+                            let prior = linear_cache.take();
+                            async move { Self::export_one_file(renderer, cache_dir, prior, item) }
+                        })
+                        .await;
+                    if let Some(cache) = outcome.0 {
+                        linear_cache = Some(cache);
+                    }
+                    if let Err((name, reason)) = outcome.1 {
+                        render_errors.push(format!("{name}: {reason}"));
+                    }
+                }
+                if let Ok(mut live) = progress.lock() {
+                    live.done = core_steps + render_extra;
+                    live.current = "Verifying every exported file".to_string();
+                }
+                match cx
+                    .background_spawn({
+                        let bundle_path = bundle_path.clone();
+                        let render_errors = render_errors.clone();
+                        async move {
+                            laika_core::exit_bundle::finalize_rendered_jpegs(
+                                &bundle_path,
+                                expected_rendered,
+                                &render_errors,
+                            )
+                        }
+                    })
+                    .await
+                {
+                    Ok((_, bytes, complete)) => {
+                        report.bytes += bytes;
+                        report.complete = complete;
+                    }
+                    Err(e) => {
+                        report.complete = false;
+                        report.errors.push(e);
+                    }
+                }
+            }
+            let path = report.path.clone();
+            let mut lines = vec![
+                format!("Bundle: {}", path.display()),
+                format!(
+                    "{} photos · {} XMP files · {} originals copied",
+                    report.photos, report.sidecars, report.originals_copied
+                ),
+                format!(
+                    "{} files written · {} verified and reused",
+                    report.files_written, report.files_reused
+                ),
+            ];
+            if report.complete {
+                lines.push("Complete — every recorded file hash verified".to_string());
+            } else {
+                lines.push("Needs attention — see manifest.json and VERIFY.txt".to_string());
+            }
+            if !report.missing_originals.is_empty() {
+                lines.push(format!(
+                    "{} originals are offline or missing",
+                    report.missing_originals.len()
+                ));
+            }
+            for error in report.errors.iter().chain(render_errors.iter()).take(8) {
+                lines.push(format!("Failed: {error}"));
+            }
+            entity
+                .update(cx, |this, cx| {
+                    this.exit_bundle.run = None;
+                    this.exit_bundle.report = lines;
+                    this.status_note = if report.complete {
+                        format!("Export Everything complete · {}", path.display())
+                    } else {
+                        format!("Export Everything needs attention · {}", path.display())
+                    };
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn exit_bundle_modal(&self, cx: &mut Context<Self>) -> Div {
+        let running = self.exit_bundle.run.is_some();
+        let progress = self
+            .exit_bundle
+            .run
+            .as_ref()
+            .and_then(|r| r.progress.lock().ok().map(|p| p.clone()))
+            .unwrap_or_default();
+        let pct = if progress.total == 0 {
+            0.0
+        } else {
+            progress.done as f32 / progress.total as f32
+        };
+        let destination = self
+            .exit_bundle
+            .dest
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Choose a parent folder…".to_string());
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(22.))
+            .w_full()
+            .child(
+                div()
+                    .text_size(sp(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .child("Export Everything".to_string()),
+            )
+            .child(
+                div()
+                    .text_size(sp(11.))
+                    .text_color(rgb(TEXT_DIM))
+                    .child("A resumable, hash-verified exit bundle with a catalog snapshot, one Adobe-compatible XMP per photo, metadata CSV, collections, aliases, and importer instructions.".to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(self.dlg_btn(
+                        "exit-destination",
+                        "Choose destination".to_string(),
+                        false,
+                        cx,
+                        |this, cx| this.open_exit_bundle_picker(cx),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(sp(10.5))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(destination),
+                    ),
+            )
+            .child(self.dlg_check(
+                "exit-originals",
+                self.exit_bundle.copy_originals,
+                "Include verified byte-for-byte copies of originals".to_string(),
+                cx,
+                |this, cx| {
+                    if this.exit_bundle.run.is_none() {
+                        this.exit_bundle.copy_originals = !this.exit_bundle.copy_originals;
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(self.dlg_check(
+                "exit-rendered",
+                self.exit_bundle.rendered_jpegs,
+                "Include full-resolution developed JPEGs (quality 92)".to_string(),
+                cx,
+                |this, cx| {
+                    if this.exit_bundle.run.is_none() {
+                        this.exit_bundle.rendered_jpegs = !this.exit_bundle.rendered_jpegs;
+                    }
+                    cx.notify();
+                },
+            ));
+        if running {
+            body = body
+                .child(
+                    div()
+                        .h(px(8.))
+                        .rounded(px(4.))
+                        .bg(rgb(bg_segment_shell()))
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded(px(4.))
+                                .bg(rgb(accent_fill()))
+                                .w(relative(pct.clamp(0.0, 1.0))),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(sp(10.5))
+                        .text_color(rgb(TEXT_DIM))
+                        .child(format!(
+                            "{} of {} · {}",
+                            progress.done, progress.total, progress.current
+                        )),
+                );
+        }
+        if !self.exit_bundle.error.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(sp(10.5))
+                    .text_color(rgb(0xE45B5B))
+                    .child(self.exit_bundle.error.clone()),
+            );
+        }
+        if !self.exit_bundle.report.is_empty() {
+            body = body.child(div().flex().flex_col().gap(px(3.)).children(
+                self.exit_bundle.report.iter().map(|line| {
+                    div()
+                        .text_size(sp(10.5))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(line.clone())
+                }),
+            ));
+        }
+        let mut actions = div().flex().gap(px(8.));
+        if running {
+            actions = actions.child(self.dlg_btn(
+                "exit-cancel",
+                "Pause".to_string(),
+                false,
+                cx,
+                |this, cx| {
+                    if let Some(run) = &this.exit_bundle.run {
+                        run.cancel.store(true, Ordering::Relaxed);
+                    }
+                    cx.notify();
+                },
+            ));
+        } else {
+            actions = actions
+                .child(
+                    self.dlg_btn("exit-close", "Close".to_string(), false, cx, |this, cx| {
+                        this.exit_bundle.open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(self.dlg_btn(
+                    "exit-reveal",
+                    "Reveal".to_string(),
+                    false,
+                    cx,
+                    |this, cx| {
+                        let path = this
+                            .exit_bundle
+                            .output
+                            .clone()
+                            .or_else(|| this.exit_bundle.dest.clone());
+                        if let Some(path) = path
+                            && let Err(e) = laika_core::import::reveal_in_manager(&path)
+                        {
+                            this.exit_bundle.error = e;
+                        }
+                        cx.notify();
+                    },
+                ))
+                .child(self.dlg_btn(
+                    "exit-start",
+                    if self.exit_bundle.report.is_empty() {
+                        "Export Everything".to_string()
+                    } else {
+                        "Verify / resume".to_string()
+                    },
+                    true,
+                    cx,
+                    |this, cx| this.start_exit_bundle(cx),
+                ));
+        }
+        body = body.child(actions);
+        modal::modal_shell_w(body, 620.0)
+    }
+
     /// U10: file-export dialog — destination, naming with live preview,
     /// JPEG options, metadata/sidecar policy, collision policy, progress
     /// with cancel, and a bounded failure report with retry + reveal.
@@ -18411,7 +19849,7 @@ impl Laika {
             .min_w(px(480.));
         col = col.child(
             div()
-                .text_size(px(15.))
+                .text_size(sp(15.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_PRIMARY))
                 .child(format!(
@@ -18437,7 +19875,7 @@ impl Laika {
                     .border_1()
                     .border_color(border_control())
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if d.dest.is_some() {
                         TEXT_SECONDARY
                     } else {
@@ -18460,7 +19898,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Name".to_string()),
                 )
@@ -18470,7 +19908,7 @@ impl Laika {
                         div()
                             .flex_1()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(d.naming.clone()),
                         false,
@@ -18482,7 +19920,7 @@ impl Laika {
         col = col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIMMER))
                 .child(self.export_preview()),
         );
@@ -18494,7 +19932,7 @@ impl Laika {
                     text_input::FieldId::ExportQuality,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(format!(
                             "q{}",
@@ -18526,7 +19964,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Long edge".to_string()),
                 )
@@ -18535,7 +19973,7 @@ impl Laika {
                         text_input::FieldId::ExportLongEdge,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(
                                 d.long_edge
@@ -18550,7 +19988,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_DIMMER))
                         .child("sRGB".to_string()),
                 )
@@ -18563,7 +20001,7 @@ impl Laika {
                     row.child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(TEXT_DIMMER))
                             .child(if wm_on {
                                 "videos copy as originals (no watermark on video)".to_string()
@@ -18583,7 +20021,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Format".to_string()),
                 )
@@ -18604,7 +20042,7 @@ impl Laika {
                                     border_control()
                                 })
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                                 .hover(|s| s.bg(rgb(bg_row_hover())))
                                 .on_hover(self.tip("Output format (settings persist)"))
@@ -18623,7 +20061,7 @@ impl Laika {
                     div()
                         .id("export-jxl-na")
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_DIMMER))
                         .on_hover(self.tip("JPEG XL needs the libjxl C library + network build"))
                         .child("JXL n/a".to_string()),
@@ -18639,7 +20077,7 @@ impl Laika {
         col = col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child(
                     "sRGB output · pixels carry no EXIF (GPS included) — authorship rides the sidecar"
@@ -18719,7 +20157,7 @@ impl Laika {
                     .child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child(if running {
                                 format!("{} of {} · {}", r.done, r.total, r.current)
@@ -18734,7 +20172,7 @@ impl Laika {
                 d.report.iter().take(12).map(|line| {
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(line.clone())
                 }),
@@ -18827,7 +20265,7 @@ impl Laika {
         let mut row = div().flex().items_center().gap(px(8.)).child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child(label.to_string()),
         );
@@ -18847,7 +20285,7 @@ impl Laika {
                         border_control()
                     })
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(self.tip(tip))
@@ -19073,7 +20511,7 @@ impl Laika {
             return div().flex_1().flex().items_center().justify_center().child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child("catalog is empty — import a folder of RAW or JPEG files".to_string()),
             );
@@ -19146,7 +20584,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("Gap".to_string()),
             );
@@ -19165,7 +20603,7 @@ impl Laika {
                         border_control()
                     })
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_hover(
@@ -19183,7 +20621,7 @@ impl Laika {
                     text_input::FieldId::TimelineJump,
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(if self.tl_jump.is_empty() {
                             TEXT_DIMMER
                         } else {
@@ -19203,7 +20641,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(format!("{counts} rows")),
             )
@@ -19554,7 +20992,7 @@ impl Laika {
                         div()
                             .flex_1()
                             .font_family(SANS)
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if on_screen {
                                 TEXT_PRIMARY
@@ -19576,7 +21014,7 @@ impl Laika {
                                     .w(px(if day { 16. } else { 24. }))
                                     .flex_none()
                                     .font_family(SANS)
-                                    .text_size(px(if day { 9.5 } else { 10.5 }))
+                                    .text_size(sp(if day { 9.5 } else { 10.5 }))
                                     .text_color(rgb(if focused {
                                         accent_line()
                                     } else if on_screen {
@@ -19628,7 +21066,7 @@ impl Laika {
                     .items_center()
                     .justify_center()
                     .font_family(SANS)
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child(if self.photos.is_empty() {
                         "catalog is empty — import a folder of RAW or JPEG files".to_string()
@@ -19759,7 +21197,7 @@ impl Laika {
                     .py(px(6.))
                     .flex_none()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .bg(rgba(0x0000008C))
                     .child(format!(
@@ -19774,8 +21212,271 @@ impl Laika {
     /// U03: filmstrip window follows the active photo — the primary is
     /// always visible, centered when the selection allows it.
     fn filmstrip_photos(&self) -> Vec<&DbPhoto> {
+        if self.state.active_module == Module::Map {
+            return self.map_strip_photos();
+        }
         // The strip scrolls and virtualizes, so it spans the whole filter.
         self.filtered()
+    }
+
+    fn local_button(
+        &self,
+        id: String,
+        label: String,
+        action: LocalAction,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .id(id)
+            .px(px(7.))
+            .py(px(4.))
+            .rounded(px(3.))
+            .border_1()
+            .border_color(hairline())
+            .font_family(SANS)
+            .text_size(sp(10.))
+            .text_color(rgb(TEXT_SECONDARY))
+            .hover(|s| {
+                s.border_color(rgb(accent_line()))
+                    .text_color(rgb(TEXT_PRIMARY))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.local_action(action, cx)))
+            .child(label)
+    }
+
+    /// U19: editable mask/heal list. Geometry is displayed in original
+    /// coordinates by the renderer, so this remains attached through crop,
+    /// rotation, and Upright. Each click is a complete undo step.
+    fn local_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let locals = self
+            .state
+            .primary
+            .and_then(|id| self.state.edits.get(&id))
+            .map(|e| e.locals.clone())
+            .unwrap_or_default();
+        let modified = !locals.is_empty();
+        let overlay = self.dev.as_ref().is_some_and(|d| d.mask_overlay);
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(7.))
+            .px(px(14.))
+            .pb(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .id("local-overlay")
+                            .px(px(7.))
+                            .py(px(4.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(hairline())
+                            .when(overlay, |s| s.border_color(rgb(accent_line())))
+                            .font_family(SANS)
+                            .text_size(sp(10.))
+                            .text_color(rgb(if overlay {
+                                accent_line()
+                            } else {
+                                TEXT_SECONDARY
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_mask_overlay(cx)))
+                            .child(if overlay { "Overlay on" } else { "Overlay off" }.to_string()),
+                    )
+                    .child(self.local_button(
+                        "local-add-brush".into(),
+                        "Brush".into(),
+                        LocalAction::AddBrush,
+                        cx,
+                    ))
+                    .child(self.local_button(
+                        "local-add-linear".into(),
+                        "Linear".into(),
+                        LocalAction::AddLinear,
+                        cx,
+                    ))
+                    .child(self.local_button(
+                        "local-add-radial".into(),
+                        "Radial".into(),
+                        LocalAction::AddRadial,
+                        cx,
+                    ))
+                    .child(self.local_button(
+                        "local-add-heal".into(),
+                        "Heal".into(),
+                        LocalAction::AddHeal,
+                        cx,
+                    )),
+            );
+        for mask in locals.masks {
+            let id = mask.id;
+            let erase = matches!(&mask.shape, edit::MaskShape::Brush { points } if points.last().is_some_and(|p| p.erase));
+            let title = format!(
+                "{}  ·  {:.2} EV  ·  feather {}%{}",
+                mask.name,
+                mask.adjustment.exposure,
+                (mask.feather * 100.).round() as i32,
+                if mask.invert { "  ·  inverted" } else { "" }
+            );
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap(px(5.))
+                .p(px(7.))
+                .rounded(px(3.))
+                .bg(rgba(0xFFFFFF08))
+                .child(
+                    div()
+                        .font_family(SANS)
+                        .text_size(sp(10.))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child(title),
+                );
+            let mut actions = div().flex().flex_wrap().gap(px(4.));
+            for (suffix, label, action) in [
+                ("exp-down", "−EV", LocalAction::Exposure(id, -0.25)),
+                ("exp-up", "+EV", LocalAction::Exposure(id, 0.25)),
+                ("feather-down", "−feather", LocalAction::Feather(id, -0.1)),
+                ("feather-up", "+feather", LocalAction::Feather(id, 0.1)),
+                ("invert", "invert", LocalAction::Invert(id)),
+                ("delete", "delete", LocalAction::Delete(id)),
+            ] {
+                actions = actions.child(self.local_button(
+                    format!("local-{id}-{suffix}"),
+                    label.into(),
+                    action,
+                    cx,
+                ));
+            }
+            if matches!(mask.shape, edit::MaskShape::Brush { .. }) {
+                actions = actions.child(self.local_button(
+                    format!("local-{id}-erase"),
+                    if erase { "erase on" } else { "erase off" }.into(),
+                    LocalAction::ToggleErase(id),
+                    cx,
+                ));
+            }
+            for (suffix, label, action) in [
+                ("left", "←", LocalAction::Move(id, -0.03, 0.)),
+                ("right", "→", LocalAction::Move(id, 0.03, 0.)),
+                ("up", "↑", LocalAction::Move(id, 0., -0.03)),
+                ("down", "↓", LocalAction::Move(id, 0., 0.03)),
+                ("smaller", "−size", LocalAction::Size(id, -0.03)),
+                ("larger", "+size", LocalAction::Size(id, 0.03)),
+            ] {
+                actions = actions.child(self.local_button(
+                    format!("local-{id}-{suffix}"),
+                    label.into(),
+                    action,
+                    cx,
+                ));
+            }
+            body = body.child(row.child(actions));
+        }
+        for heal in locals.heals {
+            let mut actions = div().flex().flex_wrap().gap(px(4.));
+            for (suffix, label, action) in [
+                (
+                    "target-left",
+                    "target ←",
+                    LocalAction::MoveHeal(heal.id, -0.03, 0., false),
+                ),
+                (
+                    "target-right",
+                    "target →",
+                    LocalAction::MoveHeal(heal.id, 0.03, 0., false),
+                ),
+                (
+                    "donor-left",
+                    "donor ←",
+                    LocalAction::MoveHeal(heal.id, -0.03, 0., true),
+                ),
+                (
+                    "donor-right",
+                    "donor →",
+                    LocalAction::MoveHeal(heal.id, 0.03, 0., true),
+                ),
+                ("smaller", "−size", LocalAction::HealSize(heal.id, -0.01)),
+                ("larger", "+size", LocalAction::HealSize(heal.id, 0.01)),
+                ("delete", "delete", LocalAction::Delete(heal.id)),
+            ] {
+                actions = actions.child(self.local_button(
+                    format!("heal-{}-{suffix}", heal.id),
+                    label.into(),
+                    action,
+                    cx,
+                ));
+            }
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .p(px(7.))
+                    .rounded(px(3.))
+                    .bg(rgba(0xFFFFFF08))
+                    .child(
+                        div()
+                            .font_family(SANS)
+                            .text_size(sp(10.))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(format!("Spot Heal {}", heal.id)),
+                    )
+                    .child(actions),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .child(section_header::section_header("Masking", modified, window))
+            .child(body)
+    }
+
+    fn profile_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let active = self
+            .state
+            .primary
+            .and_then(|id| self.state.edits.get(&id))
+            .map(|e| e.camera_profile)
+            .unwrap_or_default();
+        let mut row = div().flex().flex_wrap().gap(px(5.)).px(px(14.)).pb(px(10.));
+        for profile in [
+            edit::CameraProfile::Standard,
+            edit::CameraProfile::Neutral,
+            edit::CameraProfile::Vivid,
+            edit::CameraProfile::Monochrome,
+        ] {
+            let on = profile == active;
+            row = row.child(
+                div()
+                    .id(format!("camera-profile-{profile:?}"))
+                    .px(px(7.))
+                    .py(px(4.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(hairline())
+                    .when(on, |s| s.border_color(rgb(accent_line())))
+                    .font_family(SANS)
+                    .text_size(sp(10.))
+                    .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_SECONDARY }))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_camera_profile(profile, cx)),
+                    )
+                    .child(format!("{profile:?}")),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .child(section_header::section_header(
+                "Camera Profile",
+                active != edit::CameraProfile::Standard,
+                window,
+            ))
+            .child(row)
     }
 
     /// U18: collapsible panel section with bypass + reset. Bypass flips
@@ -19814,7 +21515,7 @@ impl Laika {
                                 div()
                                     .id(("panel-bypass", panel as usize))
                                     .font_family(SANS)
-                                    .text_size(px(10.))
+                                    .text_size(sp(10.))
                                     .text_color(rgb(if on { accent_line() } else { TEXT_DIMMER }))
                                     .hover(|s| {
                                         s.text_color(rgb(if on {
@@ -19838,7 +21539,7 @@ impl Laika {
                             div()
                                 .id(("panel-reset", panel as usize))
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIM))
                                 .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                                 .on_hover(self.tip("Reset this panel to defaults"))
@@ -19851,7 +21552,7 @@ impl Laika {
                             div()
                                 .id(("panel-open", panel as usize))
                                 .font_family(SANS)
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .text_color(rgb(TEXT_DIM))
                                 .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                                 .on_hover(self.tip("Collapse / expand"))
@@ -19903,7 +21604,7 @@ impl Laika {
                     .px(px(14.))
                     .pb(px(6.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(
                         "manual correction — no automatic lens profiles in this build".to_string(),
@@ -19929,7 +21630,7 @@ impl Laika {
                     .py(px(3.))
                     .rounded(px(3.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_DIM }))
                     .when(on, |d| d.bg(rgb(bg_segment_active())))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
@@ -20080,7 +21781,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(9.5))
+                    .text_size(sp(9.5))
                     .text_color(rgb(if tinted { accent_line() } else { TEXT_DIM }))
                     .child(if tinted {
                         format!(
@@ -20107,7 +21808,7 @@ impl Laika {
                 .px(px(14.))
                 .pt(px(6.))
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIM))
                 .child(name.to_string()),
         );
@@ -20167,7 +21868,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child("drag points · double-click resets · values snap to 0.01".to_string()),
             )
@@ -20286,7 +21987,7 @@ impl Laika {
             _ => div()
                 .id(("slider-value", i))
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(accent)
                 .on_hover(self.tip("Click to type an exact value"))
                 .on_mouse_down(
@@ -20303,6 +22004,14 @@ impl Laika {
         };
         div()
             .id(("slider", i))
+            .role(Role::Slider)
+            .aria_label(d.label)
+            .aria_orientation(Orientation::Horizontal)
+            .aria_numeric_value(v as f64)
+            .aria_min_numeric_value(d.min as f64)
+            .aria_max_numeric_value(d.max as f64)
+            .aria_numeric_value_step(d.step as f64)
+            .aria_value(edit::format(i, v))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -20366,7 +22075,7 @@ impl Laika {
 
     fn develop_right(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         div()
-            .w(px(layout::RAIL_DEVELOP_RIGHT))
+            .w(px(self.right_rail_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -20419,7 +22128,7 @@ impl Laika {
                                 div()
                                     .id("reset")
                                     .font_family(SANS)
-                                    .text_size(px(10.))
+                                    .text_size(sp(10.))
                                     .text_color(rgb(TEXT_DIM))
                                     .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -20451,6 +22160,8 @@ impl Laika {
                             .pb(px(14.))
                             .children(BASIC_PARAMS.map(|i| self.slider_row(i, slider::KNOB, cx))),
                     )
+                    .child(self.profile_panel(window, cx))
+                    .child(self.local_panel(window, cx))
                     .child(self.panel_section(Panel::Curve, window, cx))
                     .child(self.panel_section(Panel::Hsl, window, cx))
                     .child(self.panel_section(Panel::Grading, window, cx))
@@ -20464,6 +22175,7 @@ impl Laika {
             )
             .child(
                 div()
+                    .flex_col()
                     .flex()
                     .gap(px(8.))
                     .px(px(14.))
@@ -20472,22 +22184,66 @@ impl Laika {
                     .border_color(hairline())
                     .child(
                         div()
-                            .flex_1()
-                            .id("copy-settings")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(pid) = this.state.primary {
-                                    this.copy_settings_from(pid);
-                                }
-                                cx.notify();
-                            }))
-                            .child(button::outline("Copy settings")),
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("copy-settings")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(pid) = this.state.primary {
+                                            this.copy_settings_from(pid, cx);
+                                        }
+                                    }))
+                                    .child(button::outline("Copy settings")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("paste-settings")
+                                    .on_click(cx.listener(|this, _, _, cx| this.paste_settings(cx)))
+                                    .child(button::primary(&format!("Paste to {}", self.paste_count()))),
+                            ),
                     )
                     .child(
                         div()
-                            .flex_1()
-                            .id("paste-settings")
-                            .on_click(cx.listener(|this, _, _, cx| this.paste_settings(cx)))
-                            .child(button::primary(&format!("Paste to {}", self.paste_count()))),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("apply-previous")
+                                    .text_size(sp(10.5))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.apply_previous_settings(cx)))
+                                    .child("Apply Previous"),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("auto-sync")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .px(px(6.))
+                                    .py(px(3.))
+                                    .rounded(px(3.))
+                                    .when(self.batch.auto_sync, |d| d.bg(rgb(accent_fill())))
+                                    .text_size(sp(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if self.batch.auto_sync { accent_on_fill() } else { TEXT_DIM }))
+                                    .on_hover(self.tip("Auto Sync mirrors changed selected settings to the current selection"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_sync(cx)))
+                                    .child(if self.batch.auto_sync {
+                                        format!(
+                                            "AUTO SYNC · {}",
+                                            self.targets().len().saturating_sub(1)
+                                        )
+                                    } else {
+                                        "AUTO SYNC · OFF".to_string()
+                                    }),
+                            ),
                     ),
             )
     }
@@ -20521,14 +22277,14 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(9.))
+                        .text_size(sp(9.))
                         .text_color(rgb(TEXT_DIM))
                         .child(label.to_uppercase()),
                 )
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_PRIMARY))
                         .overflow_hidden()
                         .child(v),
@@ -20557,7 +22313,7 @@ impl Laika {
                             .text_ellipsis()
                             .font_family(SANS)
                             .font_weight(FontWeight::MEDIUM)
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_PRIMARY))
                             .child(name),
                     )
@@ -20572,7 +22328,7 @@ impl Laika {
                                 .border_color(border_control())
                                 .font_family(SANS)
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_size(px(9.5))
+                                .text_size(sp(9.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(kind),
                         )
@@ -20592,7 +22348,10 @@ impl Laika {
     }
 
     fn paste_count(&self) -> usize {
-        self.targets().len().max(1)
+        self.targets()
+            .into_iter()
+            .filter(|id| Some(*id) != self.batch.source_id)
+            .count()
     }
 
     /// Apply the clipboard to every selected photo (writes sidecars).
@@ -20602,7 +22361,11 @@ impl Laika {
             cx.notify();
             return;
         };
-        let ids = self.targets();
+        let ids: Vec<i64> = self
+            .targets()
+            .into_iter()
+            .filter(|id| Some(*id) != self.batch.source_id)
+            .collect();
         if ids.is_empty() {
             self.status_note = "no visible photos targeted".to_string();
             cx.notify();
@@ -20614,12 +22377,12 @@ impl Laika {
             .map(|pid| (*pid, self.snap_current(*pid)))
             .collect();
         for pid in &ids {
-            // V22: Transform sliders are geometry — like crops, they
-            // never paste onto other frames.
             let e = self.state.edit(*pid);
-            let keep = e.params;
-            e.params = cb;
-            e.params[edit::TRANSFORM_RANGE].copy_from_slice(&keep[edit::TRANSFORM_RANGE]);
+            e.params =
+                laika_core::presets::apply_selected_settings(&e.params, &cb, &self.batch.include);
+            if self.batch.include_locals {
+                e.locals = self.batch.source_locals.clone();
+            }
         }
         for (pid, before) in &befores {
             self.record_step(*pid, "Paste settings", "", before.clone());
@@ -20673,9 +22436,15 @@ impl Laika {
                     .map(|cat| cat.photo_authorship(*pid))
                     .unwrap_or_default();
                 let geom = self.sidecar_geom(*pid);
+                let result_params = self
+                    .state
+                    .edits
+                    .get(pid)
+                    .map(|e| e.params)
+                    .unwrap_or_else(edit::defaults);
                 match laika_core::xmp::write(
                     &photo.path,
-                    &cb,
+                    &result_params,
                     photo.rating,
                     &hist,
                     None,
@@ -20713,7 +22482,17 @@ impl Laika {
                 .clone()
                 .unwrap_or_else(|| format!("pasted with {failed} save failures — retry available"));
         } else {
-            self.status_note = format!("pasted to {}", ids.len());
+            self.status_note = format!(
+                "pasted {} settings from {} to {} photo{}",
+                self.batch.include.iter().filter(|on| **on).count(),
+                if self.batch.source_name.is_empty() {
+                    "copied photo"
+                } else {
+                    &self.batch.source_name
+                },
+                ids.len(),
+                if ids.len() == 1 { "" } else { "s" }
+            );
         }
         self.pump_sync(cx);
         cx.notify();
@@ -20754,7 +22533,7 @@ impl Laika {
                                 .px(px(16.))
                                 .pb(px(12.))
                                 .pt(px(16.))
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .child(count_title),
@@ -20785,7 +22564,7 @@ impl Laika {
                                                 .child(
                                                     div()
                                                         .flex_1()
-                                                        .text_size(px(11.5))
+                                                        .text_size(sp(11.5))
                                                         .text_color(rgb(TEXT_DIMMER))
                                                         .child(n.to_string()),
                                                 )
@@ -20797,7 +22576,7 @@ impl Laika {
                             div()
                                 .px(px(16.))
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child("only static galleries in this prototype"),
                         )
@@ -20811,7 +22590,7 @@ impl Laika {
                             div().flex().flex_col().gap(px(7.)).px(px(16.)).child(
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child("no saved recipes yet"),
                             ),
@@ -20823,7 +22602,7 @@ impl Laika {
                                 .border_color(hairline())
                                 .p(px(16.))
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .line_height(relative(1.7))
                                 .text_color(rgb(TEXT_DIM))
                                 // U01: no fabricated estimate — computed at build time.
@@ -20846,7 +22625,7 @@ impl Laika {
                                 .gap(px(10.))
                                 .child(
                                     div()
-                                        .text_size(px(15.))
+                                        .text_size(sp(15.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(TEXT_PRIMARY))
                                         .child("Static gallery"),
@@ -20854,7 +22633,7 @@ impl Laika {
                                 .child(
                                     div()
                                         .font_family(SANS)
-                                        .text_size(px(11.))
+                                        .text_size(sp(11.))
                                         .text_color(rgb(TEXT_DIM))
                                         .child("builds HTML + resized JPEGs, deploys to your host"),
                                 ),
@@ -20871,7 +22650,7 @@ impl Laika {
                                         .gap(px(8.))
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(sp(11.))
                                                 .text_color(rgb(TEXT_TERTIARY))
                                                 .child("GALLERY TITLE"),
                                         )
@@ -20885,7 +22664,7 @@ impl Laika {
                                         .child(
                                             div()
                                                 .mt(px(8.))
-                                                .text_size(px(11.))
+                                                .text_size(sp(11.))
                                                 .text_color(rgb(TEXT_TERTIARY))
                                                 .child("URL"),
                                         )
@@ -20904,7 +22683,7 @@ impl Laika {
                                             // Esc reverts, Tab moves on.
                                             div()
                                                 .font_family(SANS)
-                                                .text_size(px(10.))
+                                                .text_size(sp(10.))
                                                 .text_color(rgb(TEXT_DIMMER))
                                                 .child("typing commits with Enter · Esc reverts · Tab moves on"),
                                         ),
@@ -20917,7 +22696,7 @@ impl Laika {
                                         .gap(px(8.))
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(sp(11.))
                                                 .text_color(rgb(TEXT_TERTIARY))
                                                 .child("TEMPLATE"),
                                         )
@@ -20943,7 +22722,7 @@ impl Laika {
                                                             } else {
                                                                 border_control()
                                                             })
-                                                            .text_size(px(11.))
+                                                            .text_size(sp(11.))
                                                             .text_color(rgb(if on {
                                                                 accent_line()
                                                             } else {
@@ -20962,7 +22741,7 @@ impl Laika {
                                         .child(
                                             div()
                                                 .mt(px(8.))
-                                                .text_size(px(11.))
+                                                .text_size(sp(11.))
                                                 .text_color(rgb(TEXT_TERTIARY))
                                                 .child("SIZES EMITTED"),
                                         )
@@ -20982,7 +22761,7 @@ impl Laika {
                                                         border_control()
                                                     })
                                                     .font_family(SANS)
-                                                    .text_size(px(10.5))
+                                                    .text_size(sp(10.5))
                                                     .text_color(rgb(if on {
                                                         accent_line()
                                                     } else {
@@ -21093,7 +22872,7 @@ impl Laika {
                                 .border_color(hairline())
                                 .rounded(px(3.))
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .line_height(relative(1.75))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child(form.command_preview()),
@@ -21109,7 +22888,7 @@ impl Laika {
                                 .child(
                                     div()
                                         .font_family(SANS)
-                                        .text_size(px(10.5))
+                                        .text_size(sp(10.5))
                                         .text_color(rgb(TEXT_DIM))
                                         // U01: no fabricated deploys.
                                         .child("no deploys yet"),
@@ -21117,7 +22896,7 @@ impl Laika {
                                 .child(
                                     div()
                                         .font_family(SANS)
-                                        .text_size(px(10.))
+                                        .text_size(sp(10.))
                                         .text_color(rgb(TEXT_DIMMER))
                                         .child(
                                             "gallery build and deploy are not wired in this prototype",
@@ -21133,7 +22912,7 @@ impl Laika {
                                             .px(px(16.))
                                             .py(px(9.))
                                             .rounded(px(3.))
-                                            .text_size(px(11.))
+                                            .text_size(sp(11.))
                                             .text_color(rgb(TEXT_DIM))
                                             .hover(|st| st.bg(rgb(bg_row_hover())))
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -21149,7 +22928,7 @@ impl Laika {
                                             .rounded(px(3.))
                                             .border_1()
                                             .border_color(border_control())
-                                            .text_size(px(11.))
+                                            .text_size(sp(11.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(rgb(TEXT_DIMMER))
                                             .child("Build only"),
@@ -21160,7 +22939,7 @@ impl Laika {
                                             .py(px(9.))
                                             .rounded(px(3.))
                                             .bg(rgb(bg_segment_shell()))
-                                            .text_size(px(11.5))
+                                            .text_size(sp(11.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(TEXT_DIMMER))
                                             .child("Build & deploy"),
@@ -21315,7 +23094,7 @@ impl Laika {
             .gap(px(10.))
             .child(
                 div()
-                    .text_size(px(15.))
+                    .text_size(sp(15.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT_PRIMARY))
                     .child(format!("Synchronize {}", r.scope)),
@@ -21323,7 +23102,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child(format!(
                         "{} new · {} missing · {} changed",
@@ -21387,7 +23166,7 @@ impl Laika {
         col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child("removals drop catalog rows only — files are already gone"),
         )
@@ -21442,13 +23221,13 @@ impl Laika {
                         .items_center()
                         .justify_center()
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(accent_on_fill()))
                         .child(if on { "✓" } else { "" }.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(title),
                 ),
@@ -21458,7 +23237,7 @@ impl Laika {
                 div()
                     .pl(px(24.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIMMER))
                     .child(name),
             );
@@ -21490,7 +23269,7 @@ impl Laika {
                 .min_w(px(420.))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(sp(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child(format!(
@@ -21500,7 +23279,7 @@ impl Laika {
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(format!(
                             "{} still holds photos. Removing the folder requires choosing what happens to them.",
@@ -21596,7 +23375,7 @@ impl Laika {
                 .px(px(14.))
                 .py(px(7.))
                 .rounded(px(5.))
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_DIM }))
                 .when(on, |d| d.bg(rgb(bg_segment_active())))
@@ -21615,14 +23394,14 @@ impl Laika {
                 } else {
                     border_control()
                 })
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_MUTED }))
                 .hover(|st| st.bg(rgb(bg_row_hover())))
                 .child(label)
         };
         let hint = |text: String| {
             div()
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .line_height(relative(1.4))
                 .text_color(rgb(TEXT_DIM))
                 .child(text)
@@ -21633,7 +23412,7 @@ impl Laika {
                 .px(px(12.))
                 .py(px(6.))
                 .rounded(px(5.))
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .when(primary, |d| {
                     d.bg(rgb(accent_fill()))
                         .font_weight(FontWeight::SEMIBOLD)
@@ -21692,7 +23471,7 @@ impl Laika {
                     .child(
                         div()
                             .w(px(120.))
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_DIM))
                             .child("Connect with"),
                     )
@@ -21763,12 +23542,22 @@ impl Laika {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(url.unwrap_or_else(|| "enter server and share".to_string())),
                             ),
                     )
-                    .child(self.backup_field(F::SharePath, "Mounted folder", &s.share_path, "/Volumes/photos", cx))
+                    .child(self.backup_field(
+                        F::SharePath,
+                        "Mounted folder",
+                        &s.share_path,
+                        if cfg!(target_os = "windows") {
+                            r"\\server\photos"
+                        } else {
+                            "/Volumes/photos"
+                        },
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -21802,7 +23591,7 @@ impl Laika {
                             div()
                                 .w(px(120.))
                                 .flex_none()
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("Secret"),
                         )
@@ -21838,7 +23627,7 @@ impl Laika {
                         .justify_between()
                         .child(
                             div()
-                                .text_size(px(16.))
+                                .text_size(sp(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .child("Backup"),
@@ -21873,7 +23662,7 @@ impl Laika {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .line_height(relative(1.35))
                                 .text_color(rgb(if error { 0xE56060 } else { TEXT_SECONDARY }))
                                 .child(if self.sync_configured() && !error {
@@ -21895,6 +23684,18 @@ impl Laika {
                             button("sync-modal-now", "Back up now".to_string(), true)
                                 .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
                         )
+                        .when(queued + self.sync_inflight > 0, |d| {
+                            d.child(
+                                button(
+                                    "sync-modal-pause",
+                                    if self.sync_paused { "Resume" } else { "Pause" }.to_string(),
+                                    false,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_sync_pause(cx)
+                                })),
+                            )
+                        })
                         .when(failed > 0, |d| {
                             d.child(
                                 button("sync-modal-retry", format!("Retry {failed} failed"), false)
@@ -21934,7 +23735,7 @@ impl Laika {
                 div()
                     .w(px(120.))
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .text_color(rgb(TEXT_DIM))
                     .child(label),
             )
@@ -22062,7 +23863,7 @@ fn tl_row(
             div().h(px(20.)).flex().items_center().pl(px(24.)).child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(accent_line()))
                     .child(format!("◈ {name} · {count}")),
             )
@@ -22107,7 +23908,7 @@ fn tl_banner(
             .justify_center()
             .rounded(px(3.))
             .font_family(SANS)
-            .text_size(px(12.))
+            .text_size(sp(12.))
             .text_color(rgb(TEXT_TERTIARY))
             .hover(|s| s.bg(rgb(bg_row_hover())).text_color(rgb(TEXT_PRIMARY)))
             .on_click(move |_, _, _| {
@@ -22126,14 +23927,14 @@ fn tl_banner(
             div()
                 .font_family(SANS)
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(size))
+                .text_size(sp(size))
                 .text_color(rgb(TEXT_PRIMARY))
                 .child(title.to_string()),
         )
         .child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child(sub.to_string()),
         )
@@ -22157,6 +23958,23 @@ fn grid_cell(
     let style = c.style;
     let badges = c.badges;
     let full = c.full;
+    let selected = c.selected;
+    let sync_label = c.sync_label;
+    let flag_label = if c.picked {
+        "picked"
+    } else if c.rejected {
+        "rejected"
+    } else {
+        "unflagged"
+    };
+    let accessible = format!(
+        "{}, {}, {} stars, {}, {}",
+        c.filename,
+        if selected { "selected" } else { "not selected" },
+        c.stars,
+        flag_label,
+        sync_label
+    );
     // The type label ends the badge row (beside KW/EDIT); compact cells
     // have no row, so there it sits on the image's bottom-right corner.
     let kind_on_image = !c.kind.is_empty() && style == CellStyle::Compact;
@@ -22171,12 +23989,16 @@ fn grid_cell(
         div()
             .font_family(SANS)
             .font_weight(FontWeight::MEDIUM)
-            .text_size(px(9.))
+            .text_size(sp(9.))
             .text_color(rgb(color))
             .child(text)
     };
     div()
         .id(("cell", c.id as usize))
+        .role(Role::GridCell)
+        .aria_label(accessible)
+        .aria_selected(selected)
+        .when(selected, |d| d.aria_active_descendant())
         .flex_1()
         .min_w_0()
         .relative()
@@ -22250,21 +24072,38 @@ fn grid_cell(
             }
             .children(kind_chip_img),
         )
+        .when(selected, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .right(px(4.))
+                    .top(px(4.))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded(px(2.))
+                    .bg(rgba(0x000000CC))
+                    .font_family(SANS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(sp(8.5))
+                    .text_color(rgb(0xFFFFFF))
+                    .child("✓ SELECTED"),
+            )
+        })
         .child({
-            // V16: compact cells are image-only with a corner flag dot;
+            // V16: compact cells are image-only with concise text badges;
             // expanded cells carry the overlay text plus enabled badges
             // (collapsed to flag + rating past 10 columns, by rule).
             if style == CellStyle::Compact {
-                let dot = if c.picked {
-                    Some(accent_line())
+                let flag = if c.picked {
+                    Some(("PICK", accent_line()))
                 } else if c.rejected {
-                    Some(0xE56060)
+                    Some(("REJ", 0xE56060))
                 } else {
                     None
                 };
-                // V13: the label swatch sits beside the flag dot.
+                // V13: the label swatch sits beside the textual flag.
                 let label = (badges.label && c.label > 0).then_some(c.label);
-                if dot.is_none() && label.is_none() {
+                if flag.is_none() && label.is_none() && !badges.sync {
                     div().into_any_element()
                 } else {
                     div()
@@ -22273,8 +24112,11 @@ fn grid_cell(
                         .top(px(5.))
                         .flex()
                         .gap(px(3.))
-                        .children(dot.map(|color| div().size(px(7.)).rounded_full().bg(rgb(color))))
+                        .children(flag.map(|(text, color)| badge(text.to_string(), color)))
                         .children(label.map(|l| collections::label_swatch(l, 7.)))
+                        .when(badges.sync, |d| {
+                            d.child(badge(sync_label.to_uppercase(), c.dot))
+                        })
                         .into_any_element()
                 }
             } else {
@@ -22286,9 +24128,9 @@ fn grid_cell(
                         .flex()
                         .flex_col()
                         .px(px(3.))
-                        .pt(px(CAPTION_PAD_TOP))
-                        .pb(px(CAPTION_PAD_BOTTOM))
-                        .gap(px(CAPTION_GAP)),
+                        .pt(sp(CAPTION_PAD_TOP))
+                        .pb(sp(CAPTION_PAD_BOTTOM))
+                        .gap(sp(CAPTION_GAP)),
                     None => div()
                         .flex()
                         .flex_col()
@@ -22302,11 +24144,11 @@ fn grid_cell(
                 for i in 0..slots {
                     bar = bar.child(
                         div()
-                            .when(below.is_some(), |d| d.h(px(CAPTION_LINE_H)))
+                            .when(below.is_some(), |d| d.h(sp(CAPTION_LINE_H)))
                             .truncate()
                             .font_family(SANS)
                             .font_weight(FontWeight::MEDIUM)
-                            .text_size(px(9.5))
+                            .text_size(sp(9.5))
                             .text_color(rgb(if below.is_some() {
                                 TEXT_TERTIARY
                             } else {
@@ -22319,7 +24161,7 @@ fn grid_cell(
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .when(below.is_some(), |d| d.h(px(CAPTION_LINE_H)));
+                    .when(below.is_some(), |d| d.h(sp(CAPTION_LINE_H)));
                 // U17 offline state always shows (safety, not a badge).
                 if c.offline {
                     row = row.child(badge("OFFLINE".to_string(), 0xE56060));
@@ -22362,13 +24204,13 @@ fn grid_cell(
                     row = row.child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(9.))
+                            .text_size(sp(9.))
                             .text_color(rgb(WARNING))
                             .child("\u{2605}".repeat(c.stars.min(5) as usize)),
                     );
                 }
                 if badges.sync {
-                    row = row.child(div().size(px(5.)).rounded_full().bg(rgb(c.dot)));
+                    row = row.child(badge(sync_label.to_uppercase(), c.dot));
                 }
                 if !kind_on_image && !c.kind.is_empty() {
                     row = row
@@ -22418,7 +24260,7 @@ fn kind_chip(kind: &str) -> Div {
         .bg(rgba(0x000000B3))
         .font_family(SANS)
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(8.5))
+        .text_size(sp(8.5))
         .text_color(rgb(0xDEE4EA))
         .child(kind.to_string())
 }
@@ -22821,6 +24663,10 @@ fn name_ctx_for_entry(
 
 impl Render for Laika {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // S02: stored presets load once per catalog.
+        self.ensure_presets();
+        // S03: sharing policy + the shared-sidecar watch.
+        self.ensure_coexist(cx);
         // U21: a new generation per frame — the filtered order computes
         // once no matter how many views read it.
         self.render_gen.set(self.render_gen.get().wrapping_add(1));
@@ -22903,9 +24749,14 @@ impl Render for Laika {
         // U07: debounced native-detail refresh while zoomed.
         self.poll_detail(cx);
         // Kicks are guarded no-ops when already loaded/loading.
-        if self.view == ViewMode::Loupe && !self.slides.active() {
+        if matches!(self.view, ViewMode::Loupe | ViewMode::Compare) && !self.slides.active() {
             if let Some(id) = self.state.primary {
                 self.kick_large_load(id, cx);
+            }
+            if self.view == ViewMode::Compare {
+                if let Some(id) = self.review.candidate {
+                    self.kick_large_load(id, cx);
+                }
             }
         }
         if self.state.active_module == Module::Develop {
@@ -22927,6 +24778,36 @@ impl Render for Laika {
                     }
                     let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
                     e.update(cx, |this, cx| {
+                        // U22: rail splitters resize live; the final width is
+                        // persisted once on mouse-up, never on every pixel.
+                        if let Some(resize) = this.rail_resize {
+                            if ev.pressed_button == Some(MouseButton::Left) {
+                                let delta = pos.0 - resize.start_x;
+                                match resize.side {
+                                    RailSide::Left => {
+                                        this.left_rail_width =
+                                            (resize.start_width + delta).clamp(168., 420.)
+                                    }
+                                    RailSide::Right => {
+                                        this.right_rail_width =
+                                            (resize.start_width - delta).clamp(220., 460.)
+                                    }
+                                }
+                                cx.notify();
+                            } else {
+                                this.rail_resize = None;
+                                let left = this.left_rail_width.round() as u16;
+                                let right = this.right_rail_width.round() as u16;
+                                this.set_prefs(
+                                    move |p| {
+                                        p.left_rail_width = left;
+                                        p.right_rail_width = right;
+                                    },
+                                    cx,
+                                );
+                            }
+                            return;
+                        }
                         // U04: hover requests surface on the next mouse move;
                         // a moved mouse dismisses a stale tip.
                         if let Some(text) = hover_tip.take() {
@@ -22942,6 +24823,13 @@ impl Render for Laika {
                                 cx.notify();
                                 return;
                             }
+                        }
+                        if this.map_mouse_move(
+                            pos,
+                            ev.pressed_button == Some(MouseButton::Left),
+                            cx,
+                        ) {
+                            return;
                         }
                         // G08/G09: gallery drags, resizes, and sliders.
                         if this.gallery_mouse_move(
@@ -23136,6 +25024,21 @@ impl Render for Laika {
                     if phase == DispatchPhase::Bubble {
                         let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
                         e.update(cx, |this, cx| {
+                            if this.rail_resize.take().is_some() {
+                                let left = this.left_rail_width.round() as u16;
+                                let right = this.right_rail_width.round() as u16;
+                                this.set_prefs(
+                                    move |p| {
+                                        p.left_rail_width = left;
+                                        p.right_rail_width = right;
+                                    },
+                                    cx,
+                                );
+                                return;
+                            }
+                            if this.map_mouse_up(pos, cx) {
+                                this.suppress_click = true;
+                            }
                             // G08: finish a gallery gesture.
                             if this.gallery_mouse_up(pos, cx) {
                                 this.suppress_click = true;
@@ -23242,6 +25145,7 @@ impl Render for Laika {
             Some(match self.state.active_module {
                 Module::Library => self.library(window, cx),
                 Module::Develop => self.develop(window, cx),
+                Module::Map => self.map_module(window, cx),
                 Module::Publish => self.publish_module(window, cx),
             })
         };
@@ -23288,15 +25192,29 @@ impl Render for Laika {
                 // U04: modal dialogs own the keyboard. Fields get full
                 // editing; every other key is swallowed so photo commands
                 // never fire behind a dialog.
+                // S04: the command palette owns the keyboard while open.
+                if this.palette.open {
+                    if !this.palette_key(key, window, cx) {
+                        this.field_key(key, shift, cmd, key_char, None, cx);
+                    }
+                    return;
+                }
                 if this.publish_open
                     || this.diag.about_open
                     || this.diag.welcome_open
                     || this.diag.problem_open
                     || this.sync_open
                     || this.export_open
+                    || this.exit_bundle.open
                     || this.help_open
                     || this.settings_open
                     || this.apple.open
+                    || this.lr.open
+                    || this.presets.import.is_some()
+                    || this.presets.editor.is_some()
+                    || this.batch.copy.is_some()
+                    || this.coexist.conflicts_open
+                    || this.guide.open
                     || this.manage_open
                     || this.kw_open
                     || this.confirm.is_some()
@@ -23445,6 +25363,18 @@ impl Render for Laika {
                 if this.gallery_key(key, shift, cmd, cx) {
                     return;
                 }
+                if !cmd && this.map_key(key, cx) {
+                    return;
+                }
+                // S04: find any command (Laika or Lightroom names).
+                if cmd && shift && key == "p" {
+                    this.open_palette(cx);
+                    return;
+                }
+                // S04: Lightroom Classic keyboard map, when chosen.
+                if this.lightroom_key(key, cmd, shift, ev.keystroke.modifiers.alt, window, cx) {
+                    return;
+                }
                 // Cmd/Ctrl shortcuts first so `cmd-d` can't fall through to
                 // the Develop module key.
                 if cmd {
@@ -23471,6 +25401,8 @@ impl Render for Laika {
                 }
                 match key {
                     "g" => this.run_command(commands::Command::ViewGrid, window, cx),
+                    "c" => this.run_command(commands::Command::ViewCompare, window, cx),
+                    "n" => this.run_command(commands::Command::ViewSurvey, window, cx),
                     "e" => {
                         // V28: Shift+E repeats the last export; plain E is Loupe.
                         let cmd = if shift {
@@ -23507,6 +25439,7 @@ impl Render for Laika {
                     "z" => this.cycle_zoom(cx),
                     // V18: capture-ordered timeline (T switches, plain like G/E).
                     "t" => this.run_command(commands::Command::ViewTimeline, window, cx),
+                    "m" => this.run_command(commands::Command::Map, window, cx),
                     // V17: flush thumbnail wall (W toggles, back to last view).
                     "w" => this.run_command(commands::Command::ViewWall, window, cx),
                     // U06: auto-advance toggle for keyboard-first culling.
@@ -23626,6 +25559,9 @@ impl Render for Laika {
                 d.child(self.publish_modal(window, cx))
             })
             .when(self.export_open, |d| d.child(self.export_modal(window, cx)))
+            .when(self.exit_bundle.open, |d| {
+                d.child(self.exit_bundle_modal(cx))
+            })
             .when(self.sync_open, |d| d.child(self.sync_modal(window, cx)))
             .when(self.help_open, |d| d.child(self.help_modal(window, cx)))
             .when(self.settings_open, |d| {
@@ -23637,6 +25573,22 @@ impl Render for Laika {
                 d.child(self.catalog_problem_screen(cx))
             })
             .when(self.apple.open, |d| d.child(self.apple_modal(window, cx)))
+            .when(self.lr.open, |d| d.child(self.lightroom_modal(cx)))
+            .when(self.coexist.conflicts_open, |d| {
+                d.child(self.conflicts_modal(cx))
+            })
+            .children(self.toast_overlay())
+            .when(self.guide.open, |d| d.child(self.lightroom_guide_modal(cx)))
+            .when(self.palette.open, |d| d.child(self.palette_modal(cx)))
+            .when(self.presets.import.is_some(), |d| {
+                d.child(self.preset_import_modal(cx))
+            })
+            .when(self.presets.editor.is_some(), |d| {
+                d.child(self.preset_editor_modal(cx))
+            })
+            .when(self.batch.copy.is_some(), |d| {
+                d.child(self.copy_settings_modal(cx))
+            })
             .when(self.rename_open, |d| d.child(self.rename_modal(window, cx)))
             .when(self.manage_open, |d| d.child(self.manage_modal(window, cx)))
             .when(self.kw_open, |d| d.child(self.kw_modal(window, cx)))
@@ -23675,7 +25627,7 @@ impl Laika {
                 .py(px(6.))
                 .rounded(px(3.))
                 .font_family(SANS)
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(if enabled { TEXT_PRIMARY } else { TEXT_DIMMER }))
                 .when(enabled, |d| d.hover(|s| s.bg(rgb(bg_row_hover()))))
                 .child(label)
@@ -23700,7 +25652,7 @@ impl Laika {
                     .justify_center()
                     .rounded(px(3.))
                     .font_family(SANS)
-                    .text_size(px(13.))
+                    .text_size(sp(13.))
                     .text_color(rgb(if on {
                         WARNING
                     } else if current {
@@ -23751,7 +25703,7 @@ impl Laika {
                     .pt(px(6.))
                     .pb(px(2.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .truncate()
                     .child(photo.filename.clone()),
@@ -23781,7 +25733,7 @@ impl Laika {
                 .py(px(6.))
                 .rounded(px(3.))
                 .font_family(SANS)
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(TEXT_PRIMARY))
                 .when(coll_open, |d| d.bg(rgb(bg_row_hover())))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
@@ -23798,17 +25750,19 @@ impl Laika {
                 .child("Add to Collection")
                 .child(div().text_color(rgb(TEXT_DIM)).child("\u{203A}")),
         );
-        menu = menu.child(
-            item("ctx-apple", "Add to Apple Photos".to_string(), true).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.close_context_menu();
-                    this.menu_target(pid, cx);
-                    let ids: Vec<i64> = this.state.selection.iter().copied().collect();
-                    this.add_to_apple(ids, cx);
-                    cx.notify();
-                },
-            )),
-        );
+        if cfg!(target_os = "macos") {
+            menu = menu.child(
+                item("ctx-apple", "Add to Apple Photos".to_string(), true).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.close_context_menu();
+                        this.menu_target(pid, cx);
+                        let ids: Vec<i64> = this.state.selection.iter().copied().collect();
+                        this.add_to_apple(ids, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         if in_library {
             menu = menu.child(
                 item("ctx-develop", "Open in Develop".to_string(), true).on_click(cx.listener(
@@ -23830,7 +25784,7 @@ impl Laika {
                 item("ctx-copy", "Copy Settings".to_string(), true).on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.close_context_menu();
-                        this.copy_settings_from(pid);
+                        this.copy_settings_from(pid, cx);
                         cx.notify();
                     },
                 )),
@@ -23860,7 +25814,7 @@ impl Laika {
             } else {
                 (left - FW - 2.).max(6.)
             };
-            let rows = self.coll.list.len() as f32 * 28. + 60.;
+            let rows = self.coll.list.iter().filter(|c| !c.smart).count() as f32 * 28. + 60.;
             let fy = (top + 96.).min(vp.height.as_f32() - rows - 6.).max(6.);
             let target = self.target_collection().map(|c| c.id);
             let mut fly = div()
@@ -23878,7 +25832,7 @@ impl Laika {
                 .border_1()
                 .border_color(border_control())
                 .shadow_lg();
-            for (i, c) in self.coll.list.iter().enumerate() {
+            for (i, c) in self.coll.list.iter().filter(|c| !c.smart).enumerate() {
                 let cid = c.id;
                 // Read membership directly: `in_collection` keeps a single
                 // cache slot that the grid filter depends on.
@@ -23904,7 +25858,7 @@ impl Laika {
                         .py(px(6.))
                         .rounded(px(3.))
                         .font_family(SANS)
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .text_color(rgb(TEXT_PRIMARY))
                         .hover(|s| s.bg(rgb(bg_row_hover())))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -23923,7 +25877,7 @@ impl Laika {
                         .when(target == Some(cid), |d| {
                             d.child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(sp(10.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child("B"),
                             )
@@ -23938,7 +25892,7 @@ impl Laika {
                     .pl(px(30.))
                     .rounded(px(3.))
                     .font_family(SANS)
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .text_color(rgb(TEXT_PRIMARY))
                     .hover(|s| s.bg(rgb(bg_row_hover())))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -24001,22 +25955,8 @@ impl Laika {
 
     /// Copy a specific photo's develop settings (live values for the
     /// primary, stored params otherwise).
-    fn copy_settings_from(&mut self, pid: i64) {
-        let params = if Some(pid) == self.state.primary {
-            self.values
-        } else {
-            self.state
-                .edits
-                .get(&pid)
-                .map(|e| e.params)
-                .unwrap_or_else(edit::defaults)
-        };
-        self.state.clipboard = Some(params);
-        let name = self
-            .find(pid)
-            .map(|p| p.filename.clone())
-            .unwrap_or_default();
-        self.status_note = format!("settings copied from {name}");
+    fn copy_settings_from(&mut self, pid: i64, cx: &mut Context<Self>) {
+        self.open_copy_settings(pid, cx);
     }
 
     /// U04: hover tooltip overlay near the cursor (clamped into the
@@ -24039,7 +25979,7 @@ impl Laika {
             .border_color(border_control())
             .rounded(px(3.))
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(TEXT_SECONDARY))
             .child(text)
     }
@@ -24061,7 +26001,7 @@ impl Laika {
             .px(px(12.))
             .py(px(7.))
             .rounded(px(3.))
-            .text_size(px(11.5));
+            .text_size(sp(11.5));
         let styled = if primary {
             base.bg(rgb(accent_fill()))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -24107,13 +26047,13 @@ impl Laika {
                     .items_center()
                     .justify_center()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(accent_on_fill()))
                     .child(if on { "✓" } else { "" }.to_string()),
             )
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(label),
             )
@@ -24129,42 +26069,43 @@ impl Laika {
         };
         let title = match d.stage {
             ImportStage::Pick => "Add/Import Photos — choose a source",
-            ImportStage::Scanning => "Add/Import Photos — scanning",
             ImportStage::Review => "Add/Import Photos — review",
             ImportStage::Running => "Add/Import Photos — copying",
             ImportStage::Done => "Add/Import Photos — done",
         };
         let body: Div = match d.stage {
             ImportStage::Pick => self.import_pick(window, cx),
-            ImportStage::Scanning => self.import_scanning(cx),
             ImportStage::Review => self.import_review(window, cx),
             ImportStage::Running => self.import_running(window, cx),
             ImportStage::Done => self.import_done(cx),
         };
         let review = d.stage == ImportStage::Review;
-        modal::modal_shell(
+        let shell = div().flex().flex_col().gap(px(12.)).p(px(22.)).child(
             div()
-                .flex()
-                .flex_col()
-                .gap(px(12.))
-                .p(px(22.))
-                .min_w(px(if review { 860. } else { 560. }))
-                .max_w(px(if review { 920. } else { 640. }))
-                .max_h(px(840.))
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT_PRIMARY))
-                        .child(title.to_string()),
-                )
-                .child(
-                    div()
-                        .id("import-body-scroll")
-                        .max_h(px(770.))
-                        .overflow_scroll()
-                        .child(body),
-                ),
+                .text_size(sp(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT_PRIMARY))
+                .child(title.to_string()),
+        );
+        if review {
+            // Review: gallery and options scroll side by side inside a
+            // fixed-height dialog (never a scroll area inside a scroll area).
+            let h = (window.viewport_size().height.as_f32() - 60.).clamp(520., 820.);
+            return modal::modal_shell(
+                shell
+                    .w(px(980.))
+                    .h(px(h))
+                    .child(div().flex_1().min_h_0().child(body)),
+            );
+        }
+        modal::modal_shell(
+            shell.min_w(px(560.)).max_w(px(640.)).max_h(px(840.)).child(
+                div()
+                    .id("import-body-scroll")
+                    .max_h(px(770.))
+                    .overflow_scroll()
+                    .child(body),
+            ),
         )
     }
 
@@ -24180,7 +26121,7 @@ impl Laika {
             rows = rows.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("no removable volumes found — insert a card or choose a folder"),
             );
@@ -24193,7 +26134,7 @@ impl Laika {
                     .rounded(px(3.))
                     .bg(rgba(0xE5606018))
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(0xE56060))
                     .child(d.source_error.clone()),
             );
@@ -24223,14 +26164,14 @@ impl Laika {
                             .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(TEXT_PRIMARY))
                                     .child(format!("{} · card", v.label)),
                             )
                             .child(
                                 div()
                                     .font_family(SANS)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(format!(
                                         "{} free of {} · {}",
@@ -24247,7 +26188,7 @@ impl Laika {
                             .rounded(px(3.))
                             .bg(rgb(accent_fill()))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .text_color(rgb(accent_on_fill()))
                             .child("Select SD card"),
                     ),
@@ -24283,7 +26224,7 @@ impl Laika {
         .child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child("cards import with verified copy · folders add in place"),
         )
@@ -24300,43 +26241,6 @@ impl Laika {
         ))
     }
 
-    /// Scanning stage: cancellable progress.
-    fn import_scanning(&self, cx: &mut Context<Self>) -> Div {
-        let d = self.import_dialog.as_ref().expect("dialog");
-        let label = if d.scanning_total > 0 {
-            format!(
-                "checking photos {} / {} · dates and import history",
-                d.scanning_done, d.scanning_total
-            )
-        } else {
-            "listing files…".to_string()
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(
-                div()
-                    .font_family(SANS)
-                    .text_size(px(11.))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(format!("{} · {}", d.source_label, label)),
-            )
-            .child(self.dlg_btn(
-                "import-scan-cancel",
-                "Cancel".to_string(),
-                false,
-                cx,
-                |this, cx| {
-                    if let Some(d) = this.import_dialog.as_mut() {
-                        d.cancel.store(true, Ordering::Relaxed);
-                    }
-                    cx.notify();
-                },
-            ))
-    }
-
-    /// Review stage: counts, dates, thumbnails, mode, destination, policy.
     fn import_review(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let d = self.import_dialog.as_ref().expect("dialog");
         let n = d.entries.len();
@@ -24356,39 +26260,52 @@ impl Laika {
             None => "dates unknown".to_string(),
         };
         let kind = if d.is_card { "card" } else { "folder" };
-        let mut col = div()
+        let col = div().size_full().flex().flex_col().gap(px(10.)).child(
+            div()
+                .font_family(SANS)
+                .text_size(sp(11.))
+                .line_height(relative(1.7))
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(format!("{} · {kind}", d.source_label))
+                .when(d.scanning, |dd| {
+                    dd.child(if d.scanning_total == 0 {
+                        "listing files…".to_string()
+                    } else {
+                        format!(
+                            "checking {} / {} · {} already known from earlier scans",
+                            d.scanning_done, d.scanning_total, d.scan_reused
+                        )
+                    })
+                })
+                .child(format!(
+                    "{n} photos ({} RAW) · {} · {dates}",
+                    raw,
+                    fmt_bytes(bytes)
+                ))
+                .when(d.thumb_count < n, |dd| {
+                    dd.child(format!(
+                        "previews loading in background · {} / {} ready",
+                        d.thumb_count, n
+                    ))
+                })
+                .when(d.is_card, |dd| {
+                    dd.child(format!("{new} new · {imported} previously imported"))
+                })
+                .when(d.skipped.0 > 0, |dd| {
+                    dd.child(format!(
+                        "{} unsupported skipped ({})",
+                        d.skipped.0,
+                        d.skipped.1.join(", ")
+                    ))
+                }),
+        );
+        let gallery_col = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .child(
-                div()
-                    .font_family(SANS)
-                    .text_size(px(11.))
-                    .line_height(relative(1.7))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(format!("{} · {kind}", d.source_label))
-                    .child(format!(
-                        "{n} photos ({} RAW) · {} · {dates}",
-                        raw,
-                        fmt_bytes(bytes)
-                    ))
-                    .when(d.thumb_count < n, |dd| {
-                        dd.child(format!(
-                            "previews loading in background · {} / {} ready",
-                            d.thumb_count, n
-                        ))
-                    })
-                    .when(d.is_card, |dd| {
-                        dd.child(format!("{new} new · {imported} previously imported"))
-                    })
-                    .when(d.skipped.0 > 0, |dd| {
-                        dd.child(format!(
-                            "{} unsupported skipped ({})",
-                            d.skipped.0,
-                            d.skipped.1.join(", ")
-                        ))
-                    }),
-            )
+            .gap(px(8.))
             .child(section_header::section_header(
                 "Photos on source",
                 false,
@@ -24400,7 +26317,7 @@ impl Laika {
                     .items_center()
                     .gap(px(14.))
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(format!("● {new} new — full opacity"))
                     .when(imported > 0, |dd| {
@@ -24409,86 +26326,95 @@ impl Laika {
             )
             .child(
                 div()
+                    // The only scroller over the gallery: nested scroll
+                    // areas all move together in GPUI, so the options sit
+                    // beside it in their own column instead of around it.
                     .id("import-gallery-scroll")
-                    .max_h(px(300.))
-                    .overflow_scroll()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(8.))
-                    .children(self.review_thumbs.iter().filter_map(|preview| {
-                        let entry = d.entries.get(preview.entry_index)?;
-                        let seen = entry.previously_imported;
-                        let filename = entry
-                            .path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("photo")
-                            .to_string();
-                        let image = match &preview.image {
-                            Some(image) => div()
-                                .h(px(82.))
-                                .w_full()
-                                .overflow_hidden()
-                                .when(seen, |image| image.opacity(0.38))
-                                .child(
-                                    img(ImageSource::Render(image.clone()))
-                                        .size_full()
-                                        .object_fit(ObjectFit::Cover),
-                                ),
-                            None => div()
-                                .h(px(82.))
-                                .w_full()
-                                .bg(linear_gradient(
-                                    160.,
-                                    linear_color_stop(
-                                        rgb(placeholder_tint(&entry.content_hash).0),
-                                        0.,
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_wrap().gap(px(8.)).pb(px(8.)).children(
+                        self.review_thumbs.iter().filter_map(|preview| {
+                            let entry = d.entries.get(preview.entry_index)?;
+                            let seen = entry.previously_imported;
+                            let filename = entry
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("photo")
+                                .to_string();
+                            let image = match &preview.image {
+                                Some(image) => div()
+                                    .h(px(82.))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .when(seen, |image| image.opacity(0.38))
+                                    .child(
+                                        img(ImageSource::Render(image.clone()))
+                                            .size_full()
+                                            .object_fit(ObjectFit::Cover),
                                     ),
-                                    linear_color_stop(
-                                        rgb(placeholder_tint(&entry.content_hash).1),
-                                        1.,
-                                    ),
-                                ))
-                                .when(seen, |image| image.opacity(0.38)),
-                        };
-                        Some(
-                            div()
-                                .w(px(132.))
-                                .flex_none()
-                                .overflow_hidden()
-                                .rounded(px(3.))
-                                .border_1()
-                                .border_color(if seen { hairline() } else { border_control() })
-                                .child(image)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(4.))
-                                        .px(px(6.))
-                                        .py(px(5.))
-                                        .font_family(SANS)
-                                        .text_size(px(9.))
-                                        .text_color(rgb(if seen {
-                                            TEXT_DIMMER
-                                        } else {
-                                            TEXT_SECONDARY
-                                        }))
-                                        .child(div().flex_1().min_w_0().truncate().child(filename))
-                                        .child(
-                                            div()
-                                                .text_color(rgb(if seen {
-                                                    TEXT_DIMMER
-                                                } else {
-                                                    accent_line()
-                                                }))
-                                                .child(if seen { "IMPORTED" } else { "NEW" }),
+                                None => div()
+                                    .h(px(82.))
+                                    .w_full()
+                                    .bg(linear_gradient(
+                                        160.,
+                                        linear_color_stop(
+                                            rgb(placeholder_tint(&entry.content_hash).0),
+                                            0.,
                                         ),
-                                ),
-                        )
-                    })),
-            )
+                                        linear_color_stop(
+                                            rgb(placeholder_tint(&entry.content_hash).1),
+                                            1.,
+                                        ),
+                                    ))
+                                    .when(seen, |image| image.opacity(0.38)),
+                            };
+                            Some(
+                                div()
+                                    .w(px(132.))
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(if seen { hairline() } else { border_control() })
+                                    .child(image)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(4.))
+                                            .px(px(6.))
+                                            .py(px(5.))
+                                            .font_family(SANS)
+                                            .text_size(sp(9.))
+                                            .text_color(rgb(if seen {
+                                                TEXT_DIMMER
+                                            } else {
+                                                TEXT_SECONDARY
+                                            }))
+                                            .child(
+                                                div().flex_1().min_w_0().truncate().child(filename),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(if seen {
+                                                        TEXT_DIMMER
+                                                    } else {
+                                                        accent_line()
+                                                    }))
+                                                    .child(if seen { "IMPORTED" } else { "NEW" }),
+                                            ),
+                                    ),
+                            )
+                        }),
+                    )),
+            );
+        let mut opts = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
             .child(section_header::section_header("Mode", false, window))
             .child(div().flex().gap(px(8.)).children([
                 {
@@ -24512,14 +26438,14 @@ impl Laika {
                         }))
                         .child(
                             div()
-                                .text_size(px(11.5))
+                                .text_size(sp(11.5))
                                 .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                                 .child("Add in place"),
                         )
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child("leave files where they are"),
                         )
@@ -24545,14 +26471,14 @@ impl Laika {
                         }))
                         .child(
                             div()
-                                .text_size(px(11.5))
+                                .text_size(sp(11.5))
                                 .text_color(rgb(if on { accent_line() } else { TEXT_TERTIARY }))
                                 .child("Copy to folder"),
                         )
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child("verified copy, card untouched"),
                         )
@@ -24569,7 +26495,7 @@ impl Laika {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "None (optional second copy)".to_string());
-            col = col
+            opts = opts
                 .child(section_header::section_header("Destination", false, window))
                 .child(
                     div()
@@ -24580,7 +26506,7 @@ impl Laika {
                             div()
                                 .flex_1()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(dest_label),
                         )
@@ -24603,7 +26529,7 @@ impl Laika {
                             div()
                                 .flex_1()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child(format!("2nd copy: {second_label}")),
                         )
@@ -24623,9 +26549,9 @@ impl Laika {
                 );
             // V02: folder + rename templates with a live placed-path
             // preview (sanitized, exactly as written).
-            col = col.child(self.name_fields(true, self.import_name_preview(), window, cx));
+            opts = opts.child(self.name_fields(true, self.import_name_preview(), window, cx));
             if d.is_card {
-                col = col.child(self.dlg_check(
+                opts = opts.child(self.dlg_check(
                     "import-eject",
                     d.eject,
                     "Eject card when finished".to_string(),
@@ -24639,7 +26565,7 @@ impl Laika {
                 ));
             }
         }
-        col = col
+        opts = opts
             .child(section_header::section_header("Duplicates", false, window))
             .child(self.dlg_check(
                 "import-skipdup",
@@ -24654,7 +26580,7 @@ impl Laika {
                 },
             ));
         if d.is_card {
-            col = col.child(self.dlg_check(
+            opts = opts.child(self.dlg_check(
                 "import-newonly",
                 d.new_only,
                 format!("Import only new photos ({new} selected)"),
@@ -24667,11 +26593,35 @@ impl Laika {
                 },
             ));
         }
-        col = col.child(self.import_metadata_section(window, cx));
-        col.child(div().flex().gap(px(8.)).children([
+        opts = opts.child(self.import_metadata_section(window, cx));
+        col.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .gap(px(18.))
+                .child(gallery_col)
+                .child(
+                    div()
+                        .id("import-options-scroll")
+                        .w(px(360.))
+                        .flex_none()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .pr(px(6.))
+                        .child(opts),
+                ),
+        )
+        .child(div().flex().gap(px(8.)).children([
             self.dlg_btn(
                 "import-start",
-                if import_n == 0 {
+                if d.scanning {
+                    format!(
+                        "Checking {} / {}…",
+                        d.scanning_done,
+                        d.scanning_total.max(d.scanning_done)
+                    )
+                } else if import_n == 0 {
                     "No new photos to import".to_string()
                 } else {
                     format!("Import {import_n} photos")
@@ -24684,8 +26634,16 @@ impl Laika {
             ),
             self.dlg_btn("import-back", "Back".to_string(), false, cx, |this, cx| {
                 if let Some(d) = this.import_dialog.as_mut() {
+                    // Stops a scan still in progress.
+                    d.cancel.store(true, Ordering::Relaxed);
+                    d.scanning = false;
                     d.stage = ImportStage::Pick;
                     d.entries.clear();
+                }
+                for preview in this.review_thumbs.drain(..) {
+                    if let Some(image) = preview.image {
+                        this.stale.push(image);
+                    }
                 }
                 cx.notify();
             }),
@@ -24693,7 +26651,7 @@ impl Laika {
         .child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child("Enter starts the import · source files are never modified"),
         )
@@ -24738,7 +26696,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(format!("{done} / {total} · {current}")),
             )
@@ -24754,7 +26712,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(caption),
             )
@@ -24783,7 +26741,7 @@ impl Laika {
             .child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .line_height(relative(1.8))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(format!("{} · {} mode", rep.source_label, rep.mode_label))
@@ -24809,7 +26767,7 @@ impl Laika {
                 .map(|(name, err)| {
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(0xE56060))
                         .child(format!("{name}: {err}"))
                 })
@@ -24817,7 +26775,7 @@ impl Laika {
             col = col
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(format!("Failed ({}):", rep.failed.len())),
                 )
@@ -24826,7 +26784,7 @@ impl Laika {
                 col = col.child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_DIM))
                         .child(format!("…and {} more (see the log)", rep.failed.len() - 30)),
                 );
@@ -24837,7 +26795,7 @@ impl Laika {
             col = col.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child(
                         "re-run this import to retry failures — successes skip by hash".to_string(),
@@ -24872,7 +26830,7 @@ impl Laika {
                 .max_w(px(640.))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(sp(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child(format!(
@@ -24884,7 +26842,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("sidecars move with originals · collisions gain a suffix"),
                 )
@@ -24912,7 +26870,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_DIMMER))
                         .child("Enter applies · Esc closes"),
                 ),
@@ -24949,7 +26907,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_DIM))
                         .child(if open { "−" } else { "+" }.to_string()),
                 ),
@@ -24965,7 +26923,7 @@ impl Laika {
         let current = self.active_import_meta().preset.clone();
         col = col.child(
             div()
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .text_color(rgb(TEXT_TERTIARY))
                 .child("METADATA PRESET"),
         );
@@ -25000,7 +26958,7 @@ impl Laika {
                             text_input::FieldId::MdPresetName,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_DIM))
                                 .child("preset name…".to_string()),
                             false,
@@ -25065,7 +27023,7 @@ impl Laika {
                     .gap(px(10.))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_DIM))
                             .child(label.to_string()),
                     )
@@ -25074,7 +27032,7 @@ impl Laika {
                             id,
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .child(shown),
                             false,
@@ -25088,7 +27046,7 @@ impl Laika {
         col = col
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(sp(11.))
                     .text_color(rgb(TEXT_TERTIARY))
                     .child("DEVELOP PRESET"),
             )
@@ -25102,7 +27060,7 @@ impl Laika {
                 .gap(px(10.))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_DIM))
                         .child("Time offset (hours)".to_string()),
                 )
@@ -25111,7 +27069,7 @@ impl Laika {
                         text_input::FieldId::MdOffsetHours,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child({
                                 let m = self.active_import_meta().offset_min;
@@ -25130,7 +27088,7 @@ impl Laika {
         col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child("offset shifts sorting and folder names · file EXIF untouched"),
         )
@@ -25166,7 +27124,7 @@ impl Laika {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .text_color(rgb(if active {
                         accent_line()
                     } else {
@@ -25193,6 +27151,33 @@ impl Laika {
                 Some(name.to_string()),
                 name.to_string(),
                 current.as_deref() == Some(*name),
+                cx,
+            ));
+        }
+        // S02: stored presets, by group.
+        let mut last_group: Option<&str> = None;
+        for (k, p) in self.presets.user.iter().enumerate() {
+            if last_group != Some(p.group.as_str()) {
+                rows = rows.child(
+                    div()
+                        .pt(px(6.))
+                        .text_size(sp(10.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child(p.group.clone()),
+                );
+                last_group = Some(p.group.as_str());
+            }
+            let key = presets_ui::user_key(p.id);
+            let active = current.as_deref() == Some(key.as_str());
+            let label = match p.coverage() {
+                laika_core::presets::Coverage::Complete => p.name.clone(),
+                _ => format!("{} ≈", p.name),
+            };
+            rows = rows.child(self.dev_preset_row(
+                PRESETS.len() + 1 + k,
+                Some(key),
+                label,
+                active,
                 cx,
             ));
         }
@@ -25231,7 +27216,7 @@ impl Laika {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(11.5))
+                    .text_size(sp(11.5))
                     .text_color(rgb(if active {
                         accent_line()
                     } else {
@@ -25355,7 +27340,7 @@ impl Laika {
         col = col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .line_height(relative(1.8))
                 .text_color(rgb(TEXT_DIM))
                 .child(self.cache_dir.to_string_lossy().to_string())
@@ -25401,7 +27386,7 @@ impl Laika {
                         .border_1()
                         .border_color(border_control())
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .hover(|s| s.bg(rgb(bg_row_hover())))
                         .on_hover(self.tip(tip))
@@ -25413,7 +27398,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(text),
                 )
@@ -25426,7 +27411,7 @@ impl Laika {
                         .border_1()
                         .border_color(border_control())
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_SECONDARY))
                         .hover(|s| s.bg(rgb(bg_row_hover())))
                         .on_hover(self.tip(tip))
@@ -25481,7 +27466,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child(format!("{} of {} · {}", r.done, r.total, r.current)),
                 )
@@ -25501,7 +27486,7 @@ impl Laika {
         col.child(
             div()
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_DIMMER))
                 .child(
                     "smart previews enable offline editing; 1:1s speed 100% zoom ·                      eviction never removes offline smart files"
@@ -25571,7 +27556,7 @@ impl Laika {
                 .min_w(px(460.))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(sp(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child("Catalog".to_string()),
@@ -25579,7 +27564,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .line_height(relative(1.8))
                         .text_color(rgb(TEXT_DIM))
                         .child(db_label)
@@ -25595,7 +27580,7 @@ impl Laika {
                     d.child(
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(self.manage_note.clone()),
                     )
@@ -25618,6 +27603,19 @@ impl Laika {
                         cx,
                         |this, cx| {
                             this.open_restore_picker(cx);
+                        },
+                    ),
+                    self.dlg_btn(
+                        "manage-portable-bundle",
+                        "Export catalog + sidecars…".to_string(),
+                        false,
+                        cx,
+                        |this, cx| {
+                            this.open_folder_picker(
+                                PickerTarget::BundleDest,
+                                "Portable bundle destination",
+                                cx,
+                            );
                         },
                     ),
                     self.dlg_btn(
@@ -25781,7 +27779,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.))
+                        .text_size(sp(10.))
                         .text_color(rgb(TEXT_DIMMER))
                         .child("backups live beside the catalog · restores preserve first"),
                 ),
@@ -25816,6 +27814,33 @@ impl Laika {
                 self.manage_note = "no catalog is open".to_string();
             }
         }
+        cx.notify();
+    }
+
+    /// U26: export the catalog and byte-preserved XMP sidecars. Originals
+    /// stay where they are and are recorded by path + checksum in manifest.
+    fn export_portable_bundle(&mut self, parent: PathBuf, cx: &mut Context<Self>) {
+        self.flush_saves();
+        self.manage_note = match self.catalog.as_ref() {
+            Some(cat) => match cat.export_portable_bundle(&parent) {
+                Ok(report) => format!(
+                    "exported {} photos + {} sidecars to {}{}",
+                    report.photos,
+                    report.sidecars,
+                    report.path.display(),
+                    if report.missing_originals == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {} originals currently missing",
+                            report.missing_originals
+                        )
+                    }
+                ),
+                Err(e) => e,
+            },
+            None => "no catalog is open".to_string(),
+        };
         cx.notify();
     }
 
@@ -25924,7 +27949,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child(format!("in {}", dir.display())),
                 )
@@ -25933,7 +27958,7 @@ impl Laika {
                         text_input::FieldId::CatalogName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .child(if self.catalog_name_draft.is_empty() {
                                 "catalog name…".to_string()
@@ -25991,14 +28016,14 @@ impl Laika {
                             div()
                                 .flex_1()
                                 .font_family(SANS)
-                                .text_size(px(10.5))
+                                .text_size(sp(10.5))
                                 .text_color(rgb(if here { TEXT_SECONDARY } else { TEXT_DIMMER }))
                                 .child(label),
                         )
                         .child(
                             div()
                                 .font_family(SANS)
-                                .text_size(px(10.))
+                                .text_size(sp(10.))
                                 .text_color(rgb(TEXT_DIMMER))
                                 .child(if here {
                                     "".to_string()
@@ -26055,7 +28080,7 @@ impl Laika {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .text_color(rgb(if active {
                                 accent_line()
                             } else {
@@ -26076,7 +28101,7 @@ impl Laika {
                 .child(
                     div()
                         .font_family(SANS)
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_DIM))
                         .child(fixed),
                 )
@@ -26141,14 +28166,14 @@ impl Laika {
                     .min_w(px(420.))
                     .child(
                         div()
-                            .text_size(px(15.))
+                            .text_size(sp(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
                             .child(format!("Delete {n} rejected?")),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child(
                                 "Only rejected photos go — picked and unflagged stay. \
@@ -26221,14 +28246,14 @@ impl Laika {
                 .min_w(px(420.))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(sp(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child(title),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .text_color(rgb(TEXT_SECONDARY))
                         .child(body),
                 )
@@ -26479,7 +28504,7 @@ impl Laika {
         let accent_now = theme::accent();
         let section = |label: &'static str| {
             div()
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_MUTED))
                 .child(label)
@@ -26488,7 +28513,7 @@ impl Laika {
             div()
                 .w(px(120.))
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(TEXT_DIM))
                 .child(label)
         };
@@ -26552,7 +28577,7 @@ impl Laika {
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_SECONDARY }))
                             .child(a.label()),
                     ),
@@ -26598,7 +28623,7 @@ impl Laika {
                         .justify_between()
                         .child(
                             div()
-                                .text_size(px(15.))
+                                .text_size(sp(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .child("Preferences"),
@@ -26610,7 +28635,7 @@ impl Laika {
                                 .py(px(6.))
                                 .rounded(px(5.))
                                 .bg(rgb(accent_fill()))
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(accent_on_fill()))
                                 .hover(|st| st.bg(rgb(accent_fill_hover())))
@@ -26651,7 +28676,7 @@ impl Laika {
                 ))
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .child(format!(
                             "I cycles off · file · exposure in Loupe. Tokens: {}. Empty values drop with their separators; clear a line to restore it.",
@@ -26684,7 +28709,7 @@ impl Laika {
                 )
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Names are saved with this catalog and written to sidecars as xmp:Label (Lightroom reads the name). Clear a name to restore the default."),
                 )
@@ -26692,7 +28717,7 @@ impl Laika {
                 .child(self.slideshow_settings(cx))
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("⌘Enter plays the selection, or everything shown. Space pauses · arrows step · 0–5, 6–9 and P/X/U mark the slide · Esc returns to Loupe. Saved with this catalog."),
                 )
@@ -26727,7 +28752,7 @@ impl Laika {
                 ))
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .text_color(rgb(TEXT_DIM))
                         .child("Applies to every catalog. Photo colors are never affected."),
                 )
@@ -26773,7 +28798,7 @@ impl Laika {
                         div()
                             .w(px(120.))
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_DIM))
                             .child("Interval"),
                     )
@@ -26788,7 +28813,7 @@ impl Laika {
                         div()
                             .w(px(120.))
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_DIM))
                             .child("Playback"),
                     )
@@ -26867,8 +28892,8 @@ impl Laika {
             ),
             ("⌘E", "Edit in the external editor chosen in Preferences"),
             (
-                "Apple Photos",
-                "Left rail: sync originals in place · right-click to add photos",
+                "Platform integration",
+                "Apple Photos on macOS · File Explorer and Recycle Bin on Windows",
             ),
             ("Snapshots", "History rail: name the look, click to restore"),
             (" / ", "Search the library"),
@@ -26968,7 +28993,7 @@ impl Laika {
                 .min_w(px(460.))
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(sp(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child("Keyboard shortcuts"),
@@ -26986,13 +29011,13 @@ impl Laika {
                                 .child(
                                     div()
                                         .font_family(SANS)
-                                        .text_size(px(11.))
+                                        .text_size(sp(11.))
                                         .text_color(rgb(accent_line()))
                                         .child(k.to_string()),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(11.5))
+                                        .text_size(sp(11.5))
                                         .text_color(rgb(TEXT_SECONDARY))
                                         .child(v.to_string()),
                                 )
@@ -27006,7 +29031,7 @@ impl Laika {
                         .rounded(px(3.))
                         .border_1()
                         .border_color(border_control())
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_SECONDARY))
                         .hover(|st| st.bg(rgb(bg_row_hover())))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -27056,6 +29081,7 @@ fn field_tag(id: text_input::FieldId) -> usize {
         text_input::FieldId::AlbumDescription => 78,
         text_input::FieldId::AlbumCaption => 79,
         text_input::FieldId::EditorNaming => 80,
+        text_input::FieldId::Palette => 199,
         text_input::FieldId::GalleryTitle => 200,
         text_input::FieldId::GalleryEyebrow => 201,
         text_input::FieldId::GallerySubtitle => 202,
@@ -27120,6 +29146,8 @@ fn field_tag(id: text_input::FieldId) -> usize {
         text_input::FieldId::KwImportPath => 51,
         text_input::FieldId::KwExportPath => 52,
         text_input::FieldId::TimelineJump => 53,
+        text_input::FieldId::DevelopPresetName => 211,
+        text_input::FieldId::DevelopPresetGroup => 212,
     }
 }
 
@@ -27130,7 +29158,7 @@ fn field_tag(id: text_input::FieldId) -> usize {
 fn open_locked_catalog(
     selected: Option<&std::path::Path>,
     default_db: &std::path::Path,
-    home: &str,
+    app_base: &std::path::Path,
 ) -> (
     Option<Catalog>,
     Option<laika_core::catalog::CatalogLock>,
@@ -27154,7 +29182,7 @@ fn open_locked_catalog(
     let root = db
         .parent()
         .map(|d| d.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(home));
+        .unwrap_or_else(|| app_base.to_path_buf());
     // Lock before opening: opening migrates, and a catalog another Laika
     // has open must never be migrated underneath it.
     if let Some(dir) = db.parent() {
@@ -27213,7 +29241,7 @@ fn main() {
                 size(px(1440.), px(900.)),
                 cx,
             ))),
-            window_min_size: Some(size(px(1440.), px(900.))),
+            window_min_size: Some(size(px(1280.), px(800.))),
             ..Default::default()
         };
 
@@ -27221,14 +29249,14 @@ fn main() {
             .open_window(options, |window, cx| {
                 cx.new(|cx: &mut Context<Laika>| {
                 let (db_path, cache_dir) = default_dirs();
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
                 let app_base = db_path
                     .parent()
                     .map(|d| d.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from(&home));
+                    .unwrap_or_else(laika_core::platform::home_dir);
                 let mut library = laika_core::catalog::LibraryState::read(&app_base);
                 // V31: runtime-applied preferences.
                 theme::layout::set_filmstrip_scale(library.prefs.filmstrip.scale());
+                theme::set_text_scale(library.prefs.text_scale_percent);
                 IMPORT_WORKERS_PREF.store(
                     library.prefs.import_workers as usize,
                     std::sync::atomic::Ordering::Relaxed,
@@ -27271,7 +29299,7 @@ fn main() {
                         || (library.startup == laika_core::catalog::StartupMode::Fixed
                             && startup_db.is_none());
                 let (catalog, catalog_lock, mut lock_note) =
-                    open_locked_catalog(startup_db.as_deref(), &db_path, &home);
+                    open_locked_catalog(startup_db.as_deref(), &db_path, &app_base);
                 // V32: why no catalog opened, for the blocking explanation.
                 let startup_problem = match (&catalog, &lock_note, startup_db.as_ref()) {
                     (None, Some(note), Some(db)) => Some((db.clone(), note.clone())),
@@ -27300,6 +29328,8 @@ fn main() {
                 // from the catalog so acknowledged saves survive restarts.
                 let mut rescan_note: Option<String> = None;
                 if let Some(cat) = catalog.as_ref() {
+                    // S03: shared catalogs use Lightroom's raw sidecar names.
+                    laika_core::sidecar::set_adobe_naming(cat.lightroom_policy().shares());
                     let report = cat.rescan_sidecars_with(
                         library.prefs.sidecars == laika_core::prefs::SidecarPolicy::Always,
                     );
@@ -27332,6 +29362,8 @@ fn main() {
                     .map(|c| c.stored_name())
                     .unwrap_or_else(|| "Laika".to_string());
                 let status_note = lock_note.or(rescan_note).unwrap_or_default();
+                let left_rail_width = library.prefs.left_rail_width as f32;
+                let right_rail_width = library.prefs.right_rail_width as f32;
                 let mut this = Laika {
                     state: AppState::new(),
                     catalog,
@@ -27427,7 +29459,9 @@ fn main() {
                     rename_dialog: None,
                     export_open: false,
                     export_dialog: None,
+                    exit_bundle: Default::default(),
                     review_thumbs: Vec::new(),
+                    review_loading: false,
                     offline: HashSet::new(),
                     manage_open: ask_at_launch,
                     manage_note: String::new(),
@@ -27444,10 +29478,21 @@ fn main() {
                     info_exposure_line: laika_core::slideshow::DEFAULT_EXPOSURE_LINE
                         .to_string(),
                     gal: Default::default(),
+                    map: Default::default(),
+                    lr: Default::default(),
+                    presets: Default::default(),
+                    batch: Default::default(),
+                    left_rail_width,
+                    right_rail_width,
+                    rail_resize: None,
+                    coexist: Default::default(),
+                    palette: Default::default(),
+                    guide: Default::default(),
                     diag: Default::default(),
                     slides: Default::default(),
                     geo: Default::default(),
                     coll: Default::default(),
+                    review: Default::default(),
                     menu_open: None,
                     prefs_tab: 0,
                     gpu_adapter: String::new(),
@@ -27546,6 +29591,7 @@ fn main() {
                     sync_last_ok: None,
                     sync_last_error: String::new(),
                     sync_current: String::new(),
+                    sync_paused: false,
                     sync_open: false,
                     sync_testing: false,
                     sync_staged: false,
@@ -27622,6 +29668,13 @@ fn main() {
             std::mem::forget(sub);
         }
         // V31: native menu bar (macOS); Linux shows the in-window bar.
+        // S04: menu titles show the chosen keyboard map.
+        commands::set_lightroom_keys(
+            handle
+                .read(cx)
+                .map(|l| l.library.prefs.lightroom_keys)
+                .unwrap_or(false),
+        );
         commands::install_native_menus(cx, handle);
         cx.activate(true);
     });

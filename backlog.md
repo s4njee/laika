@@ -424,7 +424,16 @@ and fixed a real RGBA→JPEG encode bug before it shipped.
 
 ## P1 — Efficient shoot processing
 
-### [ ] U11 — Add Compare and Survey for choosing keepers
+### [x] U11 — Add Compare and Survey for choosing keepers
+
+**Result: done 2026-09-18.** Compare is a first-class Library view (`C`)
+with explicit Select/Candidate panes, previous/next candidate replacement,
+filmstrip candidate picking, swap, linked Fit/1:1/2× preview zoom and pan, and
+per-photo ratings that do not disturb the comparison selection. Survey (`N`)
+lays out the selected group responsively; Remove from view is session-only and
+Restore hidden brings every frame back without changing selection, collection
+membership, catalog rows, or originals. Both views are available in menus,
+the view switcher, command search, and the Lightroom keyboard/guide mapping.
 
 - **Deliver:** Two-photo Compare with candidate/select switching, linked zoom/pan,
   and independent ratings; Survey for a selected group with remove-from-view.
@@ -466,7 +475,18 @@ affected crates: 5 new state/model tests plus catalog browser tests) and
   filtering preserve valid selection and scroll state without hidden batch targets.
 - **Depends on:** U03, U04.
 
-### [ ] U13 — Add real collections, keywords, and stacks
+### [x] U13 — Add real collections, keywords, and stacks
+
+**Result: done 2026-09-18.** Existing persisted collections, Quick Collection,
+batch metadata undo, keyword hierarchy, and sidecar-safe writes now include
+saved smart collections with live criteria counts; type-ahead keyword choices
+apply to the full visible selection as one undo step. Schema v14 adds persisted
+manual stacks with collapsed covers, expand/collapse/unstack, stack badges, and
+automatic RAW/JPEG-pair stack creation. Smart collections reject membership
+writes, and deleting a collection or dissolving a stack changes organization
+only. A reopen/safety test verifies smart criteria, stack membership/state,
+catalog rows, and original files. `cargo fmt --all`, all workspace tests (311
+passed, 2 ignored), and `cargo check --workspace --all-targets` pass.
 
 - **Deliver:** Create/rename/delete collections; add/remove selected photos;
   smart collections from saved criteria; keyword autocomplete and batch editing;
@@ -513,7 +533,16 @@ tests) and `cargo check --workspace --all-targets` pass, no new warnings.
   creates a predictable branch. Virtual copies share the original safely.
 - **Depends on:** U02, U03, U08.
 
-### [ ] U15 — Make batch editing safe and efficient
+### [x] U15 — Make batch editing safe and efficient
+
+**Result: done 2026-09-18.** Copy Settings now freezes and names its source,
+shows the real target count, and offers grouped include switches; crop/local
+geometry is never part of the payload and Transform is opt-in. Selective paste,
+Apply Previous, relative Quick Develop nudges, and the clearly lit optional
+Auto Sync all use the existing batch-history unit, so one undo restores every
+target. Writes report partial failures for retry, and the frozen source is
+excluded from paste targets. Selective-overlay tests cover excluded-setting,
+Transform, and source preservation.
 
 - **Deliver:** Copy Settings chooser, explicit source and target count, selective
   paste/sync, apply previous, relative Quick Develop adjustments, and optional
@@ -523,7 +552,16 @@ tests) and `cargo check --workspace --all-targets` pass, no new warnings.
   report. A selected source never changes unexpectedly during batch processing.
 - **Depends on:** U03, U09, U14.
 
-### [ ] U16 — Let users manage presets
+### [x] U16 — Let users manage presets
+
+**Result: done 2026-09-18.** The Presets rail can create, name, group, edit,
+rename, delete, import, and export native `.laikapreset` files. Creation/editing
+uses the same explicit grouped setting selection as Copy Settings. Stored presets
+persist in the catalog, apply sparse values as one history step, and preview on
+hover by rendering a temporary value set that is restored on exit without a
+catalog, sidecar, or history write. The versioned JSON interchange validates
+names, indices, numeric ranges, and schema/version with actionable import errors;
+round-trip, invalid-file, sparse-apply, and catalog rename tests pass.
 
 - **Deliver:** Create, name, group, rename, delete, and import/export Laika presets;
   choose included settings; preview on hover and restore on exit without committing.
@@ -613,6 +651,13 @@ outward distortion mapping that smeared edges (now inward, clean).
 
 ### [ ] U19 — Add essential local adjustments and cleanup
 
+**Progress 2026-09-18:** Added persisted Brush/Linear/Radial mask and spot-heal
+models, original-image coordinates, feather/invert/erase state, editable Develop
+list + preview-only overlay, undo/snapshot/restart support, shared preview/export
+GPU rendering, and explicit opt-in local copying. Numerical preview/export parity
+is pinned. Remaining before closing: direct on-canvas brush painting and draggable
+gradient/heal handles (current controls create, nudge, resize, and edit them).
+
 - **Deliver:** Brush, linear gradient, radial gradient, editable mask list/overlay,
   feather/erase/invert, followed by a spot-heal tool. Keep mask placement tied to
   original image coordinates through cropping and rotation.
@@ -621,6 +666,15 @@ outward distortion mapping that smeared edges (now inward, clean).
 - **Depends on:** U08, U14, U18.
 
 ### [ ] U20 — Establish color management and camera coverage
+
+**Progress 2026-09-18:** Added persisted Laika Standard/Neutral/Vivid/Monochrome
+camera intents with explicit unknown-profile fallback, documented the linear-camera
+to linear-sRGB to 8-bit-sRGB contract and camera/container matrix, carried profiles
+through preview/reference export, and added final-size Off/Low/Standard/High output
+sharpening to all rendered formats (including TIFF). Existing WB numerical tests,
+RAW/raster goldens, and new local preview/export parity cover the shared path.
+Remaining before closing: a trustworthy per-display ICC transform and soft-proof
+pipeline; GPUI currently exposes the explicitly documented compositor-sRGB fallback.
 
 - **Deliver:** Display-profile-aware preview, defined working/output color spaces,
   camera profile selection, validated white-balance mapping, and a camera support
@@ -670,7 +724,28 @@ including 2 new U21 pins: 10k filter budget + cache drop/prune) and
   reload when revisited. UI actions never wait on scanning, disk writes, or decoding.
 - **Depends on:** U05–U10; profile throughout earlier milestones.
 
-### [ ] U22 — Make the workspace readable and accessible
+### [x] U22 — Make the workspace readable and accessible
+
+**Result: done 2026-09-18.** `cargo fmt --all`,
+`cargo test --workspace --all-targets` (310 passed, 2 ignored),
+`cargo check --workspace --all-targets`, and `git diff --check` pass; a native
+smoke launch opened the catalog and rendered the workspace without a panic.
+- Left and right rails resize from accessible splitters and Preferences steppers;
+  all three workspace panels can be hidden from the top bar, View menu, or command
+  palette. Visibility, rail widths, filmstrip size, and 85–150% text scale persist.
+- The window now supports a 1280 × 800 logical-pixel minimum, compacts its top bar
+  at that width, keeps rails independently scrollable, preserves full-screen mode,
+  and scales every UI text style (including tracked labels and timeline captions).
+- Secondary text contrast is raised and regression-tested. Photo cells and the
+  filmstrip spell out selection and sync state; ratings remain countable stars,
+  while save/sync failures retain text labels rather than color-only dots.
+- Essential tabs, buttons, switches, text fields, photo cells, splitters, progress,
+  and adjustment sliders expose accessibility roles, names, selection/toggle state,
+  and values. Root keyboard navigation and the command palette reach module,
+  panel, filmstrip, full-screen, and text-size actions.
+- Dragging is optional for rail widths and gallery placement/span/adjustments:
+  Preferences steppers, Place/Remove and Span controls, and slider −/+ buttons
+  provide explicit alternatives.
 
 - **Deliver:** Collapsible/resizable rails, hideable filmstrip, remembered layout,
   full-screen viewing, scalable text, sufficient contrast, and usable small-window
@@ -695,6 +770,16 @@ including 2 new U21 pins: 10k filter budget + cache drop/prune) and
 
 ### [ ] U24 — Make object-storage backup verifiable and recoverable
 
+**Progress 2026-09-19:** Backup now has tested setup/write probes, keychain-held
+S3 secrets, a crash-durable/retryable queue, verified S3/SFTP/share transfers,
+and explicit pause/resume that lets active uploads finish safely. Remote keys are
+content-versioned and idempotent, preventing same-name collisions and retaining
+older sidecar revisions; the layout-version bump requeues existing destinations.
+Local removal never sends a remote delete. Added a documented recovery contract
+and checksummed catalog/sidecar recovery bundle. Remaining before closing: upload
+the catalog bundle to remote destinations, implement an automated verified remote
+download/relink path, and record a real-shoot restore drill against each target.
+
 - **Deliver:** Connection setup/test, OS-keychain credentials, separate local-save
   and remote-backup states, checksummed uploads, durable queue, pause/retry, and
   version/conflict handling. Define which originals, sidecars, and catalog data
@@ -715,6 +800,17 @@ including 2 new U21 pins: 10k filter budget + cache drop/prune) and
 - **Depends on:** U04, U10, U21.
 
 ### [ ] U26 — Offer an honest Lightroom migration path
+
+**Progress 2026-09-19:** Lightroom migration already previews matches/options
+before its transaction, preserves originals, reports missing originals and
+unsupported masks/profiles/RGB curves/other edits, and preserves foreign XMP
+properties byte-for-byte. This pass adds standard flat/hierarchical keyword import,
+explicit metadata-compatibility-versus-render-equivalence documentation, and a
+Catalog UI export for an integrity-checked portable SQLite + byte-identical XMP
+bundle with checksummed manifest. Remaining before closing: add provenance-recorded
+fixtures produced by current Lightroom Classic/Camera Raw releases and validate the
+full import/report matrix against them (the existing regression packet is
+Adobe-shaped, not a provenance-recorded application output).
 
 - **Deliver:** Document and test standard sidecar discovery/naming and supported
   metadata/settings against actual Adobe-written fixtures. Import ratings,

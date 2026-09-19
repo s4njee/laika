@@ -30,6 +30,16 @@ struct U {
   warp0: vec4<f32>, // perspective warp G row 0 (.xyz), .w = active flag
   warp1: vec4<f32>, // G row 1 (.xyz)
   warp2: vec4<f32>, // G row 2 (.xyz)
+  local_meta: array<vec4<f32>, 8>,
+  local_geom0: array<vec4<f32>, 8>,
+  local_geom1: array<vec4<f32>, 8>,
+  local_adjust0: array<vec4<f32>, 8>,
+  local_adjust1: array<vec4<f32>, 8>,
+  brush_points: array<vec4<f32>, 128>,
+  heal0: array<vec4<f32>, 16>,
+  heal1: array<vec4<f32>, 16>,
+  local_counts: vec4<f32>, // masks, brush points, heals, camera profile
+  local_display: vec4<f32>, // .x = preview mask overlay (never export)
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -51,6 +61,106 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
 
 fn lum(c: vec3<f32>) -> f32 {
   return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// U19: spot heals remap target pixels to their donor before any develop
+// stages. Coordinates are source/original UV, so geometry never moves them.
+fn healed_uv(source_uv: vec2<f32>) -> vec2<f32> {
+  var uv = source_uv;
+  let asp = u.e.x / max(u.e.y, 1.0);
+  for (var i = 0; i < 16; i++) {
+    if (f32(i) >= u.local_counts.z) { break; }
+    let h0 = u.heal0[i];
+    let h1 = u.heal1[i];
+    let d = length((source_uv - h0.xy) * vec2<f32>(asp, 1.0));
+    let inner = h1.x * (1.0 - h1.y);
+    let w = 1.0 - smoothstep(inner, h1.x, d);
+    uv = mix(uv, h0.zw + (source_uv - h0.xy), w);
+  }
+  return uv;
+}
+
+fn mask_weight(index: i32, source_uv: vec2<f32>) -> f32 {
+  let mdata = u.local_meta[index];
+  let feather = mdata.w;
+  let asp = u.e.x / max(u.e.y, 1.0);
+  var w = 0.0;
+  if (mdata.x < 1.5) {
+    let first = i32(mdata.y + 0.5);
+    let count = i32(mdata.z + 0.5);
+    for (var pi = 0; pi < 128; pi++) {
+      if (pi >= count) { break; }
+      let p = u.brush_points[first + pi];
+      let d = length((source_uv - p.xy) * vec2<f32>(asp, 1.0));
+      let stamp = (1.0 - smoothstep(p.z * (1.0 - feather), p.z, d)) * abs(p.w);
+      if (p.w < 0.0) { w = max(0.0, w - stamp); }
+      else { w = max(w, stamp); }
+    }
+  } else if (mdata.x < 2.5) {
+    let g = u.local_geom0[index];
+    let axis = g.zw - g.xy;
+    let t = dot(source_uv - g.xy, axis) / max(dot(axis, axis), 1e-6);
+    let edge = mix(0.02, 0.5, feather);
+    w = 1.0 - smoothstep(0.5 - edge, 0.5 + edge, t);
+  } else {
+    let g = u.local_geom0[index];
+    let a = u.local_geom1[index].x;
+    let cs = cos(a);
+    let sn = sin(a);
+    let d0 = source_uv - g.xy;
+    let d = vec2<f32>(d0.x * cs + d0.y * sn, -d0.x * sn + d0.y * cs);
+    let r = length(d / max(g.zw, vec2<f32>(1e-4)));
+    w = 1.0 - smoothstep(1.0 - feather, 1.0, r);
+  }
+  if (u.local_geom1[index].w > 0.5) { w = 1.0 - w; }
+  return clamp(w, 0.0, 1.0);
+}
+
+fn apply_local_adjustments(c: vec3<f32>, source_uv: vec2<f32>) -> vec3<f32> {
+  var out = c;
+  for (var i = 0; i < 8; i++) {
+    if (f32(i) >= u.local_counts.x) { break; }
+    let w = mask_weight(i, source_uv);
+    if (w <= 0.0001) { continue; }
+    let a = u.local_adjust0[i];
+    let tint = u.local_adjust1[i].x;
+    var adjusted = out * pow(2.0, a.x);
+    let l = lum(adjusted);
+    adjusted = vec3<f32>(0.5) + (adjusted - vec3<f32>(0.5)) * (1.0 + a.y / 100.0);
+    adjusted = vec3<f32>(l) + (adjusted - vec3<f32>(l)) * max(0.0, 1.0 + a.z / 100.0);
+    let warm = a.w / 100.0 * 0.18;
+    adjusted *= vec3<f32>(1.0 + warm, 1.0 - tint / 100.0 * 0.12, 1.0 - warm);
+    out = mix(out, clamp(adjusted, vec3<f32>(0.0), vec3<f32>(1.0)), w);
+  }
+  return out;
+}
+
+fn mask_overlay(c: vec3<f32>, source_uv: vec2<f32>) -> vec3<f32> {
+  if (u.local_display.x < 0.5) { return c; }
+  var edge = 0.0;
+  for (var i = 0; i < 8; i++) {
+    if (f32(i) >= u.local_counts.x) { break; }
+    let w = mask_weight(i, source_uv);
+    edge = max(edge, 1.0 - smoothstep(0.04, 0.10, abs(w - 0.5)));
+  }
+  return mix(c, vec3<f32>(0.20, 0.82, 0.48), edge * 0.8);
+}
+
+fn apply_camera_profile(c: vec3<f32>) -> vec3<f32> {
+  let profile = u.local_counts.w;
+  if (profile < 0.5) { return c; }
+  let l = lum(c);
+  if (profile < 1.5) {
+    // Neutral: gentler contrast and chroma for grading headroom.
+    return clamp(vec3<f32>(0.5) + (c - vec3<f32>(0.5)) * 0.86,
+      vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+  if (profile < 2.5) {
+    let vivid = vec3<f32>(l) + (c - vec3<f32>(l)) * 1.22;
+    return clamp(vec3<f32>(0.5) + (vivid - vec3<f32>(0.5)) * 1.08,
+      vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+  return vec3<f32>(l);
 }
 
 fn tap(uv: vec2<f32>) -> vec3<f32> {
@@ -366,6 +476,7 @@ fn develop(uv: vec2<f32>, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, curve: vec4<
   if (!display_referred()) {
     tm = base_look(srgb_lin);
   }
+  tm = apply_camera_profile(tm);
   // U18: point tone curve on the tonemapped value, then sRGB encode.
   let curved = vec3<f32>(apply_curve_p(tm.r, curve), apply_curve_p(tm.g, curve), apply_curve_p(tm.b, curve));
   let lo = curved * 12.92;
@@ -378,16 +489,16 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   // One shared geometric mapping: before/after can never misalign.
   // Optics (lens) acts first, then the crop window.
   let luv = optics_uv(in.uv);
-  let suv = geom_uv(luv);
+  let source_uv = geom_uv(luv);
   // Crop tool: the full straightened frame is shown under the box; area
   // outside the source reads as empty canvas, not clamped edge pixels.
-  if (u.o.w > 0.5 && (any(suv < vec2<f32>(0.0)) || any(suv > vec2<f32>(1.0)))) {
+  if (u.o.w > 0.5 && (any(source_uv < vec2<f32>(0.0)) || any(source_uv > vec2<f32>(1.0)))) {
     return vec4<f32>(0.07, 0.07, 0.07, 1.0);
   }
   // Perspective warp without constrain: uncovered area reads white
   // (Lightroom). Unwarped renders keep clamping edge texels.
   if (u.warp0.w > 0.5 && u.o.w < 0.5
-    && (any(suv < vec2<f32>(-1e-4)) || any(suv > vec2<f32>(1.0 + 1e-4)))) {
+    && (any(source_uv < vec2<f32>(-1e-4)) || any(source_uv > vec2<f32>(1.0 + 1e-4)))) {
     return vec4<f32>(1.0, 1.0, 1.0, 1.0);
   }
   // Zero rows = the defined BEFORE reference (pipeline defaults).
@@ -399,9 +510,10 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   if (in.uv.x < u.d.x) {
     // (CA is color: before samples straight, like the crop rule that
     // only geometry is shared.)
-    let before = develop(suv, DEF_A, DEF_B, DEF_C, IDENT_CURVE, zh, zh);
+    let before = develop(source_uv, DEF_A, DEF_B, DEF_C, IDENT_CURVE, zh, zh);
     return vec4<f32>(apply_hsl_p(before, zh, zh, zh, zh, zh, zh), 1.0);
   }
+  let suv = healed_uv(source_uv);
   var after: vec3<f32>;
   if (abs(u.o.y) > 0.5) {
     // U18: lateral CA — R/B sampled at radially scaled positions.
@@ -414,11 +526,13 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   // U18: Color Mix grades the display-referred result; before is bare.
   var out = apply_hsl_p(after, u.h, u.i, u.j, u.k, u.l, u.m);
   out = color_grade(out);
+  out = apply_local_adjustments(out, source_uv);
   // Post-crop effects act on the output frame (skipped in the crop tool's
   // full-frame view, where the frame is not the final one).
   if (u.o.w < 0.5) {
     out = post_effects(out, in.uv);
   }
+  out = mask_overlay(out, source_uv);
   return vec4<f32>(out, 1.0);
 }
 

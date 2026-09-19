@@ -138,13 +138,15 @@ fn published_px(g: &Gallery, sx: u8, sy: u8) -> (u32, u32) {
 fn small_button(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.to_string())
         .px(px(9.))
         .py(px(5.))
         .rounded(px(4.))
         .border_1()
         .border_color(border_control())
         .font_family(SANS)
-        .text_size(px(11.))
+        .text_size(sp(11.))
         .text_color(rgb(TEXT_SECONDARY))
         .hover(|s| s.bg(rgb(bg_row_hover())))
         .child(label.to_string())
@@ -153,13 +155,15 @@ fn small_button(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
 fn accent_button(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.to_string())
         .px(px(13.))
         .py(px(5.))
         .rounded(px(4.))
         .bg(rgb(accent_fill()))
         .font_family(SANS)
         .font_weight(FontWeight::SEMIBOLD)
-        .text_size(px(11.))
+        .text_size(sp(11.))
         .text_color(rgb(accent_on_fill()))
         .hover(|s| s.bg(rgb(accent_fill_hover())))
         .child(label.to_string())
@@ -169,7 +173,7 @@ fn eyebrow(text: &str) -> Div {
     div()
         .font_family(PLEX_MONO)
         .font_weight(FontWeight::MEDIUM)
-        .text_size(px(9.5))
+        .text_size(sp(9.5))
         .text_color(rgb(TEXT_DIM))
         .child(text.to_uppercase())
 }
@@ -216,20 +220,25 @@ impl Laika {
                 .items_center()
                 .justify_center()
                 .bg(rgb(bg_canvas()))
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(TEXT_DIM))
                 .child("Open a catalog to build galleries");
         }
         if self.gal.current.is_none() {
             return self.galleries_home(cx);
         }
-        let body = div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .child(self.gallery_tray(cx))
-            .child(self.gallery_canvas(window, cx))
-            .child(self.gallery_inspector(window, cx));
+        let mut body = div().flex_1().min_h_0().flex();
+        if self.left_rail_shown() {
+            body = body
+                .child(self.gallery_tray(cx))
+                .child(self.rail_resize_handle(RailSide::Left, cx));
+        }
+        body = body.child(self.gallery_canvas(window, cx));
+        if self.right_rail_shown() {
+            body = body
+                .child(self.rail_resize_handle(RailSide::Right, cx))
+                .child(self.gallery_inspector(window, cx));
+        }
         let mut root = div()
             .relative()
             .flex_1()
@@ -305,7 +314,7 @@ impl Laika {
                             .gap(px(3.))
                             .child(
                                 div()
-                                    .text_size(px(12.5))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(TEXT_PRIMARY))
                                     .child(if s.title.trim().is_empty() {
@@ -314,7 +323,7 @@ impl Laika {
                                         s.title.clone()
                                     }),
                             )
-                            .child(div().text_size(px(10.5)).text_color(rgb(TEXT_DIM)).child(
+                            .child(div().text_size(sp(10.5)).text_color(rgb(TEXT_DIM)).child(
                                 format!(
                                     "{} photo{} · {status}",
                                     s.photo_count,
@@ -409,7 +418,7 @@ impl Laika {
                                     .child(eyebrow("Publish"))
                                     .child(
                                         div()
-                                            .text_size(px(22.))
+                                            .text_size(sp(22.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(TEXT_PRIMARY))
                                             .child("Galleries"),
@@ -448,7 +457,7 @@ impl Laika {
                                                     d.child(
                                                         div()
                                                             .p(px(8.))
-                                                            .text_size(px(11.))
+                                                            .text_size(sp(11.))
                                                             .text_color(rgb(TEXT_DIM))
                                                             .child("No collections with photos yet"),
                                                     )
@@ -462,7 +471,7 @@ impl Laika {
                                                         .px(px(8.))
                                                         .py(px(6.))
                                                         .rounded(px(3.))
-                                                        .text_size(px(11.5))
+                                                        .text_size(sp(11.5))
                                                         .text_color(rgb(TEXT_SECONDARY))
                                                         .hover(|s| s.bg(rgb(bg_row_hover())))
                                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -515,13 +524,13 @@ impl Laika {
                                 .gap(px(8.))
                                 .child(
                                     div()
-                                        .text_size(px(15.))
+                                        .text_size(sp(15.))
                                         .text_color(rgb(TEXT_SECONDARY))
                                         .child("No galleries yet"),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(11.5))
+                                        .text_size(sp(11.5))
                                         .text_color(rgb(TEXT_DIM))
                                         .child("Select photos in the Library or pick a collection, then lay them out on a page you can publish as a website."),
                                 ),
@@ -581,7 +590,7 @@ impl Laika {
             )
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(sp(13.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT_PRIMARY))
                     .max_w(px(280.))
@@ -598,13 +607,13 @@ impl Laika {
                     .py(px(3.))
                     .rounded(px(10.))
                     .bg(rgb(bg_chip()))
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(status.1))
                     .child(status.0),
             )
             .children(building.map(|label| {
                 div()
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_TERTIARY))
                     .child(label)
             }))
@@ -635,7 +644,7 @@ impl Laika {
                             .px(px(10.))
                             .py(px(3.))
                             .rounded(px(4.))
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_MUTED }))
                             .when(on, |d| d.bg(rgb(bg_segment_active())))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
@@ -675,7 +684,7 @@ impl Laika {
             .unwrap_or_default();
         let hint = match self.gal.breakpoint {
             Breakpoint::Desktop => {
-                "Drag to place · corners resize, hold ⇧ to keep ratio · ⌫ removes from page · ⌘Z undo"
+                "Place/Remove and Span buttons work without dragging · corners resize · ⌫ removes · ⌘Z undo"
             }
             _ => "Preview only — switch to Desktop to arrange",
         };
@@ -689,7 +698,7 @@ impl Laika {
             .bg(rgb(bg_chrome()))
             .border_t_1()
             .border_color(hairline())
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(TEXT_DIM))
             .child(format!("{placed} of {} placed", g.photos.len()))
             .child(at)
@@ -727,10 +736,13 @@ impl Laika {
             let on = filter == f;
             div()
                 .id(("gal-tray-filter", f as usize))
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .aria_toggled(if on { Toggled::True } else { Toggled::False })
                 .px(px(8.))
                 .py(px(3.))
                 .rounded(px(10.))
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .when(on, |d| d.bg(rgb(TEXT_PRIMARY)).text_color(rgb(bg_chrome())))
                 .when(!on, |d| {
                     d.border_1()
@@ -744,7 +756,7 @@ impl Laika {
                 .child(label)
         };
         let dragging = self.gal.drag.is_some_and(|d| d.moved && !d.from_tray);
-        let cell_w = (248. - 24. - 8. - 6.) / 2.;
+        let cell_w = ((self.left_rail_width - 24. - 8. - 6.) / 2.).max(56.);
         let mut grid = div().flex().flex_wrap().gap(px(8.));
         for i in shown.iter().copied() {
             let p = &g.photos[i];
@@ -756,6 +768,13 @@ impl Laika {
             grid = grid.child(
                 div()
                     .id(("gal-tray", pid as usize))
+                    .role(Role::Button)
+                    .aria_label(format!(
+                        "Gallery photo {}, {}",
+                        pid,
+                        if selected { "selected" } else { "not selected" }
+                    ))
+                    .aria_selected(selected)
                     .relative()
                     .w(px(cell_w))
                     .h(px(cell_w))
@@ -792,7 +811,7 @@ impl Laika {
                             .rounded(px(2.))
                             .bg(rgba(0x000000A0))
                             .font_family(PLEX_MONO)
-                            .text_size(px(8.5))
+                            .text_size(sp(8.5))
                             .text_color(rgb(0xF2EFE6))
                             .child(
                                 order
@@ -815,7 +834,7 @@ impl Laika {
         }
         let sel = self.state.selection.len();
         div()
-            .w(px(248.))
+            .w(px(self.left_rail_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -839,7 +858,7 @@ impl Laika {
                             .child(eyebrow("In this gallery"))
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(format!("{} photos", g.photos.len())),
                             ),
@@ -865,7 +884,7 @@ impl Laika {
                         d.child(
                             div()
                                 .pt(px(20.))
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgb(TEXT_DIM))
                                 .child(match filter {
                                     TrayFilter::All => "No photos yet",
@@ -887,6 +906,12 @@ impl Laika {
                     .child(
                         div()
                             .id("gal-add-sel")
+                            .role(Role::Button)
+                            .aria_label(if sel > 0 {
+                                format!("Add {sel} selected photos from Library")
+                            } else {
+                                "Add photos from Library".to_string()
+                            })
                             .flex()
                             .justify_center()
                             .py(px(10.))
@@ -897,7 +922,7 @@ impl Laika {
                             } else {
                                 border_control()
                             })
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(if sel > 0 { TEXT_PRIMARY } else { TEXT_DIM }))
                             .hover(|d| d.bg(rgb(bg_row_hover())))
@@ -971,7 +996,7 @@ impl Laika {
                             .items_center()
                             .justify_center()
                             .font_family(PLEX_MONO)
-                            .text_size(px(10.))
+                            .text_size(sp(10.))
                             .text_color(rgb(accent_line()))
                             .child("DROP HERE"),
                     );
@@ -1022,7 +1047,7 @@ impl Laika {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(9.))
+                        .text_size(sp(9.))
                         .text_color(rgba((ink << 8) | 0x55))
                         .child(
                             self.find(pid)
@@ -1042,7 +1067,7 @@ impl Laika {
                         .h(px(CAPTION_H - 5.))
                         .overflow_hidden()
                         .font_family(caption_family)
-                        .text_size(px(9.5))
+                        .text_size(sp(9.5))
                         .text_color(rgba((ink << 8) | 0x80))
                         .child(c),
                 );
@@ -1091,7 +1116,7 @@ impl Laika {
                         .border_color(rgba((ink << 8) | 0x1F))
                         .font_family(PLEX_SANS)
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .child(g.site_name.clone()),
                 )
             })
@@ -1105,7 +1130,7 @@ impl Laika {
                         div()
                             .font_family(title_family)
                             .font_weight(title_weight)
-                            .text_size(px(title_px))
+                            .text_size(sp(title_px))
                             .line_height(relative(1.06))
                             .child(if g.title.trim().is_empty() {
                                 "Untitled gallery".to_string()
@@ -1119,7 +1144,7 @@ impl Laika {
                                 .flex_none()
                                 .pb(px(6.))
                                 .font_family(PLEX_MONO)
-                                .text_size(px(8.5))
+                                .text_size(sp(8.5))
                                 .text_color(rgb(accent_text))
                                 .child(g.eyebrow.to_uppercase()),
                         )
@@ -1130,7 +1155,7 @@ impl Laika {
                     div()
                         .max_w(px(400.))
                         .font_family(PLEX_SANS)
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .line_height(relative(1.6))
                         .text_color(rgba((ink << 8) | 0xCC))
                         .child(g.subtitle.clone()),
@@ -1140,7 +1165,7 @@ impl Laika {
                 div()
                     .pb(px(14.))
                     .font_family(PLEX_SANS)
-                    .text_size(px(9.))
+                    .text_size(sp(9.))
                     .text_color(rgba((ink << 8) | 0x73))
                     .child(laika_export::site::html::meta_text(g.placed_count(), &g.meta_line)),
             )
@@ -1156,10 +1181,10 @@ impl Laika {
                         .border_1()
                         .border_color(rgba((ink << 8) | 0x33))
                         .rounded(px(6.))
-                        .child(div().text_size(px(13.)).child("No photos yet"))
+                        .child(div().text_size(sp(13.)).child("No photos yet"))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(sp(11.))
                                 .text_color(rgba((ink << 8) | 0x99))
                                 .child("Select photos in the Library, then use Add selected in the tray"),
                         ),
@@ -1169,7 +1194,7 @@ impl Laika {
                 d.child(
                     div()
                         .py(px(8.))
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgba((ink << 8) | 0x99))
                         .child("Drag photos from the tray onto the page"),
                 )
@@ -1194,7 +1219,7 @@ impl Laika {
                     .border_b_1()
                     .border_color(hairline())
                     .font_family(PLEX_MONO)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(TEXT_DIM))
                     .child(format!(
                         "{} · GRID {} COL",
@@ -1277,7 +1302,7 @@ impl Laika {
                     .rounded(px(3.))
                     .bg(rgb(accent_fill()))
                     .font_family(PLEX_MONO)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(accent_on_fill()))
                     .child(format!("{sx} × {sy} · {pw} × {ph}")),
             );
@@ -1500,6 +1525,44 @@ impl Laika {
                     cx,
                 );
             }
+        }
+    }
+
+    /// Button/keyboard-friendly alternative to the gallery's scrub tracks.
+    pub(crate) fn gal_nudge_slider(
+        &mut self,
+        kind: GalSlider,
+        direction: i8,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(g) = self.gal.current.as_ref() else {
+            return;
+        };
+        let delta = direction.signum();
+        match kind {
+            GalSlider::TitleSize => {
+                let value = (g.theme.title_size as i16 + delta as i16).clamp(32, 72) as u8;
+                self.gal_edit(
+                    "Title size",
+                    Some("title-size"),
+                    |g| g.theme.title_size = value,
+                    cx,
+                );
+            }
+            GalSlider::Radius => {
+                let value = (g.theme.corner_radius as i16 + delta as i16).clamp(0, 24) as u8;
+                self.gal_edit(
+                    "Rounded corners",
+                    Some("radius"),
+                    |g| g.theme.corner_radius = value,
+                    cx,
+                );
+            }
+            GalSlider::Gutter => {
+                let value = (g.gutter as i16 + delta as i16).clamp(0, 32) as u8;
+                self.gal_edit("Gutter", Some("gutter"), |g| g.gutter = value, cx);
+            }
+            GalSlider::Focal => {}
         }
     }
 }

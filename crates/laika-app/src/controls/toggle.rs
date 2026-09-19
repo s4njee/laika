@@ -29,7 +29,7 @@ pub fn toggle(on: bool, label: &str) -> Div {
         )
         .child(
             div()
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(rgb(TEXT_SECONDARY))
                 .child(label.to_string()),
         )

@@ -165,6 +165,9 @@ pub struct Sidecar {
     pub contact: String,
     pub location: String,
     pub keywords: Vec<String>,
+    /// Map: decimal `lat, lon` from `exif:GPSLatitude`/`GPSLongitude`
+    /// (empty = the sidecar says nothing about location).
+    pub gps: String,
     /// U08: geometry — `Some` iff the file carries any crop attribute.
     /// Absent attributes mean "leave catalog geometry alone" (a foreign
     /// rewrite without crop keys must not wipe a Laika crop).
@@ -192,6 +195,7 @@ impl Default for Sidecar {
             contact: String::new(),
             location: String::new(),
             keywords: Vec::new(),
+            gps: String::new(),
             geom: None,
             label: None,
             has_tone: false,
@@ -214,7 +218,8 @@ pub const CROP_ATTRS: [&str; 7] = [
 ];
 
 pub fn sidecar_path(photo_path: &str) -> String {
-    format!("{photo_path}.xmp")
+    // S03: Adobe's `IMG.xmp` for raws when present or shared with Lightroom.
+    crate::sidecar::path_for(photo_path)
 }
 
 /// mtime of the sidecar next to `photo_path`, whole seconds. `None` when the
@@ -271,6 +276,8 @@ fn is_known_attr(key: &str) -> bool {
             | "xmpRights:UsageTerms"
             | "photoshop:Headline"
             | "Iptc4xmpCore:Location"
+            | "exif:GPSLatitude"
+            | "exif:GPSLongitude"
             | "tiff:Orientation"
             | "laika:Rotation"
             | "laika:FlipH"
@@ -316,6 +323,9 @@ pub struct Authorship {
     pub keywords: Vec<String>,
     /// V13: color label name for `xmp:Label` (empty = no label).
     pub label: String,
+    /// Map: decimal `lat, lon` written as `exif:GPSLatitude/Longitude`
+    /// in sidecars (never embedded in exports — those strip GPS).
+    pub gps: String,
     /// V13: this catalog's label names. A carried foreign `xmp:Label`
     /// survives only when it is none of them (e.g. Lightroom's "Select"),
     /// so clearing a Laika label never resurrects the old text.
@@ -497,7 +507,20 @@ impl ChildBlock {
             el(w, "laika:Contact", &self.contact)?;
         }
         if !self.keywords.is_empty() {
-            seq_bag(w, "lr:hierarchicalSubject", "rdf:Bag", &self.keywords)?;
+            // S03: Lightroom's level separator, so its keyword tree reads
+            // Laika's paths (the reader accepts both forms).
+            let lr: Vec<String> = self
+                .keywords
+                .iter()
+                .map(|k| {
+                    k.split(" > ")
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect();
+            seq_bag(w, "lr:hierarchicalSubject", "rdf:Bag", &lr)?;
         }
         Ok(())
     }
@@ -517,10 +540,50 @@ pub fn write(
     if crate::apple_photos::in_library(photo_path) {
         return Ok(());
     }
-    // Read-modify-write: foreign attributes survive our rewrites.
-    let unknown = read_unknown(photo_path);
-    let bytes = render(params, rating, history, preset, authorship, geom, &unknown)?;
-    write_atomic(&sidecar_path(photo_path), &bytes)
+    write_scoped(
+        photo_path,
+        params,
+        rating,
+        history,
+        preset,
+        authorship,
+        geom,
+        crate::sidecar::WriteScope::default(),
+    )
+}
+
+/// S03: merge-write the sidecar. Only fields Laika changed are rewritten;
+/// everything else in the file (Adobe settings, nested structures, other
+/// apps' metadata) is carried byte-for-byte. `scope.develop = false`
+/// leaves develop fields to Lightroom.
+#[allow(clippy::too_many_arguments)]
+pub fn write_scoped(
+    photo_path: &str,
+    params: &[f32; crate::edit::PARAM_COUNT],
+    rating: u8,
+    history: &[String],
+    preset: Option<&str>,
+    authorship: &Authorship,
+    geom: &crate::edit::CropGeom,
+    scope: crate::sidecar::WriteScope,
+) -> Result<(), String> {
+    if crate::apple_photos::in_library(photo_path) {
+        return Ok(());
+    }
+    let path = sidecar_path(photo_path);
+    let existing = std::fs::read(&path).ok();
+    let bytes = crate::sidecar::merge(
+        existing.as_deref(),
+        params,
+        rating,
+        history,
+        preset,
+        authorship,
+        geom,
+        scope,
+        &crate::sidecar::now_iso(),
+    )?;
+    write_atomic(&path, &bytes)
 }
 
 /// U10: render a sidecar document to bytes (same content `write` stores;
@@ -574,6 +637,18 @@ pub fn render(
         desc.push_attribute((
             "xmlns:Iptc4xmpCore",
             "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
+        ));
+    }
+    // Map: location in Lightroom's form so other tools see placements.
+    if let Some((lat, lon)) = crate::geo::parse_gps(&authorship.gps) {
+        desc.push_attribute(("xmlns:exif", "http://ns.adobe.com/exif/1.0/"));
+        desc.push_attribute((
+            "exif:GPSLatitude",
+            crate::geo::xmp_coord(lat, 'N', 'S').as_str(),
+        ));
+        desc.push_attribute((
+            "exif:GPSLongitude",
+            crate::geo::xmp_coord(lon, 'E', 'W').as_str(),
         ));
     }
     desc.push_attribute(("xmp:Rating", rating.to_string().as_str()));
@@ -931,10 +1006,16 @@ pub fn read_unknown(photo_path: &str) -> Vec<(String, String)> {
 }
 
 pub fn read(photo_path: &str) -> Option<Sidecar> {
+    let bytes = std::fs::read(sidecar_path(photo_path)).ok()?;
+    parse(&bytes)
+}
+
+/// Parse an XMP packet (a sidecar, or Camera Raw settings stored elsewhere
+/// such as a Lightroom library's settings blobs).
+pub fn parse(bytes: &[u8]) -> Option<Sidecar> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
-    let bytes = std::fs::read(sidecar_path(photo_path)).ok()?;
-    let mut r = Reader::from_reader(&bytes[..]);
+    let mut r = Reader::from_reader(bytes);
     // No trim_text: fragments around entity references must keep their
     // spaces — the End arm trims the assembled buffer instead.
     let mut params = crate::edit::defaults();
@@ -950,6 +1031,8 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
     let mut rights_usage = String::new();
     let mut contact = String::new();
     let mut location = String::new();
+    let mut gps_lat: Option<f64> = None;
+    let mut gps_lon: Option<f64> = None;
     let mut keywords: Vec<String> = Vec::new();
     let mut lr_keywords: Vec<String> = Vec::new();
     // V12: element stack for standard structures (Alt/Bag/Seq children).
@@ -1028,6 +1111,12 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
                 }
             } else if key == "xmp:Rating" {
                 rating = val.parse::<u8>().ok();
+                found = true;
+            } else if key == "exif:GPSLatitude" {
+                gps_lat = crate::geo::parse_xmp_coord(&val);
+                found = true;
+            } else if key == "exif:GPSLongitude" {
+                gps_lon = crate::geo::parse_xmp_coord(&val);
                 found = true;
             } else if key == "xmp:Label" {
                 label = Some(val.clone());
@@ -1236,7 +1325,21 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
     // bag is present (it is strictly more informative — leaves derive
     // from paths, never the reverse).
     if !lr_keywords.is_empty() {
-        keywords = lr_keywords;
+        // Lightroom separates levels with `|`; Laika's form is ` > `.
+        keywords = lr_keywords
+            .into_iter()
+            .map(|k| {
+                if k.contains('|') {
+                    k.split('|')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" > ")
+                } else {
+                    k
+                }
+            })
+            .collect();
     }
     // U08: any crop attribute carries geometry; an uncropped Laika file
     // writes explicit full-frame edges, so Some(full-frame) is normal.
@@ -1298,6 +1401,14 @@ pub fn read(photo_path: &str) -> Option<Sidecar> {
         contact,
         location,
         keywords,
+        gps: match (gps_lat, gps_lon) {
+            (Some(lat), Some(lon))
+                if crate::geo::parse_gps(&crate::geo::format_gps(lat, lon)).is_some() =>
+            {
+                crate::geo::format_gps(lat, lon)
+            }
+            _ => String::new(),
+        },
         geom,
         label,
         has_tone,
@@ -1485,7 +1596,21 @@ mod tests {
             "{raw}"
         );
         assert!(raw.contains("aux:Lens=\"50mm\""), "{raw}");
-        assert!(!raw.contains("crs:Name"), "{raw}");
+        // S03: the nested look is carried whole (never flattened into
+        // top-level attributes).
+        let doc = crate::sidecar::parse_doc(raw.as_bytes()).unwrap();
+        assert!(
+            doc.items
+                .iter()
+                .any(|i| matches!(i, crate::sidecar::Item::Elem { key, .. } if key == "crs:Look")),
+            "{raw}"
+        );
+        assert!(
+            !doc.items
+                .iter()
+                .any(|i| matches!(i, crate::sidecar::Item::Attr { key, .. } if key == "crs:Name")),
+            "{raw}"
+        );
         // A packet with rights only still binds the dc prefix.
         let packet = String::from_utf8(descriptive_packet(&Authorship {
             copyright: "© Ada".into(),
@@ -1716,6 +1841,7 @@ mod tests {
             keywords: vec!["Places > Portugal > Lisbon".into(), "Boats".into()],
             label: "Green".into(),
             label_names: Vec::new(),
+            gps: "-33.868800, 151.209300".into(),
         };
         write(
             &photo,
@@ -1746,6 +1872,14 @@ mod tests {
         assert_eq!(back.contact, "ada@example.com");
         assert_eq!(back.location, "Lisbon");
         assert_eq!(back.keywords, vec!["Places > Portugal > Lisbon", "Boats"]);
+        // Map: location in Lightroom's exif:GPS form, back to decimal.
+        assert!(raw.contains("exif:GPSLatitude=\"33,52.128000S\""), "{raw}");
+        let (lat, lon) = crate::geo::parse_gps(&back.gps).expect("gps reads back");
+        assert!(
+            (lat + 33.8688).abs() < 1e-6 && (lon - 151.2093).abs() < 1e-6,
+            "{}",
+            back.gps
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

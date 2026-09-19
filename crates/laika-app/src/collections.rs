@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use laika_core::catalog::Collection;
+use laika_core::catalog::{Collection, PhotoStack};
 use laika_core::labels::{self, LabelNames};
 
 use super::*;
@@ -16,6 +16,8 @@ pub(crate) enum NameMode {
     Closed,
     /// New collection (with the targeted photos, if any).
     New,
+    /// Save the currently active filters as a dynamic collection.
+    NewSmart,
     /// Save the Quick Collection under a name (then clear it).
     SaveQuick,
     Rename(i64),
@@ -29,6 +31,9 @@ pub(crate) struct CollState {
     /// Where `B` adds; None = the Quick Collection.
     pub target: Option<i64>,
     pub quick_members: HashSet<i64>,
+    pub stacks: Vec<PhotoStack>,
+    pub stack_members: HashMap<i64, Vec<i64>>,
+    pub stack_by_photo: HashMap<i64, i64>,
     /// Filtered collection's members (lazy; dropped on any change).
     pub members: RefCell<Option<(i64, HashSet<i64>)>>,
     pub name_mode: NameMode,
@@ -71,12 +76,27 @@ impl Laika {
             .get_import_default("target_collection")
             .parse::<i64>()
             .ok()
-            .filter(|id| self.coll.list.iter().any(|c| c.id == *id && !c.quick));
+            .filter(|id| {
+                self.coll
+                    .list
+                    .iter()
+                    .any(|c| c.id == *id && !c.quick && !c.smart)
+            });
         self.coll.quick_members = self
             .coll
             .quick
             .map(|q| cat.collection_members(q))
             .unwrap_or_default();
+        self.coll.stacks = cat.photo_stacks();
+        self.coll.stack_members.clear();
+        self.coll.stack_by_photo.clear();
+        for stack in &self.coll.stacks {
+            let members = cat.stack_members(stack.id);
+            for photo_id in &members {
+                self.coll.stack_by_photo.insert(*photo_id, stack.id);
+            }
+            self.coll.stack_members.insert(stack.id, members);
+        }
         self.coll.members.replace(None);
         self.coll.order.replace(None);
         self.coll.captions.replace(None);
@@ -86,6 +106,12 @@ impl Laika {
             if !self.coll.list.iter().any(|c| c.id == cid) {
                 self.state.filters.collection = None;
                 self.state.filters.collection_name.clear();
+            }
+        }
+        if let Some(cid) = self.state.filters.smart_collection {
+            if !self.coll.list.iter().any(|c| c.id == cid && c.smart) {
+                self.state.filters.smart_collection = None;
+                self.state.filters.smart_collection_name.clear();
             }
         }
         // G05: the galleries list follows the open catalog.
@@ -115,6 +141,11 @@ impl Laika {
         cid: i64,
         cx: &mut Context<Self>,
     ) {
+        if self.coll.list.iter().any(|c| c.id == cid && c.smart) {
+            self.status_note = "smart collections update from their criteria".to_string();
+            cx.notify();
+            return;
+        }
         let ids = self.expand_pair_targets(&ids);
         let Some(cat) = self.catalog.as_ref() else {
             return;
@@ -165,7 +196,34 @@ impl Laika {
 
     pub(crate) fn target_collection(&self) -> Option<&Collection> {
         let id = self.coll.target.or(self.coll.quick)?;
-        self.coll.list.iter().find(|c| c.id == id)
+        self.coll.list.iter().find(|c| c.id == id && !c.smart)
+    }
+
+    pub(crate) fn stack_for_photo(&self, photo_id: i64) -> Option<&PhotoStack> {
+        let id = self.coll.stack_by_photo.get(&photo_id)?;
+        self.coll.stacks.iter().find(|s| s.id == *id)
+    }
+
+    pub(crate) fn collapsed_stack_hidden(&self) -> HashSet<i64> {
+        let mut hidden = HashSet::new();
+        for stack in self.coll.stacks.iter().filter(|s| s.collapsed) {
+            if let Some(members) = self.coll.stack_members.get(&stack.id) {
+                hidden.extend(members.iter().copied().filter(|id| *id != stack.cover));
+            }
+        }
+        hidden
+    }
+
+    fn smart_count(&self, collection: &Collection) -> usize {
+        serde_json::from_str::<laika_core::state::Filters>(&collection.criteria_json)
+            .ok()
+            .map(|filters| {
+                self.photos
+                    .iter()
+                    .filter(|photo| self.photo_matches_filters(&filters, photo))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Membership test for the collection filter.
@@ -216,7 +274,7 @@ impl Laika {
             self.coll.names.name(value).to_string()
         };
         for (pid, before) in &befores {
-            self.record_step(*pid, "Label", &name, *before);
+            self.record_step(*pid, "Label", &name, before.clone());
         }
         self.last_batch = ids.clone();
         self.last_was_meta = false;
@@ -447,7 +505,9 @@ impl Laika {
     }
 
     fn set_target_collection(&mut self, cid: Option<i64>, cx: &mut Context<Self>) {
-        self.coll.target = cid.filter(|id| Some(*id) != self.coll.quick);
+        self.coll.target = cid.filter(|id| {
+            Some(*id) != self.coll.quick && self.coll.list.iter().any(|c| c.id == *id && !c.smart)
+        });
         if let Some(cat) = self.catalog.as_ref() {
             cat.set_import_default(
                 "target_collection",
@@ -488,6 +548,15 @@ impl Laika {
                 };
                 format!("created {} with {n} photos", buf.trim())
             }
+            NameMode::NewSmart => {
+                let mut criteria = self.state.filters.clone();
+                criteria.smart_collection = None;
+                criteria.smart_collection_name.clear();
+                let json = serde_json::to_string(&criteria)
+                    .map_err(|e| format!("save smart collection: {e}"))?;
+                cat.create_smart_collection(buf, &json)?;
+                format!("saved smart collection {}", buf.trim())
+            }
             NameMode::SaveQuick => {
                 let id = cat.save_quick_collection(buf)?;
                 let n = cat.collection_members(id).len();
@@ -510,23 +579,185 @@ impl Laika {
         Ok(())
     }
 
-    fn open_name_field(&mut self, mode: NameMode, cx: &mut Context<Self>) {
+    pub(crate) fn open_name_field(&mut self, mode: NameMode, cx: &mut Context<Self>) {
         self.coll.name_mode = mode;
         self.coll.name_draft.clear();
         self.focus_field(text_input::FieldId::CollectionName, cx);
         cx.notify();
     }
 
+    pub(crate) fn create_stack_from_selection(&mut self, cx: &mut Context<Self>) {
+        let selected: HashSet<i64> = self.targets().into_iter().collect();
+        let ids: Vec<i64> = self
+            .ordered_ids()
+            .into_iter()
+            .filter(|id| selected.contains(id))
+            .collect();
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        self.status_note = match cat.create_stack(&ids) {
+            Ok(_) => format!("stacked {} photos", ids.len()),
+            Err(e) => e,
+        };
+        self.refresh_collections(cx);
+    }
+
+    pub(crate) fn toggle_primary_stack(&mut self, cx: &mut Context<Self>) {
+        let Some(photo_id) = self.state.primary else {
+            self.status_note = "select a stacked photo first".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(stack) = self.stack_for_photo(photo_id).cloned() else {
+            self.status_note = "the selected photo is not in a stack".to_string();
+            cx.notify();
+            return;
+        };
+        if let Some(cat) = self.catalog.as_ref() {
+            self.status_note = match cat.set_stack_collapsed(stack.id, !stack.collapsed) {
+                Ok(()) => if stack.collapsed {
+                    "stack expanded"
+                } else {
+                    "stack collapsed"
+                }
+                .to_string(),
+                Err(e) => e,
+            };
+        }
+        self.refresh_collections(cx);
+    }
+
+    pub(crate) fn unstack_primary(&mut self, cx: &mut Context<Self>) {
+        let Some(photo_id) = self.state.primary else {
+            self.status_note = "select a stacked photo first".to_string();
+            cx.notify();
+            return;
+        };
+        if let Some(cat) = self.catalog.as_ref() {
+            self.status_note = match cat.unstack_photo(photo_id) {
+                Ok(0) => "the selected photo is not in a stack".to_string(),
+                Ok(n) => format!("unstacked {n} photos; originals were not changed"),
+                Err(e) => e,
+            };
+        }
+        self.refresh_collections(cx);
+    }
+
+    pub(crate) fn stack_raw_jpeg_pairs(&mut self, cx: &mut Context<Self>) {
+        let pairs = self.pair_rows();
+        let mut made = 0;
+        let mut skipped = 0;
+        if let Some(cat) = self.catalog.as_ref() {
+            for pair in pairs {
+                if self.coll.stack_by_photo.contains_key(&pair.raw_id)
+                    || self.coll.stack_by_photo.contains_key(&pair.jpeg_id)
+                {
+                    skipped += 1;
+                    continue;
+                }
+                if cat.create_stack(&[pair.raw_id, pair.jpeg_id]).is_ok() {
+                    made += 1;
+                }
+            }
+        }
+        self.status_note = format!(
+            "created {made} RAW/JPEG stack{}{}",
+            if made == 1 { "" } else { "s" },
+            if skipped > 0 {
+                format!(" · skipped {skipped} already stacked")
+            } else {
+                String::new()
+            }
+        );
+        self.refresh_collections(cx);
+    }
+
+    fn stacks_section(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let primary_stack = self.state.primary.and_then(|id| self.stack_for_photo(id));
+        let count: usize = self.coll.stacks.iter().map(|s| s.count).sum();
+        let button = |id: &'static str, label: &'static str, tip: &'static str| {
+            div()
+                .id(id)
+                .px(px(7.))
+                .py(px(3.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(border_control())
+                .font_family(SANS)
+                .text_size(sp(10.))
+                .text_color(rgb(TEXT_SECONDARY))
+                .hover(|s| s.bg(rgb(bg_row_hover())))
+                .on_hover(self.tip(tip))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(section_header::section_header(
+                &format!("Stacks · {} / {count}", self.coll.stacks.len()),
+                primary_stack.is_some(),
+                window,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .px(px(14.))
+                    .child(
+                        button("stack-selected", "Stack selected", "Group selected photos")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.create_stack_from_selection(cx)),
+                            ),
+                    )
+                    .child(
+                        button(
+                            "stack-toggle",
+                            if primary_stack.is_some_and(|s| s.collapsed) {
+                                "Expand"
+                            } else {
+                                "Collapse"
+                            },
+                            "Expand or collapse the selected photo's stack",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_primary_stack(cx))),
+                    )
+                    .child(
+                        button("stack-remove", "Unstack", "Remove only the stack grouping")
+                            .on_click(cx.listener(|this, _, _, cx| this.unstack_primary(cx))),
+                    )
+                    .child(
+                        button(
+                            "stack-pairs",
+                            "RAW/JPEG pairs",
+                            "Create stacks from detected pairs",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.stack_raw_jpeg_pairs(cx))),
+                    ),
+            )
+    }
+
     /// Left rail: Quick Collection, saved collections, the target marker,
     /// and actions for the collection being viewed.
     pub(crate) fn collections_section(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let selected = self.state.filters.collection;
+        let smart_selected = self.state.filters.smart_collection;
         let target = self.target_collection().map(|c| c.id);
         let mut rows = div().flex().flex_col().gap(px(1.)).px(px(6.));
         for (i, c) in self.coll.list.iter().enumerate() {
-            let active = selected == Some(c.id);
+            let active = if c.smart {
+                smart_selected == Some(c.id)
+            } else {
+                selected == Some(c.id)
+            };
             let is_target = target == Some(c.id);
-            let (cid, name) = (c.id, c.name.clone());
+            let (cid, name, smart) = (c.id, c.name.clone(), c.smart);
+            let count = if c.smart {
+                self.smart_count(c)
+            } else {
+                c.count
+            };
             let drop_hot = self.coll.drop_hover.get() == Some(cid);
             let bounds_map = self.coll.row_bounds.clone();
             let frame = self.render_gen.get();
@@ -569,30 +800,49 @@ impl Laika {
                             .flex_1()
                             .min_w_0()
                             .rounded(px(3.))
-                            .on_hover(self.tip("Filter to this collection · drop photos to add"))
+                            .on_hover(self.tip(if c.smart {
+                                "Load this smart collection's saved criteria"
+                            } else {
+                                "Filter to this collection · drop photos to add"
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let f = &mut this.state.filters;
-                                if f.collection == Some(cid) {
-                                    f.collection = None;
-                                    f.collection_name.clear();
-                                    // V30: album order means nothing outside.
-                                    if f.sort.field == laika_core::state::SortField::Album {
-                                        f.sort.field = laika_core::state::SortField::Captured;
+                                if smart {
+                                    if this.state.filters.smart_collection == Some(cid) {
+                                        this.state.filters = Default::default();
+                                    } else if let Some(saved) =
+                                        this.coll.list.iter().find(|c| c.id == cid).and_then(|c| {
+                                            serde_json::from_str(&c.criteria_json).ok()
+                                        })
+                                    {
+                                        this.state.filters = saved;
+                                        this.state.filters.smart_collection = Some(cid);
+                                        this.state.filters.smart_collection_name = name.clone();
                                     }
                                 } else {
-                                    f.collection = Some(cid);
-                                    f.collection_name = name.clone();
-                                    this.enter_album_sort();
+                                    let f = &mut this.state.filters;
+                                    f.smart_collection = None;
+                                    f.smart_collection_name.clear();
+                                    if f.collection == Some(cid) {
+                                        f.collection = None;
+                                        f.collection_name.clear();
+                                        if f.sort.field == laika_core::state::SortField::Album {
+                                            f.sort.field = laika_core::state::SortField::Captured;
+                                        }
+                                    } else {
+                                        f.collection = Some(cid);
+                                        f.collection_name = name.clone();
+                                        this.enter_album_sort();
+                                    }
                                 }
                                 this.coll.members.replace(None);
                                 cx.notify();
                             }))
                             .child(list_row::list_row(
                                 &c.name,
-                                &c.count.to_string(),
+                                &count.to_string(),
                                 if active {
                                     accent_line()
-                                } else if c.quick {
+                                } else if c.quick || c.smart {
                                     WARNING
                                 } else {
                                     0x424446
@@ -610,22 +860,32 @@ impl Laika {
                             .justify_center()
                             .rounded(px(3.))
                             .font_family(SANS)
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(if is_target {
                                 accent_line()
                             } else {
                                 TEXT_DIMMER
                             }))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
-                            .on_hover(self.tip(if is_target {
+                            .on_hover(self.tip(if c.smart {
+                                "Smart collections cannot be collection targets"
+                            } else if is_target {
                                 "Target collection — B adds here"
                             } else {
                                 "Make this the target collection for B"
                             }))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_target_collection(Some(cid), cx);
+                                if !smart {
+                                    this.set_target_collection(Some(cid), cx);
+                                }
                             }))
-                            .child(if is_target { "●" } else { "○" }),
+                            .child(if c.smart {
+                                "◆"
+                            } else if is_target {
+                                "●"
+                            } else {
+                                "○"
+                            }),
                     ),
             );
         }
@@ -638,13 +898,15 @@ impl Laika {
                 .border_1()
                 .border_color(border_control())
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_SECONDARY))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .on_hover(self.tip(tip))
                 .child(label)
         };
-        let viewing = selected.and_then(|id| self.coll.list.iter().find(|c| c.id == id));
+        let viewing = selected
+            .or(smart_selected)
+            .and_then(|id| self.coll.list.iter().find(|c| c.id == id));
         let mut actions = div()
             .flex()
             .flex_wrap()
@@ -659,6 +921,16 @@ impl Laika {
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.open_name_field(NameMode::New, cx);
+                })),
+            )
+            .child(
+                button(
+                    "collection-smart-new",
+                    "Smart",
+                    "Save the current filter criteria as a smart collection",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_name_field(NameMode::NewSmart, cx);
                 })),
             );
         match viewing {
@@ -702,7 +974,7 @@ impl Laika {
                         })),
                     );
             }
-            Some(c) => {
+            Some(c) if !c.smart => {
                 let cid = c.id;
                 actions = actions
                     .child(
@@ -744,6 +1016,37 @@ impl Laika {
                         })),
                     );
             }
+            Some(c) => {
+                let cid = c.id;
+                actions = actions
+                    .child(
+                        button(
+                            "collection-rename",
+                            "Rename…",
+                            "Rename this smart collection",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_name_field(NameMode::Rename(cid), cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            "collection-delete",
+                            "Delete",
+                            "Delete this smart collection (photos stay in the catalog)",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(cat) = this.catalog.as_ref() {
+                                this.status_note = match cat.delete_collection(cid) {
+                                    Ok(()) => "smart collection deleted".to_string(),
+                                    Err(e) => e,
+                                };
+                            }
+                            this.state.filters = Default::default();
+                            this.refresh_collections(cx);
+                        })),
+                    );
+            }
             None => {}
         }
         let mut col = div()
@@ -757,12 +1060,13 @@ impl Laika {
             .child(rows)
             .child(actions);
         // V30: the viewed collection is also an album.
-        if let Some(c) = viewing {
+        if let Some(c) = viewing.filter(|c| !c.smart) {
             col = col.child(self.album_panel(c, cx));
         }
         if self.coll.name_mode != NameMode::Closed {
             let hint = match self.coll.name_mode {
                 NameMode::New => "New collection name…",
+                NameMode::NewSmart => "Smart collection name…",
                 NameMode::SaveQuick => "Save Quick Collection as…",
                 NameMode::Rename(_) => "Rename to…",
                 NameMode::Closed => "",
@@ -773,7 +1077,7 @@ impl Laika {
                         text_input::FieldId::CollectionName,
                         div()
                             .font_family(SANS)
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIMMER))
                             .child(hint),
                         false,
@@ -783,6 +1087,6 @@ impl Laika {
                 ),
             );
         }
-        col
+        col.child(self.stacks_section(window, cx))
     }
 }

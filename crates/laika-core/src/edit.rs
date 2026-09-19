@@ -143,6 +143,211 @@ pub const TRANSFORM_RANGE: std::ops::Range<usize> = 63..70;
 
 pub const PARAM_COUNT: usize = 70;
 
+/// U20: rendering intent for the camera data. These are Laika profiles,
+/// deliberately not Adobe/DCP profile names. `Standard` preserves the
+/// historical rendering exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CameraProfile {
+    Neutral,
+    Vivid,
+    Monochrome,
+    #[default]
+    #[serde(other)]
+    Standard,
+}
+
+/// U19: a local adjustment carried by every mask. Values use the same
+/// human-facing units as Basic (EV and +/-100 scales).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalAdjustment {
+    #[serde(default)]
+    pub exposure: f32,
+    #[serde(default)]
+    pub contrast: f32,
+    #[serde(default)]
+    pub saturation: f32,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default)]
+    pub tint: f32,
+}
+
+impl Default for LocalAdjustment {
+    fn default() -> Self {
+        Self {
+            exposure: 0.,
+            contrast: 0.,
+            saturation: 0.,
+            temperature: 0.,
+            tint: 0.,
+        }
+    }
+}
+
+impl LocalAdjustment {
+    pub fn sanitized(self) -> Self {
+        let finite = |v: f32| if v.is_finite() { v } else { 0. };
+        Self {
+            exposure: finite(self.exposure).clamp(-5., 5.),
+            contrast: finite(self.contrast).clamp(-100., 100.),
+            saturation: finite(self.saturation).clamp(-100., 100.),
+            temperature: finite(self.temperature).clamp(-100., 100.),
+            tint: finite(self.tint).clamp(-100., 100.),
+        }
+    }
+}
+
+/// One pressure-independent brush sample in normalized original-image
+/// coordinates. Negative/erase state is explicit so strokes stay editable.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BrushPoint {
+    pub position: [f32; 2],
+    pub radius: f32,
+    #[serde(default = "default_flow")]
+    pub flow: f32,
+    #[serde(default)]
+    pub erase: bool,
+}
+
+fn default_flow() -> f32 {
+    1.
+}
+
+/// U19 mask geometry. Every coordinate is normalized in the uncropped,
+/// unrotated original. The renderer evaluates it after its output->source
+/// geometry mapping, so crop/rotate/upright never detach a mask.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MaskShape {
+    Brush {
+        points: Vec<BrushPoint>,
+    },
+    Linear {
+        start: [f32; 2],
+        end: [f32; 2],
+    },
+    Radial {
+        center: [f32; 2],
+        radius: [f32; 2],
+        #[serde(default)]
+        rotation: f32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalMask {
+    pub id: u64,
+    pub name: String,
+    pub shape: MaskShape,
+    #[serde(default = "default_mask_feather")]
+    pub feather: f32,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default)]
+    pub adjustment: LocalAdjustment,
+}
+
+fn default_mask_feather() -> f32 {
+    0.5
+}
+
+/// U19 non-destructive spot heal: target and donor are original-image
+/// coordinates. The operation remains editable and follows geometry.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HealSpot {
+    pub id: u64,
+    pub target: [f32; 2],
+    pub source: [f32; 2],
+    pub radius: f32,
+    #[serde(default = "default_mask_feather")]
+    pub feather: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalEdits {
+    #[serde(default)]
+    pub masks: Vec<LocalMask>,
+    #[serde(default)]
+    pub heals: Vec<HealSpot>,
+}
+
+impl LocalEdits {
+    pub fn is_empty(&self) -> bool {
+        self.masks.is_empty() && self.heals.is_empty()
+    }
+
+    /// Stable per-photo IDs without a global counter or wall-clock coupling.
+    pub fn next_id(&self) -> u64 {
+        self.masks
+            .iter()
+            .map(|m| m.id)
+            .chain(self.heals.iter().map(|h| h.id))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    pub fn sanitized(&self) -> Self {
+        let unit = |v: f32, fallback: f32| {
+            if v.is_finite() {
+                v.clamp(0., 1.)
+            } else {
+                fallback
+            }
+        };
+        let point = |p: [f32; 2]| [unit(p[0], 0.5), unit(p[1], 0.5)];
+        let masks = self
+            .masks
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.feather = unit(m.feather, default_mask_feather());
+                m.adjustment = m.adjustment.sanitized();
+                match &mut m.shape {
+                    MaskShape::Brush { points } => {
+                        for p in points {
+                            p.position = point(p.position);
+                            p.radius = unit(p.radius, 0.1).max(0.0001);
+                            p.flow = unit(p.flow, 1.);
+                        }
+                    }
+                    MaskShape::Linear { start, end } => {
+                        *start = point(*start);
+                        *end = point(*end);
+                    }
+                    MaskShape::Radial {
+                        center,
+                        radius,
+                        rotation,
+                    } => {
+                        *center = point(*center);
+                        *radius = [
+                            unit(radius[0], 0.25).max(0.0001),
+                            unit(radius[1], 0.25).max(0.0001),
+                        ];
+                        if !rotation.is_finite() {
+                            *rotation = 0.;
+                        }
+                    }
+                }
+                m
+            })
+            .collect();
+        let heals = self
+            .heals
+            .iter()
+            .cloned()
+            .map(|mut h| {
+                h.target = point(h.target);
+                h.source = point(h.source);
+                h.radius = unit(h.radius, 0.04).max(0.0001);
+                h.feather = unit(h.feather, default_mask_feather());
+                h
+            })
+            .collect();
+        Self { masks, heals }
+    }
+}
+
 /// V22: the manual Transform sliders as an Upright transform.
 pub fn transform_of(params: &[f32; PARAM_COUNT]) -> crate::upright::Transform {
     crate::upright::Transform {
@@ -230,6 +435,10 @@ pub struct Edit {
     pub optics_on: bool,
     pub effects_on: bool,
     pub grading_on: bool,
+    /// U19: editable local masks and spot heals.
+    pub locals: LocalEdits,
+    /// U20: Laika camera rendering profile (not an Adobe profile name).
+    pub camera_profile: CameraProfile,
 }
 
 /// U09: white-balance presets (Temp Kelvin; tint stays where the user
@@ -723,10 +932,14 @@ pub struct HistoryStep {
     pub rejected: bool,
     /// V13: color label rides every step (0 = none).
     pub color_label: u8,
+    /// U19: complete local edit state makes each undo step deterministic.
+    pub locals: LocalEdits,
+    /// U20: camera profile changes undo with the rest of Develop.
+    pub camera_profile: CameraProfile,
 }
 
 /// U14: full restorable photo state for undo steps, snapshots, and reloads.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snap {
     pub params: [f32; PARAM_COUNT],
     pub crop: Option<f32>,
@@ -744,6 +957,8 @@ pub struct Snap {
     pub rejected: bool,
     /// V13: color label rides every step (0 = none).
     pub color_label: u8,
+    pub locals: LocalEdits,
+    pub camera_profile: CameraProfile,
 }
 
 /// Persisted history rows survive unknown future fields.
@@ -778,6 +993,10 @@ pub struct HistoryJson {
     pub rejected: bool,
     #[serde(default)]
     pub color_label: u8,
+    #[serde(default)]
+    pub locals: LocalEdits,
+    #[serde(default)]
+    pub camera_profile: CameraProfile,
 }
 
 impl HistoryStep {
@@ -798,6 +1017,8 @@ impl HistoryStep {
             picked: self.picked,
             rejected: self.rejected,
             color_label: self.color_label,
+            locals: self.locals.clone(),
+            camera_profile: self.camera_profile,
         }
     }
 
@@ -820,6 +1041,8 @@ impl HistoryStep {
             picked: j.picked,
             rejected: j.rejected,
             color_label: j.color_label,
+            locals: j.locals.clone(),
+            camera_profile: j.camera_profile,
         })
     }
 }
@@ -851,6 +1074,8 @@ impl Edit {
             optics_on: true,
             effects_on: true,
             grading_on: true,
+            locals: LocalEdits::default(),
+            camera_profile: CameraProfile::default(),
         }
     }
 
@@ -882,6 +1107,8 @@ impl Edit {
             picked: snap.picked,
             rejected: snap.rejected,
             color_label: snap.color_label,
+            locals: snap.locals.clone(),
+            camera_profile: snap.camera_profile,
         });
         self.params = snap.params;
         self.crop = snap.crop;
@@ -892,6 +1119,8 @@ impl Edit {
         self.optics_on = snap.optics_on;
         self.effects_on = snap.effects_on;
         self.grading_on = snap.grading_on;
+        self.locals = snap.locals;
+        self.camera_profile = snap.camera_profile;
         self.cursor = self.history.len();
         // Cap depth but pin the baseline: the first step always stays the
         // undo floor, even across restarts.
@@ -921,6 +1150,8 @@ impl Edit {
                 picked: false,
                 rejected: false,
                 color_label: 0,
+                locals: self.locals.clone(),
+                camera_profile: self.camera_profile,
             },
         );
     }
@@ -945,6 +1176,8 @@ impl Edit {
                 picked: snap.picked,
                 rejected: snap.rejected,
                 color_label: snap.color_label,
+                locals: snap.locals.clone(),
+                camera_profile: snap.camera_profile,
             });
             self.cursor = 1;
         }
@@ -991,6 +1224,8 @@ impl Edit {
         self.optics_on = step.optics_on;
         self.effects_on = step.effects_on;
         self.grading_on = step.grading_on;
+        self.locals = step.locals.clone();
+        self.camera_profile = step.camera_profile;
     }
 }
 
@@ -1016,6 +1251,8 @@ pub fn step_snap(step: &HistoryStep) -> Snap {
         picked: step.picked,
         rejected: step.rejected,
         color_label: step.color_label,
+        locals: step.locals.clone(),
+        camera_profile: step.camera_profile,
     }
 }
 
@@ -1218,6 +1455,8 @@ mod tests {
             picked: true,
             rejected: false,
             color_label: 3,
+            locals: LocalEdits::default(),
+            camera_profile: CameraProfile::default(),
         }
     }
 
@@ -1251,6 +1490,41 @@ mod tests {
         e.push_snap("Exposure", "-0.50", snap_of(p2));
         assert_eq!(e.history.len(), 2);
         assert!(e.redo().is_none());
+    }
+
+    #[test]
+    fn local_edits_and_camera_profile_survive_history_restart_and_undo() {
+        let mut e = Edit::new();
+        let base = snap_of(defaults());
+        e.ensure_baseline(base.clone());
+        let mut changed = base;
+        changed.camera_profile = CameraProfile::Vivid;
+        changed.locals.masks.push(LocalMask {
+            id: 1,
+            name: "Sky".into(),
+            shape: MaskShape::Linear {
+                start: [0.1, 0.2],
+                end: [0.9, 0.8],
+            },
+            feather: 0.7,
+            invert: true,
+            adjustment: LocalAdjustment {
+                exposure: -0.8,
+                ..Default::default()
+            },
+        });
+        e.push_snap("Linear Gradient", "add", changed.clone());
+        let json = encode_history(&e.history);
+        let history = decode_history(&json);
+        assert_eq!(history[1].locals, changed.locals);
+        assert_eq!(history[1].camera_profile, CameraProfile::Vivid);
+
+        e.history = history;
+        let undone = e.undo().expect("baseline is undoable");
+        assert!(undone.locals.is_empty());
+        assert_eq!(undone.camera_profile, CameraProfile::Standard);
+        let redone = e.redo().expect("local step is redoable");
+        assert_eq!(redone.locals, changed.locals);
     }
 
     #[test]

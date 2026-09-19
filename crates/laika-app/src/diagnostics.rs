@@ -27,8 +27,7 @@ pub(crate) fn bundled_samples() -> Option<PathBuf> {
             .map(|r| r.flatten().any(|e| laika_raw::is_raw(&e.path())))
             .unwrap_or(false)
     };
-    let exe = std::env::current_exe().ok()?;
-    let bundled = exe.parent()?.parent()?.join("Resources").join("samples");
+    let bundled = laika_core::platform::resource_dir()?.join("samples");
     if has_raw(&bundled) {
         return Some(bundled);
     }
@@ -134,12 +133,20 @@ impl Laika {
     pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
         self.close_modals(cx);
         if self.diag.os_version.is_empty() {
-            self.diag.os_version = std::process::Command::new("sw_vers")
+            #[cfg(target_os = "macos")]
+            let version = std::process::Command::new("sw_vers")
                 .arg("-productVersion")
-                .output()
+                .output();
+            #[cfg(target_os = "windows")]
+            let version = std::process::Command::new("cmd")
+                .args(["/C", "ver"])
+                .output();
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let version = std::process::Command::new("uname").arg("-sr").output();
+            self.diag.os_version = version
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| std::env::consts::OS.to_string());
         }
         // The GPU line names the adapter; starting the renderer is quick.
         self.ensure_dev(cx);
@@ -149,7 +156,7 @@ impl Laika {
         cx.notify();
     }
 
-    /// Reveal the live log in Finder.
+    /// Reveal the live log in Finder / File Explorer / the file manager.
     pub(crate) fn show_log(&mut self, cx: &mut Context<Self>) {
         match laika_core::logging::log_path() {
             Some(p) => {
@@ -192,7 +199,7 @@ impl Laika {
                 .rounded(px(4.))
                 .border_1()
                 .border_color(border_control())
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .text_color(rgb(TEXT_SECONDARY))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .child(label.to_string())
@@ -211,7 +218,7 @@ impl Laika {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(20.))
+                            .text_size(sp(20.))
                             .text_color(rgb(TEXT_PRIMARY))
                             .child("LAIKA"),
                     )
@@ -219,7 +226,7 @@ impl Laika {
                     .child(
                         div()
                             .id("about-close")
-                            .text_size(px(15.))
+                            .text_size(sp(15.))
                             .text_color(rgb(TEXT_DIM))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -231,7 +238,7 @@ impl Laika {
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(sp(12.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(build_line()),
             )
@@ -251,7 +258,7 @@ impl Laika {
                                 div()
                                     .w(px(96.))
                                     .flex_none()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(k),
                             )
@@ -259,7 +266,7 @@ impl Laika {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(11.))
+                                    .text_size(sp(11.))
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(v),
                             )
@@ -276,7 +283,7 @@ impl Laika {
                     .child(
                         div()
                             .pl(px(35.))
-                            .text_size(px(10.5))
+                            .text_size(sp(10.5))
                             .text_color(rgb(TEXT_DIM))
                             .child("Reports stay on this Mac beside the log. Nothing is sent anywhere; attach one to an issue if you choose."),
                     ),
@@ -284,7 +291,7 @@ impl Laika {
             .when(!self.diag.note.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(self.diag.note.clone()),
                 )
@@ -392,7 +399,7 @@ impl Laika {
                 .rounded(px(4.))
                 .border_1()
                 .border_color(border_control())
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(rgb(TEXT_SECONDARY))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .child(label.to_string())
@@ -404,14 +411,14 @@ impl Laika {
             .gap(px(12.))
             .child(
                 div()
-                    .text_size(px(18.))
+                    .text_size(sp(18.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT_PRIMARY))
                     .child(title),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .line_height(relative(1.5))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(detail),
@@ -422,7 +429,7 @@ impl Laika {
                         .p(px(8.))
                         .rounded(px(4.))
                         .bg(rgb(bg_well()))
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(path),
                 )
@@ -432,7 +439,7 @@ impl Laika {
                 |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(WARNING))
                             .child(self.manage_note.clone()),
                     )
@@ -495,8 +502,7 @@ impl Laika {
             cx.notify();
             return;
         };
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let dest = PathBuf::from(home).join("Pictures").join("Laika Samples");
+        let dest = laika_core::platform::pictures_dir().join("Laika Samples");
         if let Err(e) = std::fs::create_dir_all(&dest) {
             self.diag.note = format!("couldn't create {}: {e}", dest.display());
             cx.notify();
@@ -541,14 +547,14 @@ impl Laika {
                 .gap(px(3.))
                 .child(
                     div()
-                        .text_size(px(12.5))
+                        .text_size(sp(12.5))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(TEXT_PRIMARY))
                         .child(title.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(sp(11.5))
                         .line_height(relative(1.5))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(body.to_string()),
@@ -569,14 +575,14 @@ impl Laika {
                 .hover(|d| d.bg(rgb(bg_row_hover())))
                 .child(
                     div()
-                        .text_size(px(12.5))
+                        .text_size(sp(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(if primary { accent_line() } else { TEXT_PRIMARY }))
                         .child(title.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(TEXT_DIM))
                         .child(body.to_string()),
                 )
@@ -593,14 +599,14 @@ impl Laika {
                     .gap(px(6.))
                     .child(
                         div()
-                            .text_size(px(24.))
+                            .text_size(sp(24.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
                             .child("Welcome to Laika"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(sp(12.5))
                             .text_color(rgb(TEXT_SECONDARY))
                             .child("A photo catalog and RAW developer that keeps everything on your Mac."),
                     ),
@@ -611,7 +617,7 @@ impl Laika {
             ))
             .child(point(
                 "One catalog file",
-                "Ratings, edits, collections, and galleries live in a single catalog you can move or back up. Backup and Apple Photos sync are optional — set them up later.",
+                "Ratings, edits, collections, and galleries live in a single catalog you can move or back up. Remote backup is optional; Apple Photos sync is available on macOS.",
             ))
             .child(
                 div()
@@ -628,8 +634,8 @@ impl Laika {
                             .flex()
                             .flex_col()
                             .gap(px(2.))
-                            .child(div().text_size(px(10.)).text_color(rgb(TEXT_DIM)).child("CATALOG"))
-                            .child(div().text_size(px(11.)).text_color(rgb(TEXT_SECONDARY)).child(catalog)),
+                            .child(div().text_size(sp(10.)).text_color(rgb(TEXT_DIM)).child("CATALOG"))
+                            .child(div().text_size(sp(11.)).text_color(rgb(TEXT_SECONDARY)).child(catalog)),
                     )
                     .child(
                         div()
@@ -639,7 +645,7 @@ impl Laika {
                             .rounded(px(4.))
                             .border_1()
                             .border_color(border_control())
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -684,8 +690,29 @@ impl Laika {
                         })),
                     ),
             )
+            // S04: switching from Lightroom? Its keys and a concept map.
+            .child({
+                let on = self.library.prefs.lightroom_keys;
+                div()
+                    .id("welcome-lightroom")
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .p(px(10.))
+                    .rounded(px(5.))
+                    .bg(rgb(bg_well()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_lightroom_keys(!on, cx)))
+                    .child(toggle::toggle(on, "I'm coming from Lightroom"))
+                    .child(
+                        div()
+                            .pl(px(35.))
+                            .text_size(sp(10.5))
+                            .text_color(rgb(TEXT_DIM))
+                            .child("Use Lightroom Classic's keyboard shortcuts. Help → Laika for Lightroom Users maps catalogs, collections, and presets, and File → Import from Lightroom brings your library across."),
+                    )
+            })
             .when(!self.diag.note.is_empty(), |d| {
-                d.child(div().text_size(px(11.)).text_color(rgb(WARNING)).child(self.diag.note.clone()))
+                d.child(div().text_size(sp(11.)).text_color(rgb(WARNING)).child(self.diag.note.clone()))
             })
             .child(
                 div()
@@ -694,7 +721,7 @@ impl Laika {
                     .child(
                         div()
                             .id("welcome-skip")
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .text_color(rgb(TEXT_DIM))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                             .on_click(cx.listener(|this, _, _, cx| {

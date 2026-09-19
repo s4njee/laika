@@ -634,9 +634,10 @@ impl Laika {
             }
             F::GalleryOutputDir => {
                 let expanded = if let Some(rest) = text.strip_prefix("~/") {
-                    std::env::var("HOME")
-                        .map(|h| format!("{h}/{rest}"))
-                        .unwrap_or(text.clone())
+                    laika_core::platform::home_dir()
+                        .join(rest)
+                        .to_string_lossy()
+                        .to_string()
                 } else {
                     text.clone()
                 };

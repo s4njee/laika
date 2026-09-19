@@ -1,7 +1,7 @@
 name: release
 
 # Every push to main publishes a rolling "nightly" prerelease; a `v*` tag
-# publishes a versioned release. Both attach Laika.app as .zip and .dmg.
+# publishes a versioned release. macOS and Windows artifacts are built natively.
 on:
   push:
     branches: [main]
@@ -28,7 +28,7 @@ jobs:
           key: release
 
       - name: Build
-        run: cargo build --release -p laika-app
+        run: cargo build --release -p laika-app -p laika-render
 
       - name: Bundle
         id: bundle
@@ -56,10 +56,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="Laika ${GITHUB_REF_NAME} for macOS (Apple silicon).
+          notes="Laika ${GITHUB_REF_NAME} for macOS (Apple silicon) and Windows x64.
 
-          The app is ad-hoc signed, not notarized. After downloading, open it once
-          with right-click → Open (or run \`xattr -cr /Applications/Laika.app\`)."
+          The macOS app is ad-hoc signed, not notarized; open it once with
+          right-click → Open. The Windows preview is unsigned and may show a
+          SmartScreen warning."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.dmg dist/*.sha256 --clobber
           else
@@ -76,4 +77,61 @@ jobs:
           gh release create nightly dist/*.zip dist/*.dmg dist/*.sha256 \
             --prerelease --target "$GITHUB_SHA" \
             --title "Laika nightly (${GITHUB_SHA::7})" \
-            --notes "Latest build of main at ${GITHUB_SHA}. Ad-hoc signed, not notarized: right-click → Open on first launch."
+            --notes "Latest macOS Apple-silicon and Windows x64 builds of main at ${GITHUB_SHA}. These development builds are not notarized/code-signed."
+
+  windows:
+    needs: macos
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: Check and test
+        shell: pwsh
+        run: |
+          cargo check --workspace --all-targets --locked
+          cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release -p laika-app -p laika-render --locked
+
+      - name: Bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+          } else {
+            $line = Select-String -Path "crates/laika-app/Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            $base = $line.Matches[0].Groups[1].Value
+            $version = "$base-nightly.$(Get-Date -AsUTC -Format yyyyMMdd).$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          .\scripts\bundle-windows.ps1 -Version $version
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Laika-${{ steps.bundle.outputs.version }}-windows
+          path: |
+            dist/*-windows-x64.zip
+            dist/*-windows-x64.zip.sha256
+
+      - name: Add Windows files to tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release upload $env:GITHUB_REF_NAME dist/*-windows-x64.zip dist/*-windows-x64.zip.sha256 --clobber
+
+      - name: Add Windows files to nightly release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release upload nightly dist/*-windows-x64.zip dist/*-windows-x64.zip.sha256 --clobber

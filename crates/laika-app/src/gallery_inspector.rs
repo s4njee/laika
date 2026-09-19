@@ -13,7 +13,7 @@ fn section(title: &str) -> Div {
         .pt(px(4.))
         .font_family(PLEX_MONO)
         .font_weight(FontWeight::MEDIUM)
-        .text_size(px(9.5))
+        .text_size(sp(9.5))
         .text_color(rgb(TEXT_DIM))
         .child(title.to_uppercase())
 }
@@ -22,7 +22,7 @@ fn row_label(t: &str) -> Div {
     div()
         .w(px(78.))
         .flex_none()
-        .text_size(px(11.5))
+        .text_size(sp(11.5))
         .text_color(rgb(TEXT_TERTIARY))
         .child(t.to_string())
 }
@@ -36,7 +36,7 @@ fn value_text(v: &str, placeholder: &str) -> Div {
         .rounded(px(4.))
         .bg(rgb(bg_well()))
         .overflow_hidden()
-        .text_size(px(11.5))
+        .text_size(sp(11.5))
         .text_color(rgb(if v.is_empty() {
             TEXT_DIMMER
         } else {
@@ -52,12 +52,15 @@ fn value_text(v: &str, placeholder: &str) -> Div {
 fn seg_button(id: impl Into<ElementId>, label: &str, on: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.to_string())
+        .aria_toggled(if on { Toggled::True } else { Toggled::False })
         .flex_1()
         .flex()
         .justify_center()
         .py(px(5.))
         .rounded(px(4.))
-        .text_size(px(11.))
+        .text_size(sp(11.))
         .when(on, |d| {
             d.bg(rgb(accent_fill())).text_color(rgb(accent_on_fill()))
         })
@@ -77,11 +80,7 @@ fn hexs(c: u32) -> String {
 impl Laika {
     pub(crate) fn gallery_inspector(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let tab = self.gal.tab;
-        let width = if tab == InspectorTab::Page {
-            348.
-        } else {
-            300.
-        };
+        let width = self.right_rail_width;
         let tabs = [
             ("Photo", InspectorTab::Photo),
             ("Layout", InspectorTab::Layout),
@@ -112,11 +111,14 @@ impl Laika {
                         let on = t == tab;
                         div()
                             .id(("gal-tab", t as usize))
+                            .role(Role::Tab)
+                            .aria_label(*name)
+                            .aria_selected(on)
                             .flex_1()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_MUTED }))
                             .when(on, |d| d.border_b_2().border_color(rgb(TEXT_PRIMARY)))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
@@ -172,6 +174,9 @@ impl Laika {
         let label_s = label.to_string();
         div()
             .id(id)
+            .role(Role::Switch)
+            .aria_label(label.to_string())
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.gal_edit(&label_s, None, f, cx);
             }))
@@ -193,15 +198,71 @@ impl Laika {
             _ => self.gal.gutter_box.clone(),
         };
         let frac = frac.clamp(0., 1.);
+        let accessible_value = readout.clone();
+        let nudge = |id: &'static str, glyph: &'static str, direction: i8| {
+            div()
+                .id((id, kind as usize))
+                .role(Role::Button)
+                .aria_label(format!(
+                    "{} {}",
+                    if direction < 0 {
+                        "Decrease"
+                    } else {
+                        "Increase"
+                    },
+                    label
+                ))
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(border_control())
+                .text_size(sp(12.))
+                .text_color(rgb(TEXT_SECONDARY))
+                .hover(|d| d.bg(rgb(bg_row_hover())))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.gal_nudge_slider(kind, direction, cx)),
+                )
+                .child(glyph)
+        };
         div()
             .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(row_label(label))
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(row_label(label).flex_1())
+                    .child(
+                        div()
+                            .w(px(42.))
+                            .flex_none()
+                            .flex()
+                            .justify_end()
+                            .font_family(PLEX_MONO)
+                            .text_size(sp(11.))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(readout),
+                    )
+                    .child(nudge("gal-slider-less", "−", -1))
+                    .child(nudge("gal-slider-more", "+", 1)),
+            )
             .child(
                 div()
                     .id(("gal-slider", kind as usize))
-                    .flex_1()
+                    .role(Role::Slider)
+                    .aria_label(label.to_string())
+                    .aria_orientation(Orientation::Horizontal)
+                    .aria_numeric_value(frac as f64)
+                    .aria_min_numeric_value(0.)
+                    .aria_max_numeric_value(1.)
+                    .aria_numeric_value_step(0.01)
+                    .aria_value(accessible_value)
+                    .w_full()
                     .h(px(18.))
                     .relative()
                     .on_mouse_down(
@@ -248,17 +309,6 @@ impl Laika {
                             .border_color(rgb(TEXT_PRIMARY)),
                     ),
             )
-            .child(
-                div()
-                    .w(px(40.))
-                    .flex_none()
-                    .flex()
-                    .justify_end()
-                    .font_family(PLEX_MONO)
-                    .text_size(px(11.))
-                    .text_color(rgb(TEXT_SECONDARY))
-                    .child(readout),
-            )
     }
 
     // ---- Photo tab --------------------------------------------------------------
@@ -276,7 +326,7 @@ impl Laika {
                 .flex_col()
                 .items_center()
                 .gap(px(6.))
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("No photo selected")
                 .child("Click a photo on the page or in the tray");
@@ -368,7 +418,7 @@ impl Laika {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(10.5))
+                .text_size(sp(10.5))
                 .text_color(rgb(TEXT_DIM))
                 .child("Loading preview…"),
         };
@@ -402,7 +452,7 @@ impl Laika {
                             .gap(px(3.))
                             .child(
                                 div()
-                                    .text_size(px(12.5))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(TEXT_PRIMARY))
                                     .overflow_hidden()
@@ -411,7 +461,7 @@ impl Laika {
                             .child(
                                 div()
                                     .font_family(PLEX_MONO)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(
                                         row.map(|r| format!("{} × {}", r.width, r.height))
@@ -420,7 +470,7 @@ impl Laika {
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(if placed { TEXT_DIM } else { WARNING }))
                                     .child(match p.cell {
                                         Some(c) => format!(
@@ -521,6 +571,13 @@ impl Laika {
             .child(
                 div()
                     .id("gal-open-full")
+                    .role(Role::Switch)
+                    .aria_label("Open full size on click")
+                    .aria_toggled(if p.open_full_size {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.gal_edit(
                             "Open full size",
@@ -614,13 +671,13 @@ impl Laika {
                             .gap(px(3.))
                             .child(
                                 div()
-                                    .text_size(px(12.5))
+                                    .text_size(sp(12.5))
                                     .text_color(rgb(TEXT_PRIMARY))
                                     .child(t.name),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(t.description),
                             ),
@@ -743,7 +800,7 @@ impl Laika {
             )
             .child(
                 div()
-                    .text_size(px(10.5))
+                    .text_size(sp(10.5))
                     .text_color(rgb(TEXT_DIM))
                     .child("Long edge in pixels; never upscaled. JPEG, sRGB, no EXIF or GPS."),
             )
@@ -901,7 +958,7 @@ impl Laika {
                             .w(px(40.))
                             .font_family(fam)
                             .font_weight(weight)
-                            .text_size(px(23.))
+                            .text_size(sp(23.))
                             .text_color(rgb(t.ink))
                             .child("Aa"),
                     )
@@ -912,13 +969,13 @@ impl Laika {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(t.ink))
                                     .child(p.name()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(rgba((t.ink << 8) | 0x80))
                                     .child(p.descriptor()),
                             ),
@@ -927,7 +984,7 @@ impl Laika {
                         d.child(
                             div()
                                 .font_family(PLEX_MONO)
-                                .text_size(px(9.))
+                                .text_size(sp(9.))
                                 .text_color(rgb(accent_line()))
                                 .child("IN USE"),
                         )
@@ -977,7 +1034,7 @@ impl Laika {
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.5))
+                                    .text_size(sp(9.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child(name.to_string()),
                             )
@@ -1003,13 +1060,13 @@ impl Laika {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(18.))
+                                    .text_size(sp(18.))
                                     .text_color(rgb(TEXT_DIM))
                                     .child("+"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.5))
+                                    .text_size(sp(9.5))
                                     .text_color(rgb(TEXT_DIM))
                                     .child("add"),
                             ),
@@ -1069,7 +1126,7 @@ impl Laika {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_size(px(10.5))
+                        .text_size(sp(10.5))
                         .text_color(rgb(TEXT_TERTIARY))
                         .child(
                             div()
@@ -1179,10 +1236,10 @@ impl Laika {
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT_PRIMARY)).child("Choose a layout"))
+                            .child(div().text_size(sp(22.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT_PRIMARY)).child("Choose a layout"))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(sp(12.))
                                     .text_color(rgb(TEXT_TERTIARY))
                                     .child(format!(
                                         "Your {} photos flow into the grid. You can move any of them afterwards.",
@@ -1193,7 +1250,7 @@ impl Laika {
                     .child(
                         div()
                             .id("gal-picker-close")
-                            .text_size(px(15.))
+                            .text_size(sp(15.))
                             .text_color(rgb(TEXT_DIM))
                             .hover(|d| d.text_color(rgb(TEXT_PRIMARY)))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1212,7 +1269,7 @@ impl Laika {
                         .px(px(10.))
                         .py(px(4.))
                         .rounded(px(12.))
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .when(on, |d| d.bg(rgb(TEXT_PRIMARY)).text_color(rgb(bg_panel())))
                         .when(!on, |d| d.border_1().border_color(border_control()).text_color(rgb(TEXT_SECONDARY)))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1263,7 +1320,7 @@ impl Laika {
                                             .rounded(px(3.))
                                             .bg(rgb(accent_fill()))
                                             .font_family(PLEX_MONO)
-                                            .text_size(px(9.))
+                                            .text_size(sp(9.))
                                             .text_color(rgb(accent_on_fill()))
                                             .child("CURRENT"),
                                     )
@@ -1276,8 +1333,8 @@ impl Laika {
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
-                                .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT_PRIMARY)).child(t.name))
-                                .child(div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(t.description)),
+                                .child(div().text_size(sp(12.5)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT_PRIMARY)).child(t.name))
+                                .child(div().text_size(sp(11.)).text_color(rgb(TEXT_DIM)).child(t.description)),
                         )
                 })),
             )
@@ -1290,7 +1347,7 @@ impl Laika {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(div().flex_1().text_size(px(11.5)).text_color(rgb(TEXT_TERTIARY)).child("Switching layouts keeps your captions and photo order."))
+                    .child(div().flex_1().text_size(sp(11.5)).text_color(rgb(TEXT_TERTIARY)).child("Switching layouts keeps your captions and photo order."))
                     .child(
                         div()
                             .id("gal-picker-cancel")

@@ -14,6 +14,8 @@ use gpui_kit::*;
 /// Editable field identities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FieldId {
+    /// S04: command palette query.
+    Palette,
     PublishTitle,
     PublishSlug,
     S3Endpoint,
@@ -148,6 +150,32 @@ pub enum FieldId {
     KwExportPath,
     /// V18: timeline Jump to Date (YYYY-MM-DD or YYYY-MM).
     TimelineJump,
+    /// U16: native develop preset editor.
+    DevelopPresetName,
+    DevelopPresetGroup,
+}
+
+impl FieldId {
+    /// Stable, human-readable fallback name for the active editor's
+    /// accessibility node. Visible field labels remain the primary context.
+    pub fn accessible_name(self) -> String {
+        if let Self::SliderValue(i) = self {
+            return laika_core::edit::PARAMS
+                .get(i)
+                .map(|d| format!("{} value", d.label))
+                .unwrap_or_else(|| "Develop adjustment value".to_string());
+        }
+        let debug = format!("{self:?}");
+        let base = debug.split('(').next().unwrap_or(&debug);
+        let mut out = String::new();
+        for ch in base.chars() {
+            if ch.is_ascii_uppercase() && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(ch);
+        }
+        out
+    }
 }
 
 /// One active editor: buffer plus caret/selection/undo state.
@@ -545,7 +573,7 @@ pub fn plain_param(i: usize, v: f32) -> String {
 /// Render an active editor: text with selection highlight, caret bar, focus
 /// ring, and an optional validation error line. `mask` renders bullets for
 /// secrets without ever echoing the value.
-pub fn render_editor(edit: &FieldEdit, mask: bool) -> Div {
+pub fn render_editor(edit: &FieldEdit, mask: bool) -> Stateful<Div> {
     let shown = if mask {
         "•".repeat(edit.buffer.chars().count())
     } else {
@@ -575,6 +603,18 @@ pub fn render_editor(edit: &FieldEdit, mask: bool) -> Div {
     // When a selection exists the caret bar renders at its end (standard
     // behavior); the split above already placed `mid` before the bar.
     div()
+        .id("active-text-input")
+        .role(if mask {
+            Role::PasswordInput
+        } else {
+            Role::TextInput
+        })
+        .aria_label(edit.id.accessible_name())
+        .aria_value(if mask {
+            "•".repeat(edit.buffer.chars().count())
+        } else {
+            edit.buffer.clone()
+        })
         .flex()
         .flex_col()
         .gap(px(4.))
@@ -589,7 +629,7 @@ pub fn render_editor(edit: &FieldEdit, mask: bool) -> Div {
                 .border_color(rgb(accent_line()))
                 .rounded(px(3.))
                 .font_family(SANS)
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(rgb(TEXT_PRIMARY))
                 .child(div().child(pre.to_string()))
                 .when(!mid.is_empty(), |d| {
@@ -610,7 +650,7 @@ pub fn render_editor(edit: &FieldEdit, mask: bool) -> Div {
             d.child(
                 div()
                     .font_family(SANS)
-                    .text_size(px(10.))
+                    .text_size(sp(10.))
                     .text_color(rgb(0xE56060))
                     .child(edit.error.clone().unwrap_or_default()),
             )

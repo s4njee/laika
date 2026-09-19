@@ -3,7 +3,7 @@
 //! Surfaces and the accent are runtime-switchable (Settings → Appearance)
 //! and read through functions; text greys stay constant.
 
-use gpui_kit::{Hsla, rgba};
+use gpui_kit::{Hsla, Pixels, px, rgba};
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Surface palette. Grey is the default (neutral with a slight cool
@@ -189,11 +189,27 @@ pub fn hist_bar_library() -> u32 {
 
 pub const TEXT_PRIMARY: u32 = 0xDEE4EA;
 pub const TEXT_SECONDARY: u32 = 0xB1B6BB;
-pub const TEXT_TERTIARY: u32 = 0x9DA1A5;
-pub const TEXT_MUTED: u32 = 0x808488;
-pub const TEXT_DIM: u32 = 0x66696C;
-pub const TEXT_DIMMER: u32 = 0x74777A;
+pub const TEXT_TERTIARY: u32 = 0xA8ADB2;
+pub const TEXT_MUTED: u32 = 0x979CA1;
+pub const TEXT_DIM: u32 = 0x8B9095;
+pub const TEXT_DIMMER: u32 = 0x7E8388;
 pub const WARNING: u32 = 0xE5C860;
+
+/// U22: scale every explicit UI font while leaving image/layout geometry in
+/// logical pixels. Stored as percent to keep it deterministic and testable.
+static TEXT_SCALE: AtomicU32 = AtomicU32::new(100);
+
+pub fn set_text_scale(percent: u8) {
+    TEXT_SCALE.store(percent.clamp(85, 150) as u32, Ordering::Relaxed);
+}
+
+pub fn text_scale_percent() -> u8 {
+    TEXT_SCALE.load(Ordering::Relaxed) as u8
+}
+
+pub fn sp(value: f32) -> Pixels {
+    px(value * text_scale_percent() as f32 / 100.)
+}
 
 /// Accent choices offered in Settings: (label, line color). Any other
 /// `#RRGGBB` is accepted as a custom accent.
@@ -359,6 +375,29 @@ pub mod layout {
 mod tests {
     use super::*;
 
+    fn luminance(rgb: u32) -> f32 {
+        let channel = |v: u32| {
+            let s = v as f32 / 255.;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel((rgb >> 16) & 0xff)
+            + 0.7152 * channel((rgb >> 8) & 0xff)
+            + 0.0722 * channel(rgb & 0xff)
+    }
+
+    fn contrast(a: u32, b: u32) -> f32 {
+        let (light, dark) = if luminance(a) > luminance(b) {
+            (luminance(a), luminance(b))
+        } else {
+            (luminance(b), luminance(a))
+        };
+        (light + 0.05) / (dark + 0.05)
+    }
+
     #[test]
     fn hex_parsing() {
         assert_eq!(parse_hex("#3D8BFF"), Some(0x3D8BFF));
@@ -372,6 +411,14 @@ mod tests {
             Appearance::Black
         );
         assert_eq!(Appearance::parse(""), Appearance::Grey);
+    }
+
+    #[test]
+    fn secondary_text_meets_small_text_contrast() {
+        for surface in [GREY.panel, GREY.chrome, GREY.well, BLACK.panel] {
+            assert!(contrast(TEXT_DIM, surface) >= 4.5);
+            assert!(contrast(TEXT_SECONDARY, surface) >= 4.5);
+        }
     }
 
     #[test]

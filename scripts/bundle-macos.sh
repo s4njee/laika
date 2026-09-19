@@ -11,6 +11,8 @@ version="${version#v}"
 arch="$(uname -m)"
 bin="target/release/laika"
 [ -x "$bin" ] || { echo "missing $bin — run: cargo build --release -p laika-app" >&2; exit 1; }
+render_bin="target/release/laika-render"
+[ -x "$render_bin" ] || { echo "missing $render_bin — run: cargo build --release -p laika-render" >&2; exit 1; }
 
 dist="$root/dist"
 app="$dist/Laika.app"
@@ -18,6 +20,7 @@ rm -rf "$dist"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/fonts" "$app/Contents/Resources/samples"
 
 cp "$bin" "$app/Contents/MacOS/laika"
+cp "$render_bin" "$app/Contents/MacOS/laika-render"
 cp assets/icon/Laika.icns "$app/Contents/Resources/Laika.icns"
 cp assets/fonts/*.ttf "$app/Contents/Resources/fonts/"
 # First-run sample photos (V32 "Try with sample photos").

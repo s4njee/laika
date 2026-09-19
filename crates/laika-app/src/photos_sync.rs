@@ -64,6 +64,10 @@ pub(crate) struct AppleSync {
 
 impl Laika {
     pub(crate) fn load_apple_sync(&mut self) {
+        if !cfg!(target_os = "macos") {
+            self.apple = AppleSync::default();
+            return;
+        }
         let settings = self
             .catalog
             .as_ref()
@@ -485,7 +489,7 @@ impl Laika {
                 .border_1()
                 .border_color(border_control())
                 .font_family(SANS)
-                .text_size(px(10.))
+                .text_size(sp(10.))
                 .text_color(rgb(TEXT_SECONDARY))
                 .hover(|s| s.bg(rgb(bg_row_hover())))
                 .child(label)
@@ -506,7 +510,7 @@ impl Laika {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_SECONDARY))
                             .child("Apple Photos"),
@@ -515,7 +519,7 @@ impl Laika {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(sp(11.))
                             .text_color(rgb(if error { 0xE56060 } else { TEXT_DIM }))
                             .child(status),
                     ),
@@ -578,7 +582,7 @@ impl Laika {
                 } else {
                     border_control()
                 })
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_MUTED }))
                 .hover(|st| st.bg(rgb(bg_row_hover())))
                 .child(label)
@@ -588,14 +592,14 @@ impl Laika {
                 div()
                     .w(px(120.))
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .text_color(rgb(TEXT_DIM))
                     .child(label),
             )
         };
         let hint = |text: &'static str| {
             div()
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .line_height(relative(1.4))
                 .text_color(rgb(TEXT_DIM))
                 .child(text)
@@ -603,7 +607,7 @@ impl Laika {
         let section = |label: &'static str| {
             div()
                 .pt(px(4.))
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT_MUTED))
                 .child(label)
@@ -626,14 +630,14 @@ impl Laika {
             })
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT_PRIMARY))
                     .child("Photos keeps the only copy"),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(sp(12.))
                     .line_height(relative(1.45))
                     .text_color(rgb(TEXT_SECONDARY))
                     .child(
@@ -674,7 +678,7 @@ impl Laika {
                             .rounded(px(4.))
                             .border_1()
                             .border_color(border_control())
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|st| st.bg(rgb(bg_row_hover())))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -786,7 +790,7 @@ impl Laika {
                 .child(
                     div()
                         .min_w_0()
-                        .text_size(px(12.))
+                        .text_size(sp(12.))
                         .line_height(relative(1.4))
                         .text_color(rgb(if error { 0xE56060 } else { TEXT_TERTIARY }))
                         .child(status),
@@ -804,7 +808,7 @@ impl Laika {
                                 .rounded(px(5.))
                                 .border_1()
                                 .border_color(border_control())
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .text_color(rgb(TEXT_SECONDARY))
                                 .hover(|st| st.bg(rgb(bg_row_hover())))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_modals(cx)))
@@ -816,7 +820,7 @@ impl Laika {
                                 .px(px(12.))
                                 .py(px(6.))
                                 .rounded(px(5.))
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .when(can_sync, |d| {
                                     d.bg(rgb(accent_fill()))
@@ -860,7 +864,7 @@ impl Laika {
                         .gap(px(3.))
                         .child(
                             div()
-                                .text_size(px(15.))
+                                .text_size(sp(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_PRIMARY))
                                 .child("Apple Photos"),
@@ -910,7 +914,7 @@ impl Laika {
                 .when(a.not_local + a.unsupported > 0, |d| {
                     d.child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(sp(11.5))
                             .text_color(rgb(WARNING))
                             .child(format!(
                                 "Last read skipped {} only in iCloud and {} Laika can't open.",

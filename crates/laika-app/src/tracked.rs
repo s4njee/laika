@@ -2,6 +2,7 @@
 //! this shapes the line once (kerning intact) and paints each glyph shifted
 //! right. Carried from the Phase 0 spike (`spikes/p0/src/tracked.rs`).
 
+use crate::theme::sp;
 use gpui_kit::*;
 
 pub struct Tracked {
@@ -19,7 +20,7 @@ pub fn tracked(
 ) -> (Div, Tracked) {
     let text: SharedString = text.into();
     let color = color.into();
-    let font_size = px(size);
+    let font_size = sp(size);
     let run = TextRun {
         len: text.len(),
         font: Font {
@@ -34,10 +35,10 @@ pub fn tracked(
     let line = window
         .text_system()
         .shape_line(text, font_size, &[run], None);
-    let tracking = px(size * tracking_em);
+    let tracking = sp(size * tracking_em);
     let glyphs: usize = line.runs.iter().map(|r| r.glyphs.len()).sum();
     let width = line.width + tracking * glyphs as f32;
-    let line_height = px((size * 1.3).ceil());
+    let line_height = sp((size * 1.3).ceil());
 
     let el = div().w(width).h(line_height).flex_none().child(
         canvas(

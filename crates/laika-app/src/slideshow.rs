@@ -134,7 +134,7 @@ impl Laika {
                 .rounded(px(4.))
                 .bg(rgba(0x0000008C))
                 .font_family(SANS)
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgba(0xFFFFFFE6))
                 .truncate()
                 .child(line),
@@ -723,7 +723,7 @@ impl Laika {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(13.))
+                    .text_size(sp(13.))
                     .text_color(rgba(0xFFFFFF66))
                     .child(
                         photo
@@ -761,7 +761,7 @@ impl Laika {
                         .py(px(6.))
                         .rounded(px(6.))
                         .bg(rgba(0x00000073))
-                        .text_size(px(17.))
+                        .text_size(sp(17.))
                         .text_color(rgba(0xFFFFFFEB))
                         .child(text),
                 )
@@ -780,7 +780,7 @@ impl Laika {
                         .py(px(7.))
                         .rounded(px(18.))
                         .bg(rgba(0x000000B3))
-                        .text_size(px(14.))
+                        .text_size(sp(14.))
                         .text_color(rgba(0xFFFFFFF2))
                         .child(text.clone()),
                 )
@@ -822,7 +822,7 @@ impl Laika {
                 .items_center()
                 .justify_center()
                 .rounded(px(5.))
-                .text_size(px(12.5))
+                .text_size(sp(12.5))
                 .text_color(rgba(if on { 0xFFFFFFF2 } else { 0xFFFFFF99 }))
                 .when(on, |d| d.bg(rgba(0xFFFFFF1F)))
                 .hover(|s| s.bg(rgba(0xFFFFFF2E)))
@@ -889,7 +889,7 @@ impl Laika {
                     .child(
                         div()
                             .px(px(4.))
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgba(0xFFFFFFCC))
                             .child(format!("{} / {}", show.idx + 1, show.ids.len())),
                     )
@@ -897,14 +897,14 @@ impl Laika {
                         div()
                             .max_w(px(260.))
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(sp(12.))
                             .text_color(rgba(0xFFFFFF99))
                             .child(name),
                     )
                     .when(!marks.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(sp(12.))
                                 .text_color(rgb(WARNING))
                                 .child(marks),
                         )
@@ -964,7 +964,7 @@ impl Laika {
             .border_1()
             .border_color(border_control())
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(TEXT_SECONDARY))
             .hover(|s| s.bg(rgb(bg_row_hover())))
             .on_hover(self.tip("Slideshow of the selection, or everything shown (⌘Enter)"))
@@ -983,7 +983,7 @@ impl Laika {
             .border_1()
             .border_color(border_control())
             .font_family(SANS)
-            .text_size(px(10.5))
+            .text_size(sp(10.5))
             .text_color(rgb(if on { TEXT_PRIMARY } else { TEXT_SECONDARY }))
             .when(on, |d| d.bg(rgb(bg_segment_active())))
             .hover(|s| s.bg(rgb(bg_row_hover())))

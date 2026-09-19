@@ -23,6 +23,7 @@ use object_store::{
     Attribute, Attributes, GetOptions, GetRange, ObjectStore, PutOptions, PutPayload,
 };
 
+#[cfg(test)]
 use crate::photo::SyncState;
 
 pub const BLAKE_ATTR: &str = "blake3";
@@ -152,11 +153,28 @@ impl SyncSettings {
         Some(format!("{}://{server}/{name}", self.share_kind.key()))
     }
 
-    /// Where macOS mounts the share by default (`/Volumes/<last segment>`).
+    /// Likely mounted location after asking the OS to connect.
     pub fn share_mount_guess(&self) -> Option<std::path::PathBuf> {
         let name = self.share_name.trim().trim_end_matches('/');
         let last = name.rsplit('/').next().filter(|s| !s.is_empty())?;
-        Some(std::path::Path::new("/Volumes").join(last))
+        #[cfg(target_os = "macos")]
+        return Some(std::path::Path::new("/Volumes").join(last));
+        #[cfg(target_os = "windows")]
+        {
+            if self.share_kind == ShareKind::Smb && !self.share_server.trim().is_empty() {
+                return Some(std::path::PathBuf::from(format!(
+                    r"\\{}\{}",
+                    self.share_server.trim(),
+                    name.replace('/', r"\")
+                )));
+            }
+            return None;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let _ = last;
+            None
+        }
     }
 
     /// Overlay `LAIKA_S3_*` env vars (local-dev path without UI editing).
@@ -271,6 +289,32 @@ pub fn remote_key(catalog: &str, captured_at: &str, path: &Path, sidecar: bool) 
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let base = format!("{catalog}/{yyyy}/{ymd}/{filename}");
     if sidecar { format!("{base}.xmp") } else { base }
+}
+
+/// Immutable, idempotent backup key. The content hash prevents two
+/// same-named files from silently overwriting each other and keeps prior
+/// sidecar revisions recoverable. Reconnecting uploads the same bytes to
+/// the same key instead of creating a duplicate.
+pub fn versioned_remote_key(
+    catalog: &str,
+    captured_at: &str,
+    path: &Path,
+    sidecar: bool,
+    hash: &str,
+) -> String {
+    let base = remote_key(catalog, captured_at, path, sidecar);
+    let version: String = hash
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(64)
+        .collect();
+    if version.is_empty() {
+        return base;
+    }
+    match base.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{version}-{file}"),
+        None => format!("{version}-{base}"),
+    }
 }
 
 pub fn build_store(settings: &SyncSettings, secret: &str) -> Result<AmazonS3, String> {
@@ -468,15 +512,24 @@ pub mod sftp {
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPath=/tmp/laika-ssh-%C",
-            "-o",
-            "ControlPersist=120",
         ]
         .iter()
         .map(|a| a.to_string())
         .collect();
+        // Windows OpenSSH does not support Unix-domain control sockets.
+        #[cfg(unix)]
+        args.extend(
+            [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/tmp/laika-ssh-%C",
+                "-o",
+                "ControlPersist=120",
+            ]
+            .iter()
+            .map(|a| a.to_string()),
+        );
         let port = s.sftp_port.trim();
         if !port.is_empty() {
             args.push("-p".into());
@@ -485,9 +538,10 @@ pub mod sftp {
         let identity = s.sftp_identity.trim();
         if !identity.is_empty() {
             let expanded = match identity.strip_prefix("~/") {
-                Some(rest) => std::env::var("HOME")
-                    .map(|h| format!("{h}/{rest}"))
-                    .unwrap_or_else(|_| identity.to_string()),
+                Some(rest) => crate::platform::home_dir()
+                    .join(rest)
+                    .to_string_lossy()
+                    .to_string(),
                 None => identity.to_string(),
             };
             args.push("-i".into());
@@ -726,6 +780,7 @@ mod tests {
 
     /// The remote script runs under a local `sh` exactly as ssh would run
     /// it: creates folders, lands the file atomically, prints its sha256.
+    #[cfg(unix)]
     #[test]
     fn sftp_upload_script_runs_locally() {
         use std::io::Write;
@@ -843,6 +898,37 @@ mod tests {
                 .split('/')
                 .count(),
             4
+        );
+    }
+
+    #[test]
+    fn versioned_keys_are_idempotent_and_do_not_collide() {
+        let p = Path::new("IMG_0001.NEF");
+        let a = versioned_remote_key(
+            "Wedding",
+            "2026:06:14 18:42:00",
+            p,
+            false,
+            "aabbccddeeff001122",
+        );
+        let b = versioned_remote_key(
+            "Wedding",
+            "2026:06:14 18:42:00",
+            p,
+            false,
+            "112233445566778899",
+        );
+        assert_eq!(a, "wedding/2026/2026-06-14/aabbccddeeff001122-IMG_0001.NEF");
+        assert_ne!(a, b);
+        assert_eq!(
+            versioned_remote_key(
+                "Wedding",
+                "2026:06:14 18:42:00",
+                p,
+                true,
+                "aabbccddeeff001122",
+            ),
+            "wedding/2026/2026-06-14/aabbccddeeff001122-IMG_0001.NEF.xmp"
         );
     }
 

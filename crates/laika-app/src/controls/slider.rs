@@ -40,7 +40,7 @@ pub fn slider_chrome(
                 .items_center()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(sp(11.))
                         .text_color(rgb(if focused { TEXT_PRIMARY } else { TEXT_TERTIARY }))
                         .child(def.label),
                 )

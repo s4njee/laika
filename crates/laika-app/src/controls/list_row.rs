@@ -21,7 +21,7 @@ pub fn list_row(name: &str, count: &str, chip: u32, active: bool) -> Div {
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.))
+                .text_size(sp(12.))
                 .text_color(rgb(if active { TEXT_PRIMARY } else { TEXT_SECONDARY }))
                 .child(name.to_string()),
         )
@@ -29,7 +29,7 @@ pub fn list_row(name: &str, count: &str, chip: u32, active: bool) -> Div {
             div()
                 .font_family(SANS)
                 .flex_none()
-                .text_size(px(11.))
+                .text_size(sp(11.))
                 .text_color(rgb(TEXT_DIM))
                 .child(count.to_string()),
         )

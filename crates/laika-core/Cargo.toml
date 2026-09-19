@@ -13,10 +13,23 @@ quick-xml = "0.38"
 object_store = { version = "0.14", features = ["aws"] }
 keyring = "4"
 sha2 = "0.10"
+# Lightroom originals are matched by SHA-256; 0.11 uses the CPU's SHA
+# instructions on Apple silicon (0.10 needs its asm feature).
+sha2_hw = { package = "sha2", version = "0.11" }
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 futures = "0.3"
 laika-raw = { path = "../laika-raw" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 filetime = "0.2"

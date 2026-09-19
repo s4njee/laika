@@ -1,0 +1,26 @@
+name: windows-check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked

@@ -89,6 +89,15 @@ impl ExportFormat {
 }
 
 /// V27: per-format options (persisted with the export dialog).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OutputSharpening {
+    #[default]
+    Off,
+    Low,
+    Standard,
+    High,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExportFormatOpts {
     /// JPEG/AVIF lossy quality 1..100.
@@ -101,6 +110,10 @@ pub struct ExportFormatOpts {
     pub avif_speed: u8,
     /// AVIF bit depth 8 / 10.
     pub avif_depth: u8,
+    /// U20: final-size output sharpening, applied once after resize and
+    /// before encoding. It is intentionally separate from Develop detail.
+    #[serde(default)]
+    pub output_sharpening: OutputSharpening,
 }
 
 impl Default for ExportFormatOpts {
@@ -111,6 +124,7 @@ impl Default for ExportFormatOpts {
             png_level: 1,
             avif_speed: 6,
             avif_depth: 8,
+            output_sharpening: OutputSharpening::Off,
         }
     }
 }
@@ -182,6 +196,13 @@ pub fn encode_pixels(
     opts: &ExportFormatOpts,
     rgba: &image::RgbaImage,
 ) -> Result<(Vec<u8>, &'static str), String> {
+    let sharpened;
+    let rgba = if opts.output_sharpening == OutputSharpening::Off {
+        rgba
+    } else {
+        sharpened = output_sharpen(rgba, opts.output_sharpening);
+        &sharpened
+    };
     let (w, h) = (rgba.width(), rgba.height());
     if w == 0 || h == 0 {
         return Err("empty image".to_string());
@@ -278,6 +299,48 @@ pub fn encode_pixels(
         }
         ExportFormat::Original => Err("originals copy, never render".to_string()),
     }
+}
+
+/// U20: compact luminance-preserving 3x3 unsharp mask. The alpha channel is
+/// untouched and flat fields remain bit-identical, avoiding halos in skies.
+pub fn output_sharpen(src: &image::RgbaImage, amount: OutputSharpening) -> image::RgbaImage {
+    let gain = match amount {
+        OutputSharpening::Off => return src.clone(),
+        OutputSharpening::Low => 0.30,
+        OutputSharpening::Standard => 0.55,
+        OutputSharpening::High => 0.85,
+    };
+    let (w, h) = src.dimensions();
+    if w < 3 || h < 3 {
+        return src.clone();
+    }
+    let mut out = src.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let center = src.get_pixel(x, y).0;
+            let mut blur = [0f32; 3];
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                let p = src.get_pixel(nx, ny).0;
+                for c in 0..3 {
+                    blur[c] += p[c] as f32 * 0.25;
+                }
+            }
+            let edge_luma = 0.2126 * (center[0] as f32 - blur[0])
+                + 0.7152 * (center[1] as f32 - blur[1])
+                + 0.0722 * (center[2] as f32 - blur[2]);
+            // Threshold one byte value: suppress sensor/codec noise.
+            if edge_luma.abs() >= 1.0 {
+                let mut p = center;
+                for c in 0..3 {
+                    p[c] = (center[c] as f32 + edge_luma * gain)
+                        .round()
+                        .clamp(0., 255.) as u8;
+                }
+                out.put_pixel(x, y, image::Rgba(p));
+            }
+        }
+    }
+    out
 }
 
 /// Drop alpha (pipeline output is opaque) straight from the RGBA buffer,
@@ -413,5 +476,22 @@ mod tests {
         let (bytes, ext) = encode_pixels(ExportFormat::Avif, &opts, &src).expect("avif");
         assert_eq!(ext, "avif");
         assert_eq!(&bytes[4..8], b"ftyp");
+    }
+
+    #[test]
+    fn output_sharpen_preserves_flat_fields_and_alpha() {
+        let flat = image::RgbaImage::from_pixel(9, 9, image::Rgba([90, 120, 150, 77]));
+        let got = output_sharpen(&flat, OutputSharpening::High);
+        assert_eq!(got, flat);
+
+        let mut edge = flat.clone();
+        for y in 0..9 {
+            for x in 5..9 {
+                edge.put_pixel(x, y, image::Rgba([220, 220, 220, 77]));
+            }
+        }
+        let got = output_sharpen(&edge, OutputSharpening::Standard);
+        assert_eq!(got.get_pixel(4, 4).0[3], 77);
+        assert_ne!(got.get_pixel(4, 4), edge.get_pixel(4, 4));
     }
 }

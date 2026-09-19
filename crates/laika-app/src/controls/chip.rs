@@ -16,7 +16,7 @@ pub fn filter_chip(label: &str, active: bool) -> Div {
         } else {
             border_control()
         })
-        .text_size(px(10.5))
+        .text_size(sp(10.5))
         .text_color(rgb(if active {
             accent_line()
         } else {

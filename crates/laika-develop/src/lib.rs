@@ -13,6 +13,11 @@ use bytemuck::{Pod, Zeroable};
 use laika_raw::decode::LinearImage;
 
 pub use laika_core::edit::PARAM_COUNT;
+use laika_core::edit::{CameraProfile, LocalEdits, MaskShape};
+
+pub const MAX_LOCAL_MASKS: usize = 8;
+pub const MAX_BRUSH_POINTS: usize = 128;
+pub const MAX_HEAL_SPOTS: usize = 16;
 
 /// U08: render-time geometry (pre-constrained by the app): normalized
 /// crop rect, straighten angle in radians, mirrors.
@@ -128,6 +133,9 @@ pub struct Job {
     pub params: [f32; PARAM_COUNT],
     pub split: f32,
     pub geom: CropRender,
+    pub locals: LocalEdits,
+    pub camera_profile: CameraProfile,
+    pub show_mask_overlay: bool,
     /// Output edge for this live frame. Slider drags use a display-sized
     /// proxy; release submits the settled-quality frame.
     pub preview_long_edge: u32,
@@ -181,6 +189,20 @@ pub struct Uniforms {
     /// Perspective warp rows (WGSL `warp0..warp2`): G rows in `.xyz`;
     /// `warp[0][3]` = 1 when the warp is active, else 0. Other `.w` pad.
     pub warp: [[f32; 4]; 3],
+    /// U19/U20 fixed-capacity local-edit payload. Fixed arrays keep the
+    /// preview/export shader and its bind group identical and deterministic.
+    pub local_meta: [[f32; 4]; MAX_LOCAL_MASKS],
+    pub local_geom0: [[f32; 4]; MAX_LOCAL_MASKS],
+    pub local_geom1: [[f32; 4]; MAX_LOCAL_MASKS],
+    pub local_adjust0: [[f32; 4]; MAX_LOCAL_MASKS],
+    pub local_adjust1: [[f32; 4]; MAX_LOCAL_MASKS],
+    pub brush_points: [[f32; 4]; MAX_BRUSH_POINTS],
+    pub heal0: [[f32; 4]; MAX_HEAL_SPOTS],
+    pub heal1: [[f32; 4]; MAX_HEAL_SPOTS],
+    /// mask count, point count, heal count, camera-profile code.
+    pub local_counts: [f32; 4],
+    /// preview-only editable mask overlay flag; exports always pack zero.
+    pub local_display: [f32; 4],
 }
 
 /// Pack develop params + image metadata into shader uniforms. Pure and unit
@@ -192,8 +214,98 @@ pub fn pack(
     src: &LinearImage,
     geom: &CropRender,
 ) -> Uniforms {
+    pack_with_locals(
+        params,
+        split,
+        target,
+        src,
+        geom,
+        &LocalEdits::default(),
+        CameraProfile::Standard,
+        false,
+    )
+}
+
+pub fn pack_with_locals(
+    params: &[f32; PARAM_COUNT],
+    split: f32,
+    target: (u32, u32),
+    src: &LinearImage,
+    geom: &CropRender,
+    locals: &LocalEdits,
+    camera_profile: CameraProfile,
+    show_mask_overlay: bool,
+) -> Uniforms {
     let p = params;
     let q = |i: usize| p[i];
+    let mut local_meta = [[0.; 4]; MAX_LOCAL_MASKS];
+    let mut local_geom0 = [[0.; 4]; MAX_LOCAL_MASKS];
+    let mut local_geom1 = [[0.; 4]; MAX_LOCAL_MASKS];
+    let mut local_adjust0 = [[0.; 4]; MAX_LOCAL_MASKS];
+    let mut local_adjust1 = [[0.; 4]; MAX_LOCAL_MASKS];
+    let mut brush_points = [[0.; 4]; MAX_BRUSH_POINTS];
+    let mut point_count = 0usize;
+    let mask_count = locals.masks.len().min(MAX_LOCAL_MASKS);
+    for (mi, mask) in locals.masks.iter().take(mask_count).enumerate() {
+        let adj = mask.adjustment.sanitized();
+        local_adjust0[mi] = [adj.exposure, adj.contrast, adj.saturation, adj.temperature];
+        local_adjust1[mi] = [adj.tint, 0., 0., 0.];
+        local_geom1[mi][3] = if mask.invert { 1. } else { 0. };
+        match &mask.shape {
+            MaskShape::Brush { points } => {
+                let start = point_count;
+                for point in points
+                    .iter()
+                    .take(MAX_BRUSH_POINTS.saturating_sub(point_count))
+                {
+                    brush_points[point_count] = [
+                        point.position[0],
+                        point.position[1],
+                        point.radius.max(0.0001),
+                        point.flow.clamp(0., 1.) * if point.erase { -1. } else { 1. },
+                    ];
+                    point_count += 1;
+                }
+                local_meta[mi] = [
+                    1.,
+                    start as f32,
+                    (point_count - start) as f32,
+                    mask.feather.clamp(0., 1.),
+                ];
+            }
+            MaskShape::Linear { start, end } => {
+                local_meta[mi] = [2., 0., 0., mask.feather.clamp(0., 1.)];
+                local_geom0[mi] = [start[0], start[1], end[0], end[1]];
+            }
+            MaskShape::Radial {
+                center,
+                radius,
+                rotation,
+            } => {
+                local_meta[mi] = [3., 0., 0., mask.feather.clamp(0., 1.)];
+                local_geom0[mi] = [center[0], center[1], radius[0].abs(), radius[1].abs()];
+                local_geom1[mi][0] = if rotation.is_finite() { *rotation } else { 0. };
+            }
+        }
+    }
+    let mut heal0 = [[0.; 4]; MAX_HEAL_SPOTS];
+    let mut heal1 = [[0.; 4]; MAX_HEAL_SPOTS];
+    let heal_count = locals.heals.len().min(MAX_HEAL_SPOTS);
+    for (i, heal) in locals.heals.iter().take(heal_count).enumerate() {
+        heal0[i] = [
+            heal.target[0],
+            heal.target[1],
+            heal.source[0],
+            heal.source[1],
+        ];
+        heal1[i] = [heal.radius.max(0.0001), heal.feather.clamp(0., 1.), 0., 0.];
+    }
+    let profile_code = match camera_profile {
+        CameraProfile::Standard => 0.,
+        CameraProfile::Neutral => 1.,
+        CameraProfile::Vivid => 2.,
+        CameraProfile::Monochrome => 3.,
+    };
     Uniforms {
         rows: [
             [p[0], p[1], p[2], p[3]],
@@ -261,6 +373,21 @@ pub fn pack(
                 [g[6], g[7], g[8], 0.],
             ]
         },
+        local_meta,
+        local_geom0,
+        local_geom1,
+        local_adjust0,
+        local_adjust1,
+        brush_points,
+        heal0,
+        heal1,
+        local_counts: [
+            mask_count as f32,
+            point_count as f32,
+            heal_count as f32,
+            profile_code,
+        ],
+        local_display: [if show_mask_overlay { 1. } else { 0. }, 0., 0., 0.],
     }
 }
 
@@ -274,6 +401,8 @@ enum Msg {
     Export {
         image: LinearImage,
         params: [f32; PARAM_COUNT],
+        locals: LocalEdits,
+        camera_profile: CameraProfile,
         /// U07: 100% detail renders the same before/after composition as
         /// the preview so the zoomed view stays spatially aligned with it.
         split: f32,
@@ -389,11 +518,35 @@ impl Renderer {
         split: f32,
         geom: CropRender,
     ) -> Result<Rendered, String> {
+        self.render_export_with(
+            image,
+            params,
+            LocalEdits::default(),
+            CameraProfile::Standard,
+            split,
+            geom,
+        )
+    }
+
+    /// U19/U20: full-resolution render using the exact local/profile state
+    /// submitted by preview. The legacy wrapper above remains for callers
+    /// that intentionally render global edits only.
+    pub fn render_export_with(
+        &self,
+        image: LinearImage,
+        params: [f32; PARAM_COUNT],
+        locals: LocalEdits,
+        camera_profile: CameraProfile,
+        split: f32,
+        geom: CropRender,
+    ) -> Result<Rendered, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Msg::Export {
                 image,
                 params,
+                locals,
+                camera_profile,
                 split,
                 geom,
                 reply: reply_tx,
@@ -438,6 +591,8 @@ fn same_image(a: &LinearImage, b: &LinearImage) -> bool {
 struct ExportReq {
     image: LinearImage,
     params: [f32; PARAM_COUNT],
+    locals: LocalEdits,
+    camera_profile: CameraProfile,
     split: f32,
     geom: CropRender,
     reply: mpsc::Sender<Result<Rendered, String>>,
@@ -686,12 +841,16 @@ impl Gpu {
                     Msg::Export {
                         image,
                         params,
+                        locals,
+                        camera_profile,
                         split,
                         geom,
                         reply,
                     } => exports.push_back(ExportReq {
                         image,
                         params,
+                        locals,
+                        camera_profile,
                         split,
                         geom,
                         reply,
@@ -711,7 +870,16 @@ impl Gpu {
                     ),
                     job.preview_long_edge.clamp(256, PREVIEW_LONG_EDGE),
                 );
-                let u = pack(&job.params, job.split, target, &edit.image, &job.geom);
+                let u = pack_with_locals(
+                    &job.params,
+                    job.split,
+                    target,
+                    &edit.image,
+                    &job.geom,
+                    &job.locals,
+                    job.camera_profile,
+                    job.show_mask_overlay,
+                );
                 let slot = if job.preview_long_edge <= PREVIEW_INTERACTIVE_EDGE {
                     &mut interactive_preview_slot
                 } else {
@@ -737,6 +905,8 @@ impl Gpu {
                 let r = self.render_export_image(
                     req.image,
                     req.params,
+                    req.locals,
+                    req.camera_profile,
                     req.split,
                     req.geom,
                     &editing,
@@ -753,6 +923,8 @@ impl Gpu {
         &self,
         image: LinearImage,
         params: [f32; PARAM_COUNT],
+        locals: LocalEdits,
+        camera_profile: CameraProfile,
         split: f32,
         geom: CropRender,
         editing: &Option<GpuSource>,
@@ -779,12 +951,15 @@ impl Gpu {
         };
         let (w, h) = (src.image.width, src.image.height);
         // U08: output dims follow the crop rect.
-        let u = pack(
+        let u = pack_with_locals(
             &params,
             split,
             crop_target(w, h, geom.rect, geom.rotation),
             &src.image,
             &geom,
+            &locals,
+            camera_profile,
+            false,
         );
         let frame = render_with(
             &self.device,
@@ -1016,6 +1191,9 @@ mod tests {
         // Preview still samples the editing source (red), delivered BGRA.
         r.submit(Job {
             params,
+            locals: Default::default(),
+            camera_profile: Default::default(),
+            show_mask_overlay: false,
             split: 0.,
             geom,
             preview_long_edge: PREVIEW_LONG_EDGE,
@@ -1101,8 +1279,114 @@ mod tests {
         assert_eq!(ug.rows[16], [0., 1., 2., 3.]);
         assert_eq!(ug.rows[18], [8., 9., 10., 11.]);
         assert_eq!(ug.rows[19], [12., 13., 0., 0.]);
-        // Uniform buffer size matches WGSL struct (27 vec4s).
-        assert_eq!(std::mem::size_of::<Uniforms>(), 27 * 16);
+        // Uniform buffer size matches WGSL struct (base + fixed local arrays).
+        assert_eq!(std::mem::size_of::<Uniforms>(), 229 * 16);
+    }
+
+    #[test]
+    fn local_uniforms_pack_source_coordinates_and_profile() {
+        use laika_core::edit::{BrushPoint, LocalAdjustment, LocalMask, MaskShape};
+        let img = test_image();
+        let locals = LocalEdits {
+            masks: vec![LocalMask {
+                id: 1,
+                name: "brush".into(),
+                shape: MaskShape::Brush {
+                    points: vec![BrushPoint {
+                        position: [0.25, 0.75],
+                        radius: 0.1,
+                        flow: 0.8,
+                        erase: true,
+                    }],
+                },
+                feather: 0.4,
+                invert: true,
+                adjustment: LocalAdjustment {
+                    exposure: 1.25,
+                    ..Default::default()
+                },
+            }],
+            heals: vec![],
+        };
+        let u = pack_with_locals(
+            &laika_core::edit::defaults(),
+            0.,
+            (64, 48),
+            &img,
+            &CropRender::default(),
+            &locals,
+            CameraProfile::Monochrome,
+            true,
+        );
+        assert_eq!(u.local_counts, [1., 1., 0., 3.]);
+        assert_eq!(u.brush_points[0], [0.25, 0.75, 0.1, -0.8]);
+        assert_eq!(u.local_adjust0[0][0], 1.25);
+        assert_eq!(u.local_geom1[0][3], 1.);
+    }
+
+    #[test]
+    fn local_preview_and_export_are_pixel_identical() {
+        use laika_core::edit::{LocalAdjustment, LocalMask, MaskShape};
+        let (tx, rx) = mpsc::channel();
+        let (r, _) = Renderer::spawn(move |frame| {
+            tx.send(frame).ok();
+        })
+        .unwrap();
+        let img = solid(48, 32, [0.15, 0.2, 0.3]);
+        r.set_source(img.clone());
+        let locals = LocalEdits {
+            masks: vec![LocalMask {
+                id: 1,
+                name: "center".into(),
+                shape: MaskShape::Radial {
+                    center: [0.5, 0.5],
+                    radius: [0.3, 0.3],
+                    rotation: 0.,
+                },
+                feather: 0.4,
+                invert: false,
+                adjustment: LocalAdjustment {
+                    exposure: 1.,
+                    saturation: 20.,
+                    ..Default::default()
+                },
+            }],
+            heals: vec![],
+        };
+        let params = laika_core::edit::defaults();
+        r.submit(Job {
+            params,
+            locals: locals.clone(),
+            camera_profile: CameraProfile::Vivid,
+            show_mask_overlay: false,
+            split: 0.,
+            geom: CropRender::default(),
+            preview_long_edge: PREVIEW_LONG_EDGE,
+            photo_id: Some(9),
+            seq: 1,
+        });
+        let preview = rx.recv().unwrap();
+        let export = r
+            .render_export_with(
+                img,
+                params,
+                locals,
+                CameraProfile::Vivid,
+                0.,
+                CropRender::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            (preview.width, preview.height),
+            (export.width, export.height)
+        );
+        for (bgra, rgba) in preview
+            .rgba
+            .chunks_exact(4)
+            .zip(export.rgba.chunks_exact(4))
+        {
+            assert_eq!([bgra[2], bgra[1], bgra[0], bgra[3]], rgba);
+        }
     }
 
     #[test]

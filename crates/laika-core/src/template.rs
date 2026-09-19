@@ -194,7 +194,41 @@ pub fn sanitize_segment(s: &str) -> String {
             out.push(c);
         }
     }
-    out.trim_end_matches(['.', ' ']).to_string()
+    let clean = out.trim_end_matches(['.', ' ']);
+    // Windows reserves these device names even when an extension is present
+    // (`CON.jpg`, `LPT1.xmp`, …). Prefixing keeps the name readable and makes
+    // catalogs/templates portable between macOS and Windows.
+    let stem = clean.split('.').next().unwrap_or(clean);
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if reserved {
+        format!("_{clean}")
+    } else {
+        clean.to_string()
+    }
 }
 
 /// Render a folder template to segments (empty segments dropped so an
@@ -361,6 +395,7 @@ mod tests {
         assert_eq!(sanitize_segment("a/b\\c:d"), "a_b_c_d");
         assert_eq!(sanitize_segment("trail. "), "trail");
         assert_eq!(sanitize_segment("Canon EOS R5"), "Canon EOS R5");
+        assert_eq!(sanitize_segment("CON.jpg"), "_CON.jpg");
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub fn section_header(text: &str, active: bool, _window: &mut Window) -> Div {
         .pt(px(16.))
         .pb(px(6.))
         .font_family(SANS)
-        .text_size(px(11.))
+        .text_size(sp(11.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(if active { accent_line() } else { TEXT_MUTED }))
         .child(text.to_string())
