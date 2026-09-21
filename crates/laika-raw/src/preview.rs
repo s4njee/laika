@@ -70,6 +70,35 @@ fn embedded_review_image(path: &Path) -> Option<DynamicImage> {
     })
 }
 
+/// S10: a camera-embedded image at least `edge` px on its long side (the
+/// smallest such JPEG, else the largest there is) for culling straight
+/// from a card — no RAW decode. `edge = 0` asks for the largest (100%).
+pub fn cull_image(path: &Path, edge: u32) -> Result<DynamicImage, String> {
+    if is_raw(path) {
+        if let Some((data, candidates)) =
+            embedded_jpeg_candidates(path, EMBEDDED_JPEG_SCAN_LIMIT).filter(|(_, c)| !c.is_empty())
+        {
+            let pick = if edge == 0 {
+                candidates.iter().rev().collect::<Vec<_>>()
+            } else {
+                candidates
+                    .iter()
+                    .filter(|(_, w, h, _)| (*w).max(*h) >= edge)
+                    .chain(candidates.iter().rev())
+                    .collect::<Vec<_>>()
+            };
+            if let Some(image) = pick
+                .into_iter()
+                .find_map(|(_, _, _, offset)| decode_embedded_candidate(&data, *offset))
+            {
+                return Ok(image);
+            }
+        }
+        return load_preview(path);
+    }
+    crate::system_image::open_raster(path, (edge > 0).then_some(edge))
+}
+
 /// Small JPEG for the import-review grid. Prefer the camera's embedded
 /// review image and retain rawler as a compatibility fallback.
 pub fn review_jpeg(path: &Path, edge: u32) -> Result<Vec<u8>, String> {
@@ -198,6 +227,38 @@ mod tests {
             *p = image::Rgb([(x * 255 / w) as u8, (y * 255 / h) as u8, 128]);
         }
         img.save(path).unwrap();
+    }
+
+    #[test]
+    fn cull_images_come_from_the_camera_jpeg() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/raw/IMG_5442.NEF");
+        if !path.exists() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let fit = cull_image(&path, 2048).expect("loupe image");
+        let full = cull_image(&path, 0).expect("100% image");
+        // The NEF's full-size embedded JPEG serves both: at least 2048 px
+        // for the Loupe, the largest for 100%.
+        assert!(
+            fit.width().max(fit.height()) >= 2048,
+            "{}x{}",
+            fit.width(),
+            fit.height()
+        );
+        assert!(full.width() * full.height() >= fit.width() * fit.height());
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "no RAW decode: {:?}",
+            t.elapsed()
+        );
+        // Raster files decode at the requested size.
+        let dir = std::env::temp_dir().join(format!("laika-cull-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = dir.join("a.jpg");
+        gradient(&jpg, 3000, 2000);
+        assert_eq!(cull_image(&jpg, 0).unwrap().width(), 3000);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

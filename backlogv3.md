@@ -516,6 +516,46 @@ report, UI) is where the `.lrcat` reader will plug in.
   users currently pay for separately.
 - **Depends on:** V01, U06, the scan fingerprint cache (`source_fingerprints`).
 
+**Progress 2026-09-19: built and tested on a 48-NEF test card; not yet timed on a full 64 GB card.**
+
+- **Culling in the review** (`cull_ui.rs`): the SD-card review grid is now a
+  culling surface.
+  - Click to select, arrows to move (↑↓ by row), **0–5** rate, **P / X / U**
+    flag, **6–9** label, **A** auto-advance.
+  - Double-click or **E** opens a Loupe; **Z**, Space or a click toggles
+    100% at that point; **G** or Esc returns to the grid. Enter never
+    starts the import from inside the Loupe.
+  - Cells show ⚑ / ✕ / stars / label, rejects dim, and the Loupe header says
+    **NOT IMPORTED YET**.
+- **Images come straight from the camera's embedded JPEG**
+  (`preview::cull_image`), never a RAW decode.
+  - The Loupe loads the smallest embedded JPEG at least 2048 px (capped at
+    2560 px), plus ±3 neighbours prefetched nearest-first; 12 are cached
+    around the cursor.
+  - 100% uses the largest embedded JPEG, which is full size on Nikon.
+- **Import:**
+  - "Leave rejected photos on the card" (on by default) and "Import picked
+    photos only"; the Import button count follows them.
+  - Marks survive closing and reopening the dialog. Each photo's marks are
+    applied as it's inserted (`Prepared.source` maps a copy back to its card
+    file), then consumed, so every rating lands once.
+  - Sidecars are written.
+- **Live test:** a disk-image card with 48 NEFs.
+  - Scan took 0.9 s.
+  - 5★ pick, reject, 3★ green, reject, 4★ pick set in grid and Loupe; no
+    Loupe image took more than 400 ms while stepping through.
+  - The import brought in 46 at 426 MB/s. The two rejects stayed on the
+    card, and every mark matched in the catalog.
+- **Tests:** `cull_images_come_from_the_camera_jpeg` (≥ 2048 px for the
+  Loupe, largest for 100%, no RAW decode). The rest was verified live.
+- **Still open:**
+  - The 64 GB / 1,000-photo timings: first photo within 2 s of mount, and
+    never waiting on I/O across 1,000 photos.
+  - Panning at 100% (it's click-to-center today).
+  - A larger, dedicated culling window: the Loupe shares the review dialog
+    with the options column.
+  - Culling from a plain folder uses the same path but wasn't tried.
+
 ### [ ] S11 — Never wait: a performance budget per interaction
 
 - **Deliver:** A tracked budget table (like U21's gates) extended to every

@@ -29,6 +29,7 @@ mod collections;
 mod commands;
 mod compare_survey;
 mod controls;
+mod cull_ui;
 mod diagnostics;
 mod gallery_canvas;
 mod gallery_inspector;
@@ -226,6 +227,14 @@ struct ImportProgress {
     preset_ids: Vec<i64>,
     /// V05: unsupported files skipped at scan (count + samples).
     skipped_unsupported: (usize, Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+struct SftpRestoreJob {
+    photo_id: i64,
+    local: PathBuf,
+    remote_key: String,
+    blake3: String,
 }
 
 /// U05/V01: import dialog stages. Pick → Scanning → Review → Running → Done.
@@ -1439,6 +1448,7 @@ struct Laika {
     right_rail_width: f32,
     rail_resize: Option<RailResize>,
     coexist: coexist_ui::CoexistUi,
+    cull: cull_ui::CullUi,
     palette: lightroom_mode::PaletteUi,
     guide: lightroom_mode::GuideUi,
     /// V32: About window and first-run welcome.
@@ -1598,6 +1608,15 @@ struct Laika {
     /// Backup dialog: a connection test is running.
     sync_testing: bool,
     sync_staged: bool,
+    /// Missing originals being pulled from their recorded immutable SFTP
+    /// backup keys. This queue is session-local: every completed file is
+    /// already durable and verified, while unfinished files remain missing.
+    sftp_restore_queue: VecDeque<SftpRestoreJob>,
+    sftp_restore_inflight: usize,
+    sftp_restore_total: usize,
+    sftp_restore_done: usize,
+    sftp_restore_failed: usize,
+    sftp_restore_bytes: u64,
     /// U04: hover tooltip request slot (set from `on_hover`, drained in
     /// render — hover callbacks can't reach the entity directly).
     hover_tip: Rc<Cell<Option<String>>>,
@@ -4728,7 +4747,7 @@ impl Laika {
             jobs.push(self.meta_sidecar_job(*id));
         }
         // In-memory mirrors update now so the rail never lags the DB.
-        for (id, meta, _) in &writes {
+        for (id, meta, keywords) in &writes {
             if let Some(p) = self.photos.iter_mut().find(|p| p.id == *id) {
                 p.title = meta.title.clone();
                 p.caption = meta.caption.clone();
@@ -4738,6 +4757,11 @@ impl Laika {
                 p.rights = meta.rights.clone();
                 p.contact = meta.contact.clone();
                 p.location = meta.location.clone();
+            }
+            if keywords.is_empty() {
+                self.photo_keywords.remove(id);
+            } else {
+                self.photo_keywords.insert(*id, keywords.clone());
             }
         }
         self.last_was_meta = true;
@@ -4802,6 +4826,137 @@ impl Laika {
         })
         .detach();
         self.status_note = format!("{label_done} — writing sidecars…");
+        cx.notify();
+    }
+
+    /// S14: accept either one ghost keyword or every pending proposal in the
+    /// current scope. Each photo receives only its own proposals; the whole
+    /// operation remains one metadata undo step and follows the normal XMP
+    /// writer path.
+    fn accept_keyword_suggestions(
+        &mut self,
+        scope: Vec<i64>,
+        only_keyword: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let suggestions = self
+            .catalog
+            .as_ref()
+            .map(|cat| cat.pending_keyword_suggestions(&scope))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|suggestion| {
+                only_keyword
+                    .as_ref()
+                    .is_none_or(|keyword| suggestion.keyword == *keyword)
+            })
+            .collect::<Vec<_>>();
+        if suggestions.is_empty() {
+            self.status_note = "no pending keyword suggestions in this selection".to_string();
+            cx.notify();
+            return;
+        }
+        let mut by_photo: HashMap<i64, Vec<String>> = HashMap::new();
+        let decisions: Vec<(i64, String)> = suggestions
+            .iter()
+            .map(|suggestion| {
+                by_photo
+                    .entry(suggestion.photo_id)
+                    .or_default()
+                    .push(suggestion.keyword.clone());
+                (suggestion.photo_id, suggestion.keyword.clone())
+            })
+            .collect();
+        let ids: Vec<i64> = by_photo.keys().copied().collect();
+        let before = self.meta_before(&ids);
+        let mut writes = Vec::new();
+        for (id, meta, keywords) in &before {
+            let mut next = keywords.clone();
+            if let Some(additions) = by_photo.get(id) {
+                for keyword in additions {
+                    if !next.iter().any(|old| old.eq_ignore_ascii_case(keyword)) {
+                        next.push(keyword.clone());
+                    }
+                }
+            }
+            if next != *keywords {
+                writes.push((*id, meta.clone(), next));
+            }
+        }
+        if writes.is_empty() {
+            self.status_note = "suggested keywords are already assigned".to_string();
+            cx.notify();
+            return;
+        }
+        if let Some(cat) = self.catalog.as_ref() {
+            if let Err(error) = cat.decide_keyword_suggestions(&decisions, true) {
+                self.status_note = error;
+                cx.notify();
+                return;
+            }
+        }
+        let label = only_keyword
+            .as_ref()
+            .map(|keyword| format!("Accept suggested {keyword}"))
+            .unwrap_or_else(|| "Accept suggested keywords".to_string());
+        self.execute_meta_writes(
+            writes,
+            Some(MetaUndoStep {
+                label: label.clone(),
+                before,
+            }),
+            label,
+            cx,
+        );
+    }
+
+    /// S14: reject one proposal or all proposals for the selection. Rejection
+    /// touches no metadata or sidecar, but persists across embedding refreshes.
+    fn reject_keyword_suggestions(
+        &mut self,
+        scope: Vec<i64>,
+        only_keyword: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let suggestions = self
+            .catalog
+            .as_ref()
+            .map(|cat| cat.pending_keyword_suggestions(&scope))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|suggestion| {
+                only_keyword
+                    .as_ref()
+                    .is_none_or(|keyword| suggestion.keyword == *keyword)
+            })
+            .map(|suggestion| (suggestion.photo_id, suggestion.keyword))
+            .collect::<Vec<_>>();
+        if suggestions.is_empty() {
+            self.status_note = "no pending keyword suggestions in this selection".to_string();
+            cx.notify();
+            return;
+        }
+        let photos = suggestions
+            .iter()
+            .map(|(photo_id, _)| *photo_id)
+            .collect::<HashSet<_>>()
+            .len();
+        let count = suggestions.len();
+        match self
+            .catalog
+            .as_ref()
+            .map(|cat| cat.decide_keyword_suggestions(&suggestions, false))
+        {
+            Some(Ok(_)) => {
+                self.status_note = format!(
+                    "rejected {count} keyword suggestion{} for {photos} photo{}",
+                    if count == 1 { "" } else { "s" },
+                    if photos == 1 { "" } else { "s" }
+                );
+            }
+            Some(Err(error)) => self.status_note = error,
+            None => self.status_note = "no catalog is open".to_string(),
+        }
         cx.notify();
     }
 
@@ -5479,6 +5634,11 @@ impl Laika {
 
     /// Enqueue everything not yet verified and kick the worker.
     fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sftp_restore_active() {
+            self.status_note = "wait for the SFTP restore to finish before backing up".to_string();
+            cx.notify();
+            return;
+        }
         if !self.sync_configured() {
             self.status_note = "set up a backup destination first".to_string();
             self.open_sync(cx);
@@ -5506,6 +5666,12 @@ impl Laika {
     }
 
     fn retry_failed_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sftp_restore_active() {
+            self.status_note =
+                "wait for the SFTP restore to finish before retrying backup".to_string();
+            cx.notify();
+            return;
+        }
         let n = self
             .catalog
             .as_ref()
@@ -5579,6 +5745,182 @@ impl Laika {
         .detach();
     }
 
+    fn sftp_restore_active(&self) -> bool {
+        self.sftp_restore_inflight > 0 || !self.sftp_restore_queue.is_empty()
+    }
+
+    fn sftp_restore_candidates(&self) -> VecDeque<SftpRestoreJob> {
+        self.photos
+            .iter()
+            .filter(|photo| {
+                !std::path::Path::new(&photo.path).exists()
+                    && !photo.remote_key.trim().is_empty()
+                    && !photo.blake3.trim().is_empty()
+            })
+            .map(|photo| SftpRestoreJob {
+                photo_id: photo.id,
+                local: PathBuf::from(&photo.path),
+                remote_key: photo.remote_key.clone(),
+                blake3: photo.blake3.clone(),
+            })
+            .collect()
+    }
+
+    fn sftp_restore_candidate_count(&self) -> usize {
+        self.photos
+            .iter()
+            .filter(|photo| {
+                !std::path::Path::new(&photo.path).exists()
+                    && !photo.remote_key.trim().is_empty()
+                    && !photo.blake3.trim().is_empty()
+            })
+            .count()
+    }
+
+    /// Pull catalog originals that are missing locally from their exact,
+    /// verified SFTP backup keys. Files already present are never touched.
+    fn start_sftp_restore(&mut self, cx: &mut Context<Self>) {
+        use laika_core::sync::BackupTarget;
+        if self.sftp_restore_active() {
+            self.status_note = "SFTP restore is already running".to_string();
+            cx.notify();
+            return;
+        }
+        if self.sync_settings.target != BackupTarget::Sftp || !self.sync_settings.configured() {
+            self.status_note = "configure and test an SFTP destination first".to_string();
+            self.open_sync(cx);
+            return;
+        }
+        let (queued, _) = self.queue_depth();
+        if self.sync_inflight > 0 || queued > 0 {
+            self.status_note =
+                "pause until the active backup queue drains, then restore missing originals"
+                    .to_string();
+            cx.notify();
+            return;
+        }
+        let missing = self
+            .photos
+            .iter()
+            .filter(|photo| !std::path::Path::new(&photo.path).exists())
+            .count();
+        let jobs = self.sftp_restore_candidates();
+        if jobs.is_empty() {
+            self.status_note = if missing == 0 {
+                "no originals are missing from this catalog".to_string()
+            } else {
+                format!(
+                    "{missing} missing original{} ha{} no recorded, verified SFTP backup key",
+                    if missing == 1 { "" } else { "s" },
+                    if missing == 1 { "s" } else { "ve" }
+                )
+            };
+            cx.notify();
+            return;
+        }
+        self.sftp_restore_total = jobs.len();
+        self.sftp_restore_done = 0;
+        self.sftp_restore_failed = 0;
+        self.sftp_restore_bytes = 0;
+        self.sftp_restore_queue = jobs;
+        self.sync_last_error.clear();
+        self.status_note = format!(
+            "restoring {} missing original{} from SFTP…",
+            self.sftp_restore_total,
+            if self.sftp_restore_total == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        self.pump_sftp_restore(cx);
+    }
+
+    fn pump_sftp_restore(&mut self, cx: &mut Context<Self>) {
+        while self.sftp_restore_inflight < self.sync_parallelism() {
+            let Some(job) = self.sftp_restore_queue.pop_front() else {
+                break;
+            };
+            // The path may have come back since the plan was made. Treat it
+            // as safely skipped, never as permission to replace it.
+            if job.local.exists() {
+                self.sftp_restore_done += 1;
+                continue;
+            }
+            self.sftp_restore_inflight += 1;
+            self.sync_current = job
+                .local
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("original")
+                .to_string();
+            let settings = self.sync_settings.clone();
+            let remote = job.remote_key.clone();
+            let local = job.local.clone();
+            let hash = job.blake3.clone();
+            cx.spawn(async move |entity, cx| {
+                let outcome = cx
+                    .background_spawn(async move {
+                        laika_core::sync::restore_blocking(&settings, &remote, &local, &hash)
+                    })
+                    .await;
+                entity
+                    .update(cx, |this, cx| this.finish_sftp_restore(job, outcome, cx))
+                    .ok();
+            })
+            .detach();
+        }
+
+        if self.sftp_restore_total > 0
+            && self.sftp_restore_inflight == 0
+            && self.sftp_restore_queue.is_empty()
+        {
+            let restored = self.sftp_restore_done;
+            let failed = self.sftp_restore_failed;
+            let mib = self.sftp_restore_bytes as f64 / 1024.0 / 1024.0;
+            self.sync_current.clear();
+            self.refresh_photos(cx);
+            self.status_note = if failed == 0 {
+                format!(
+                    "restored and verified {restored} original{} from SFTP ({mib:.1} MiB)",
+                    if restored == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "restored {restored}; {failed} failed — no existing local files were replaced"
+                )
+            };
+        }
+        cx.notify();
+    }
+
+    fn finish_sftp_restore(
+        &mut self,
+        job: SftpRestoreJob,
+        outcome: Result<u64, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sftp_restore_inflight = self.sftp_restore_inflight.saturating_sub(1);
+        match outcome {
+            Ok(bytes) => {
+                self.sftp_restore_done += 1;
+                self.sftp_restore_bytes += bytes;
+                self.offline.remove(&job.photo_id);
+            }
+            Err(error) => {
+                self.sftp_restore_failed += 1;
+                self.sync_last_error = format!(
+                    "restore {}: {error}",
+                    job.local
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("original")
+                );
+            }
+        }
+        self.pump_sftp_restore(cx);
+    }
+
     fn toggle_sync_pause(&mut self, cx: &mut Context<Self>) {
         self.sync_paused = !self.sync_paused;
         if self.sync_paused {
@@ -5590,13 +5932,25 @@ impl Laika {
         cx.notify();
     }
 
-    /// Claim jobs while under the concurrency limit (3). DB work stays on
-    /// the UI thread; only the transfer runs in the background.
+    /// Transfers in flight at once. SFTP and share targets land on one
+    /// disk, often a spinning or SMR drive where interleaved writers turn
+    /// sequential streams into seeks and cache-zone cleaning (a USB SMR
+    /// disk measured 100% busy at ~4 MB/s with three writers), so they get
+    /// a single writer. Object stores are latency-bound and gain from 3.
+    fn sync_parallelism(&self) -> usize {
+        match self.sync_settings.target {
+            laika_core::sync::BackupTarget::S3 => 3,
+            _ => 1,
+        }
+    }
+
+    /// Claim jobs while under the target's concurrency limit. DB work stays
+    /// on the UI thread; only the transfer runs in the background.
     fn pump_sync(&mut self, cx: &mut Context<Self>) {
         if !self.sync_configured() || self.sync_paused {
             return;
         }
-        while self.sync_inflight < 3 {
+        while self.sync_inflight < self.sync_parallelism() {
             let job = self.catalog.as_ref().and_then(|c| c.claim_job());
             let Some(job) = job else { break };
             let resolved = self.catalog.as_ref().and_then(|c| {
@@ -8282,8 +8636,10 @@ impl Laika {
         self.flush_saves();
         // A restore mid-sync could land in-flight rowid ops on the wrong
         // rows — refuse while transfers run.
-        if self.sync_inflight > 0 {
-            self.manage_note = "sync is running — wait for it to drain, then restore".to_string();
+        if self.sync_inflight > 0 || self.sftp_restore_active() {
+            self.manage_note =
+                "backup or SFTP restore is running — wait for it to drain, then restore"
+                    .to_string();
             cx.notify();
             return;
         }
@@ -8410,6 +8766,12 @@ impl Laika {
     /// rescan, and queue kick. Shared by restore, open, new, and recent.
     fn adopt_catalog(&mut self, cat: Catalog, cx: &mut Context<Self>) {
         self.catalog = Some(cat);
+        self.sftp_restore_queue.clear();
+        self.sftp_restore_inflight = 0;
+        self.sftp_restore_total = 0;
+        self.sftp_restore_done = 0;
+        self.sftp_restore_failed = 0;
+        self.sftp_restore_bytes = 0;
         self.snapshot_rows.replace(None);
         // U07: zoomed detail belongs to the old catalog's photos.
         self.zoom_center = (0.5, 0.5);
@@ -8509,8 +8871,9 @@ impl Laika {
         cx: &mut Context<Self>,
     ) {
         self.flush_saves();
-        if self.sync_inflight > 0 {
-            self.manage_note = "sync is running — wait for it to drain, then switch".to_string();
+        if self.sync_inflight > 0 || self.sftp_restore_active() {
+            self.manage_note =
+                "backup or SFTP restore is running — wait for it to drain, then switch".to_string();
             cx.notify();
             return;
         }
@@ -9087,6 +9450,16 @@ impl Laika {
             .as_ref()
             .map(|d| d.skipped.clone())
             .unwrap_or((0, Vec::new()));
+        // S10: rejects stay on the card (or only picks come in), as chosen.
+        let entries = self.cull_filter(entries);
+        if entries.is_empty() {
+            self.status_note =
+                "nothing left to import after culling — every photo is rejected or unpicked"
+                    .to_string();
+            cx.notify();
+            return;
+        }
+        self.cull_release();
         if let Some(d) = self.import_dialog.as_mut() {
             d.stage = ImportStage::Running;
         }
@@ -9871,6 +10244,7 @@ impl Laika {
     fn close_import_dialog(&mut self, cx: &mut Context<Self>) {
         self.import_open = false;
         self.import_dialog = None;
+        self.cull_release();
         for preview in self.review_thumbs.drain(..) {
             if let Some(img) = preview.image {
                 self.stale.push(img);
@@ -10097,6 +10471,7 @@ impl Laika {
             return false;
         }
         let mut was_skipped = false;
+        let source = prepared.source.clone();
         let inserted = match prepared.result {
             Ok(data) => {
                 // Skip without counting against the import when the full
@@ -10183,6 +10558,10 @@ impl Laika {
                         // V03: capture offset, metadata, and develop
                         // preset land at import time.
                         self.apply_import_values(id, adopted);
+                        // S10: marks made while culling from the card.
+                        if let Some(src) = &source {
+                            self.apply_cull_marks(id, src);
+                        }
                         if let Some(cat) = self.catalog.as_ref() {
                             // New originals join the upload queue.
                             cat.enqueue(id, "original");
@@ -11996,6 +12375,21 @@ impl Laika {
     fn sync_status(&self) -> (String, f32, String) {
         if !self.sync_settings.configured() {
             return ("Backup".to_string(), 0., "Not configured".to_string());
+        }
+        if self.sftp_restore_active() {
+            let finished = self.sftp_restore_done + self.sftp_restore_failed;
+            let frac = finished as f32 / self.sftp_restore_total.max(1) as f32;
+            return (
+                "SFTP restore".to_string(),
+                frac,
+                format!(
+                    "{finished}/{} · {} active · {} failed · {}",
+                    self.sftp_restore_total,
+                    self.sftp_restore_inflight,
+                    self.sftp_restore_failed,
+                    self.sync_current
+                ),
+            );
         }
         let (queued, failed) = self.queue_depth();
         let total_photos = self.photos.len().max(1);
@@ -14492,6 +14886,25 @@ impl Laika {
             }
             union.sort();
         }
+        let mut suggested_counts: HashMap<String, (usize, f32)> = HashMap::new();
+        if let Some(cat) = self.catalog.as_ref() {
+            for suggestion in cat.pending_keyword_suggestions(&scope) {
+                let entry = suggested_counts
+                    .entry(suggestion.keyword)
+                    .or_insert((0, suggestion.score));
+                entry.0 += 1;
+                entry.1 = entry.1.max(suggestion.score);
+            }
+        }
+        let mut suggested: Vec<(String, usize, f32)> = suggested_counts
+            .into_iter()
+            .map(|(keyword, (count, score))| (keyword, count, score))
+            .collect();
+        suggested.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let includes: std::collections::HashMap<String, bool> = self
             .catalog
             .as_ref()
@@ -14510,7 +14923,7 @@ impl Laika {
                     .to_lowercase()
             })
             .unwrap_or_default();
-        let mut suggestions: Vec<String> = if typed.is_empty() {
+        let mut autocomplete_suggestions: Vec<String> = if typed.is_empty() {
             Vec::new()
         } else {
             includes
@@ -14522,11 +14935,11 @@ impl Laika {
                 .cloned()
                 .collect()
         };
-        suggestions.sort_by_key(|path| {
+        autocomplete_suggestions.sort_by_key(|path| {
             let lower = path.to_lowercase();
             (!lower.starts_with(&typed), lower)
         });
-        suggestions.truncate(5);
+        autocomplete_suggestions.truncate(5);
         let mut col = div().flex().flex_col().gap(px(6.)).px(px(14.));
         if scope.len() > 1 {
             col = col.child(
@@ -14596,6 +15009,138 @@ impl Laika {
                 ),
             );
         }
+        if !suggested.is_empty() {
+            let all_accept_scope = scope.clone();
+            let all_reject_scope = scope.clone();
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_family(SANS)
+                                    .text_size(sp(10.))
+                                    .text_color(rgb(TEXT_DIMMER))
+                                    .child("Suggested · on-device".to_string()),
+                            )
+                            .child(
+                                div()
+                                    .id("kw-suggest-accept-all")
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded(px(2.))
+                                    .text_size(sp(9.5))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .hover(|s| s.bg(rgb(bg_row_hover())))
+                                    .on_hover(self.tip("Accept every suggestion for this selection"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.accept_keyword_suggestions(
+                                            all_accept_scope.clone(),
+                                            None,
+                                            cx,
+                                        );
+                                    }))
+                                    .child("Accept all".to_string()),
+                            )
+                            .child(
+                                div()
+                                    .id("kw-suggest-reject-all")
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded(px(2.))
+                                    .text_size(sp(9.5))
+                                    .text_color(rgb(TEXT_DIM))
+                                    .hover(|s| s.bg(rgb(bg_row_hover())))
+                                    .on_hover(self.tip(
+                                        "Reject every suggestion for this selection and remember it",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reject_keyword_suggestions(
+                                            all_reject_scope.clone(),
+                                            None,
+                                            cx,
+                                        );
+                                    }))
+                                    .child("Reject all".to_string()),
+                            ),
+                    )
+                    .child(
+                        div().flex().flex_wrap().gap(px(5.)).children(
+                            suggested
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (keyword, count, _))| {
+                                    let accept_keyword = keyword.clone();
+                                    let reject_keyword = keyword.clone();
+                                    let accept_scope = scope.clone();
+                                    let reject_scope = scope.clone();
+                                    let leaf = laika_core::catalog::Catalog::keyword_leaf(&keyword);
+                                    let label = if scope.len() > 1 {
+                                        format!("{leaf} {count}/{}", scope.len())
+                                    } else {
+                                        leaf.to_string()
+                                    };
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(3.))
+                                        .border_1()
+                                        .border_color(rgba(0x7AA2F766))
+                                        .bg(rgba(0x7AA2F712))
+                                        .child(
+                                            div()
+                                                .id(("kw-suggest-accept", index))
+                                                .px(px(7.))
+                                                .py(px(3.))
+                                                .font_family(SANS)
+                                                .text_size(sp(10.5))
+                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .hover(|s| s.bg(rgba(0x7AA2F722)))
+                                                .on_hover(self.tip(
+                                                    "Suggested only — click to accept and write to XMP",
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.accept_keyword_suggestions(
+                                                        accept_scope.clone(),
+                                                        Some(accept_keyword.clone()),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child(format!("+ {label}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("kw-suggest-reject", index))
+                                                .px(px(5.))
+                                                .py(px(3.))
+                                                .text_size(sp(10.5))
+                                                .text_color(rgb(TEXT_DIM))
+                                                .hover(|s| s.bg(rgba(0xE5606022)))
+                                                .on_hover(self.tip(
+                                                    "Reject this suggestion and remember it",
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.reject_keyword_suggestions(
+                                                        reject_scope.clone(),
+                                                        Some(reject_keyword.clone()),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child("×".to_string()),
+                                        )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    ),
+            );
+        }
         col = col.child(
             div()
                 .flex()
@@ -14634,7 +15179,7 @@ impl Laika {
                         .child("Manage".to_string()),
                 ),
         );
-        if !suggestions.is_empty() {
+        if !autocomplete_suggestions.is_empty() {
             col = col.child(
                 div()
                     .flex()
@@ -14642,33 +15187,35 @@ impl Laika {
                     .rounded(px(3.))
                     .border_1()
                     .border_color(border_control())
-                    .children(suggestions.into_iter().enumerate().map(|(i, keyword)| {
-                        let label = keyword.clone();
-                        div()
-                            .id(("keyword-suggestion", i))
-                            .role(Role::Button)
-                            .aria_label(format!("Add keyword {label}"))
-                            .px(px(8.))
-                            .py(px(4.))
-                            .font_family(SANS)
-                            .text_size(sp(10.5))
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .hover(|s| s.bg(rgb(bg_row_hover())))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let scope = this.meta_scope();
-                                this.field = None;
-                                this.commit_meta_patch(
-                                    scope,
-                                    MetaPatch {
-                                        keywords_add: vec![keyword.clone()],
-                                        ..Default::default()
-                                    },
-                                    "Add keyword".to_string(),
-                                    cx,
-                                );
-                            }))
-                            .child(label)
-                    })),
+                    .children(autocomplete_suggestions.into_iter().enumerate().map(
+                        |(i, keyword)| {
+                            let label = keyword.clone();
+                            div()
+                                .id(("keyword-suggestion", i))
+                                .role(Role::Button)
+                                .aria_label(format!("Add keyword {label}"))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .font_family(SANS)
+                                .text_size(sp(10.5))
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .hover(|s| s.bg(rgb(bg_row_hover())))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let scope = this.meta_scope();
+                                    this.field = None;
+                                    this.commit_meta_patch(
+                                        scope,
+                                        MetaPatch {
+                                            keywords_add: vec![keyword.clone()],
+                                            ..Default::default()
+                                        },
+                                        "Add keyword".to_string(),
+                                        cx,
+                                    );
+                                }))
+                                .child(label)
+                        },
+                    )),
             );
         }
         col
@@ -23348,7 +23895,21 @@ impl Laika {
         use text_input::FieldId as F;
         let s = &self.sync_settings;
         let (queued, failed) = self.queue_depth();
-        let status = if !self.sync_last_error.is_empty() {
+        let restore_active = self.sftp_restore_active();
+        let restore_available = if s.target == BackupTarget::Sftp {
+            self.sftp_restore_candidate_count()
+        } else {
+            0
+        };
+        let status = if restore_active {
+            format!(
+                "Restoring {}/{} · {} active · {} failed",
+                self.sftp_restore_done + self.sftp_restore_failed,
+                self.sftp_restore_total,
+                self.sftp_restore_inflight,
+                self.sftp_restore_failed
+            )
+        } else if !self.sync_last_error.is_empty() {
             self.sync_last_error.clone()
         } else if self.sync_testing {
             "Testing connection…".to_string()
@@ -23512,6 +24073,9 @@ impl Laika {
                     .child(self.backup_field(F::SftpIdentity, "Key file", &s.sftp_identity, "optional — ~/.ssh/id_ed25519", cx))
                     .child(hint(
                         "Signs in with your SSH keys (ssh-agent or ~/.ssh), never a password. If a login prompt would appear, the test fails instead — add your public key to the server's ~/.ssh/authorized_keys.".to_string(),
+                    ))
+                    .child(hint(
+                        "Pull missing restores only originals that this catalog previously verified at this destination. Downloads land at their recorded catalog paths, are BLAKE3-verified, and never replace an existing local file.".to_string(),
                     ));
             } else {
                 let kind = if s.share_kind == ShareKind::Smb {
@@ -23613,6 +24177,61 @@ impl Laika {
                 ));
         }
 
+        // Keep the persistent Done action visible while the context-sensitive
+        // backup actions wrap within the space beside it. A busy SFTP queue can
+        // show Test, Back up, Pull, Pause, and Retry at once.
+        let actions = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .flex_wrap()
+            .gap(px(8.))
+            .child(
+                button("sync-modal-test", "Test connection".to_string(), false)
+                    .on_click(cx.listener(|this, _, _, cx| this.test_sync(cx))),
+            )
+            .child(
+                button("sync-modal-now", "Back up now".to_string(), true)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+            )
+            .when(s.target == BackupTarget::Sftp, |d| {
+                d.child(
+                    button(
+                        "sync-modal-pull",
+                        if restore_active {
+                            format!(
+                                "Restoring {}/{}",
+                                self.sftp_restore_done + self.sftp_restore_failed,
+                                self.sftp_restore_total
+                            )
+                        } else {
+                            format!("Pull missing ({restore_available})")
+                        },
+                        false,
+                    )
+                    .when(restore_available == 0 && !restore_active, |b| {
+                        b.opacity(0.55)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.start_sftp_restore(cx))),
+                )
+            })
+            .when(queued + self.sync_inflight > 0, |d| {
+                d.child(
+                    button(
+                        "sync-modal-pause",
+                        if self.sync_paused { "Resume" } else { "Pause" }.to_string(),
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sync_pause(cx))),
+                )
+            })
+            .when(failed > 0, |d| {
+                d.child(
+                    button("sync-modal-retry", format!("Retry {failed} failed"), false)
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_failed_sync(cx))),
+                )
+            });
+
         modal::modal_shell_w(
             div()
                 .flex()
@@ -23675,42 +24294,15 @@ impl Laika {
                 .child(
                     div()
                         .flex()
+                        .items_end()
                         .gap(px(8.))
+                        .child(actions)
                         .child(
-                            button("sync-modal-test", "Test connection".to_string(), false)
-                                .on_click(cx.listener(|this, _, _, cx| this.test_sync(cx))),
-                        )
-                        .child(
-                            button("sync-modal-now", "Back up now".to_string(), true)
-                                .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
-                        )
-                        .when(queued + self.sync_inflight > 0, |d| {
-                            d.child(
-                                button(
-                                    "sync-modal-pause",
-                                    if self.sync_paused { "Resume" } else { "Pause" }.to_string(),
-                                    false,
-                                )
+                            button("sync-modal-close", "Done".to_string(), false)
+                                .flex_none()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_sync_pause(cx)
-                                })),
-                            )
-                        })
-                        .when(failed > 0, |d| {
-                            d.child(
-                                button("sync-modal-retry", format!("Retry {failed} failed"), false)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.retry_failed_sync(cx)
-                                    })),
-                            )
-                        })
-                        .child(div().flex_1())
-                        .child(
-                            button("sync-modal-close", "Done".to_string(), false).on_click(
-                                cx.listener(|this, _, _, cx| {
                                     this.close_modals(cx);
-                                }),
-                            ),
+                                })),
                         ),
                 ),
             600.,
@@ -24295,6 +24887,8 @@ const CAPTION_PAD_BOTTOM: f32 = 3.;
 /// Heavy per-file work: hash, EXIF, previews. Runs on the background pool.
 struct Prepared {
     name: String,
+    /// S10: the source file (card path) this came from.
+    source: Option<PathBuf>,
     bytes: u64,
     result: Result<PreparedData, String>,
     /// U05/V01 copy bookkeeping (add-in-place leaves these empty).
@@ -24348,6 +24942,7 @@ fn prepare_one(path: PathBuf, known_hash: Option<String>) -> Prepared {
         })();
         return Prepared {
             name,
+            source: None,
             bytes,
             result,
             renamed: false,
@@ -24383,6 +24978,7 @@ fn prepare_one(path: PathBuf, known_hash: Option<String>) -> Prepared {
     .unwrap_or(Err("decode thread failed".to_string()));
     Prepared {
         name,
+        source: None,
         bytes,
         result,
         renamed: false,
@@ -24495,6 +25091,7 @@ fn place_import_file(
         move |msg: String| {
             PlaceResult::Failed(Prepared {
                 name: name.clone(),
+                source: None,
                 bytes: 0,
                 result: Err(msg),
                 renamed: false,
@@ -24583,6 +25180,7 @@ fn prepare_placed_import(placed: PlacedImport) -> Prepared {
         .to_string();
     let mut prepared = prepare_one(placed.path, Some(placed.hash));
     prepared.name = name;
+    prepared.source = Some(placed.entry.path);
     prepared.renamed = placed.renamed;
     prepared.second_error = placed.second_error;
     prepared
@@ -25256,6 +25854,10 @@ impl Render for Laika {
                 // V02: the import review has naming fields — full editing
                 // there, Enter drives the primary action otherwise.
                 if this.import_open {
+                    // S10: culling keys in the review (rate, flag, Loupe).
+                    if this.cull_key(key, shift, cx) {
+                        return;
+                    }
                     match key {
                         "escape" => {
                             if this.field.is_some() {
@@ -26250,7 +26852,24 @@ impl Laika {
             .filter(|entry| entry.previously_imported)
             .count();
         let new = n.saturating_sub(imported);
-        let import_n = if d.is_card && d.new_only { new } else { n };
+        let base_n = if d.is_card && d.new_only { new } else { n };
+        // S10: culling decisions change what the import brings in.
+        let (mut picked, mut rejected, mut rated) = (0usize, 0usize, 0usize);
+        let mut excluded = 0usize;
+        for e in &d.entries {
+            let m = self.cull_mark(&e.path);
+            picked += (m.flag == 1) as usize;
+            rejected += (m.flag == -1) as usize;
+            rated += (m.rating > 0) as usize;
+            let counted = !(d.is_card && d.new_only && e.previously_imported);
+            let out = if self.cull.picks_only {
+                m.flag != 1
+            } else {
+                self.cull.skip_rejects && m.flag == -1
+            };
+            excluded += (counted && out) as usize;
+        }
+        let import_n = base_n.saturating_sub(excluded);
         let raw = d.entries.iter().filter(|e| e.is_raw).count();
         let bytes: u64 = d.entries.iter().map(|e| e.size).sum();
         let range = laika_core::import::date_range(&d.entries);
@@ -26324,97 +26943,167 @@ impl Laika {
                         dd.child(format!("○ {imported} imported — dimmed"))
                     }),
             )
-            .child(
-                div()
-                    // The only scroller over the gallery: nested scroll
-                    // areas all move together in GPUI, so the options sit
-                    // beside it in their own column instead of around it.
-                    .id("import-gallery-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(div().flex().flex_wrap().gap(px(8.)).pb(px(8.)).children(
-                        self.review_thumbs.iter().filter_map(|preview| {
-                            let entry = d.entries.get(preview.entry_index)?;
-                            let seen = entry.previously_imported;
-                            let filename = entry
-                                .path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("photo")
-                                .to_string();
-                            let image = match &preview.image {
-                                Some(image) => div()
-                                    .h(px(82.))
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .when(seen, |image| image.opacity(0.38))
-                                    .child(
-                                        img(ImageSource::Render(image.clone()))
-                                            .size_full()
-                                            .object_fit(ObjectFit::Cover),
-                                    ),
-                                None => div()
-                                    .h(px(82.))
-                                    .w_full()
-                                    .bg(linear_gradient(
-                                        160.,
-                                        linear_color_stop(
-                                            rgb(placeholder_tint(&entry.content_hash).0),
-                                            0.,
+            .child(if self.cull.loupe {
+                self.cull_loupe_view(cx)
+            } else {
+                div().flex_1().min_h_0().flex().flex_col().child(
+                    div()
+                        // The only scroller over the gallery: nested scroll
+                        // areas all move together in GPUI, so the options sit
+                        // beside it in their own column instead of around it.
+                        .id("import-gallery-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(crate::gallery_ui::meter(self.cull.grid_box.clone()))
+                        .child(div().flex().flex_wrap().gap(px(8.)).pb(px(8.)).children(
+                            self.review_thumbs.iter().filter_map(|preview| {
+                                let entry = d.entries.get(preview.entry_index)?;
+                                let seen = entry.previously_imported;
+                                let ei = preview.entry_index;
+                                let mark = self.cull_mark(&entry.path);
+                                let focused = self.cull.focus == Some(ei);
+                                let dim = seen || mark.flag == -1;
+                                let filename = entry
+                                    .path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("photo")
+                                    .to_string();
+                                let image = match &preview.image {
+                                    Some(image) => div()
+                                        .h(px(82.))
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .when(dim, |image| image.opacity(0.38))
+                                        .child(
+                                            img(ImageSource::Render(image.clone()))
+                                                .size_full()
+                                                .object_fit(ObjectFit::Cover),
                                         ),
-                                        linear_color_stop(
-                                            rgb(placeholder_tint(&entry.content_hash).1),
-                                            1.,
-                                        ),
-                                    ))
-                                    .when(seen, |image| image.opacity(0.38)),
-                            };
-                            Some(
-                                div()
-                                    .w(px(132.))
-                                    .flex_none()
-                                    .overflow_hidden()
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(if seen { hairline() } else { border_control() })
-                                    .child(image)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(4.))
-                                            .px(px(6.))
-                                            .py(px(5.))
-                                            .font_family(SANS)
-                                            .text_size(sp(9.))
-                                            .text_color(rgb(if seen {
-                                                TEXT_DIMMER
-                                            } else {
-                                                TEXT_SECONDARY
-                                            }))
-                                            .child(
-                                                div().flex_1().min_w_0().truncate().child(filename),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(if seen {
-                                                        TEXT_DIMMER
-                                                    } else {
-                                                        accent_line()
-                                                    }))
-                                                    .child(if seen { "IMPORTED" } else { "NEW" }),
+                                    None => div()
+                                        .h(px(82.))
+                                        .w_full()
+                                        .bg(linear_gradient(
+                                            160.,
+                                            linear_color_stop(
+                                                rgb(placeholder_tint(&entry.content_hash).0),
+                                                0.,
                                             ),
-                                    ),
-                            )
-                        }),
-                    )),
-            );
+                                            linear_color_stop(
+                                                rgb(placeholder_tint(&entry.content_hash).1),
+                                                1.,
+                                            ),
+                                        ))
+                                        .when(dim, |image| image.opacity(0.38)),
+                                };
+                                Some(
+                                    div()
+                                        .id(("cull-cell", ei))
+                                        .w(px(132.))
+                                        .flex_none()
+                                        .overflow_hidden()
+                                        .rounded(px(3.))
+                                        .border_1()
+                                        .border_color::<Hsla>(if focused {
+                                            rgb(accent_line()).into()
+                                        } else if seen {
+                                            hairline()
+                                        } else {
+                                            border_control()
+                                        })
+                                        .on_click(cx.listener(
+                                            move |this, ev: &ClickEvent, _, cx| {
+                                                if ev.click_count() >= 2 {
+                                                    this.cull_open_loupe(ei, cx);
+                                                } else {
+                                                    this.cull_focus(ei, cx);
+                                                }
+                                            },
+                                        ))
+                                        .child(image)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(4.))
+                                                .px(px(6.))
+                                                .py(px(5.))
+                                                .font_family(SANS)
+                                                .text_size(sp(9.))
+                                                .text_color(rgb(if seen {
+                                                    TEXT_DIMMER
+                                                } else {
+                                                    TEXT_SECONDARY
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .child(filename),
+                                                )
+                                                .when(!mark.is_empty(), |dd| {
+                                                    dd.child(Self::cull_badges(mark, 9.))
+                                                })
+                                                .when(mark.is_empty(), |dd| {
+                                                    dd.child(
+                                                        div()
+                                                            .text_color(rgb(if seen {
+                                                                TEXT_DIMMER
+                                                            } else {
+                                                                accent_line()
+                                                            }))
+                                                            .child(if seen {
+                                                                "IMPORTED"
+                                                            } else {
+                                                                "NEW"
+                                                            }),
+                                                    )
+                                                }),
+                                        ),
+                                )
+                            }),
+                        )),
+                )
+            });
+        let (skip_rejects, picks_only) = (self.cull.skip_rejects, self.cull.picks_only);
         let mut opts = div()
             .flex()
             .flex_col()
             .gap(px(10.))
+            // S10: cull before importing.
+            .child(section_header::section_header("Cull before importing", false, window))
+            .child(
+                div()
+                    .font_family(SANS)
+                    .text_size(sp(10.5))
+                    .text_color(rgb(TEXT_DIM))
+                    .child(if picked + rejected + rated == 0 {
+                        "Click a photo, then rate 0–5, flag P / X, label 6–9. Double-click or E for a large view, Z for 100%. Nothing is imported until you choose Import.".to_string()
+                    } else {
+                        format!("{picked} picked · {rejected} rejected · {rated} rated — applied as each photo is imported")
+                    }),
+            )
+            .child(
+                div()
+                    .id("cull-skip-rejects")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cull.skip_rejects = !skip_rejects;
+                        cx.notify();
+                    }))
+                    .child(toggle::toggle(skip_rejects, "Leave rejected photos on the card")),
+            )
+            .child(
+                div()
+                    .id("cull-picks-only")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cull.picks_only = !picks_only;
+                        cx.notify();
+                    }))
+                    .child(toggle::toggle(picks_only, "Import picked photos only")),
+            )
             .child(section_header::section_header("Mode", false, window))
             .child(div().flex().gap(px(8.)).children([
                 {
@@ -29486,6 +30175,7 @@ fn main() {
                     right_rail_width,
                     rail_resize: None,
                     coexist: Default::default(),
+                    cull: Default::default(),
                     palette: Default::default(),
                     guide: Default::default(),
                     diag: Default::default(),
@@ -29595,6 +30285,12 @@ fn main() {
                     sync_open: false,
                     sync_testing: false,
                     sync_staged: false,
+                    sftp_restore_queue: VecDeque::new(),
+                    sftp_restore_inflight: 0,
+                    sftp_restore_total: 0,
+                    sftp_restore_done: 0,
+                    sftp_restore_failed: 0,
+                    sftp_restore_bytes: 0,
                     hover_tip: Rc::new(Cell::new(None)),
                     tooltip: None,
                     snapshot_rows: RefCell::new(None),

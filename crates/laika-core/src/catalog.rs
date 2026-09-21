@@ -244,6 +244,15 @@ pub struct MetadataPreset {
     pub keywords: String,
 }
 
+/// S14: one pending, on-device keyword proposal for a photo. Suggestions are
+/// catalog data until explicitly accepted; they never enter XMP on their own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeywordSuggestion {
+    pub photo_id: i64,
+    pub keyword: String,
+    pub score: f32,
+}
+
 /// V12: the right-rail editable descriptive block (batch panels diff
 /// field-by-field on this; `<mixed>` marks disagreement).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1106,6 +1115,25 @@ pub mod migrations {
         .map_err(|e| format!("photo stacks: {e}"))
     }
 
+    /// S14: proposed keyword decisions live separately from assignments.
+    /// Keeping accepted/rejected rows means a later embedding refresh cannot
+    /// silently resurrect a choice the photographer already made.
+    fn migrate_v15(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS keyword_suggestions(
+               photo_id INTEGER NOT NULL,
+               keyword TEXT NOT NULL,
+               score REAL NOT NULL DEFAULT 0,
+               source TEXT NOT NULL DEFAULT 'embedding',
+               state TEXT NOT NULL DEFAULT 'pending',
+               PRIMARY KEY(photo_id, keyword)
+             );
+             CREATE INDEX IF NOT EXISTS keyword_suggestions_state
+               ON keyword_suggestions(state, photo_id);",
+        )
+        .map_err(|e| format!("keyword suggestions: {e}"))
+    }
+
     pub const MIGRATIONS: &[Migration] = &[
         Migration {
             version: 1,
@@ -1177,10 +1205,15 @@ pub mod migrations {
             name: "smart collections and photo stacks",
             apply: migrate_v14,
         },
+        Migration {
+            version: 15,
+            name: "keyword suggestions and decisions",
+            apply: migrate_v15,
+        },
     ];
 
     /// Highest schema this build opens. Bump with every `MIGRATIONS` entry.
-    pub const APP_SCHEMA_VERSION: u32 = 14;
+    pub const APP_SCHEMA_VERSION: u32 = 15;
 
     /// Schema version of an open db (0 = pre-versioning prototype era).
     pub fn read_version(conn: &Connection, db_path: &std::path::Path) -> Result<u32, String> {
@@ -1238,6 +1271,7 @@ pub struct IntegrityReport {
     pub pages: String,
     pub orphan_edits: i64,
     pub orphan_keywords: i64,
+    pub orphan_keyword_suggestions: i64,
     pub orphan_sidecar_state: i64,
     pub orphan_sync_queue: i64,
     pub orphan_snapshots: i64,
@@ -1251,6 +1285,7 @@ impl IntegrityReport {
     pub fn orphans(&self) -> i64 {
         self.orphan_edits
             + self.orphan_keywords
+            + self.orphan_keyword_suggestions
             + self.orphan_sidecar_state
             + self.orphan_sync_queue
             + self.orphan_snapshots
@@ -3953,6 +3988,7 @@ impl Catalog {
                 ("keyword_nodes", "path"),
                 ("keywords", "keyword"),
                 ("keyword_synonyms", "path"),
+                ("keyword_suggestions", "keyword"),
             ] {
                 self.conn
                     .execute(
@@ -3969,6 +4005,7 @@ impl Catalog {
                 ("keyword_nodes", "path"),
                 ("keywords", "keyword"),
                 ("keyword_synonyms", "path"),
+                ("keyword_suggestions", "keyword"),
             ] {
                 self.conn
                     .execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [p])
@@ -4076,6 +4113,9 @@ impl Catalog {
             self.conn
                 .execute("DELETE FROM keywords WHERE keyword = ?1", [p])
                 .ok();
+            self.conn
+                .execute("DELETE FROM keyword_suggestions WHERE keyword = ?1", [p])
+                .ok();
         }
         for (name, paths) in self.list_keyword_sets() {
             let kept: Vec<String> = paths
@@ -4137,6 +4177,217 @@ impl Catalog {
             .and_then(|mut q| q.query_row([typed.as_str()], |r| r.get(0)))
             .ok();
         found.unwrap_or_else(|| Self::canon_keyword_path(&typed))
+    }
+
+    /// S14: normalize a model label for conservative exact matching. This is
+    /// deliberately not fuzzy: suggestions should prefer precision over
+    /// surprising the photographer.
+    fn suggestion_key(label: &str) -> String {
+        let mut key = label
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for prefix in ["a ", "an ", "the "] {
+            if let Some(rest) = key.strip_prefix(prefix) {
+                key = rest.to_string();
+                break;
+            }
+        }
+        if key.len() > 3 && key.ends_with('s') && !key.ends_with("ss") {
+            key.pop();
+        }
+        key
+    }
+
+    /// S14: replace pending proposals for one photo from S13's ranked local
+    /// embedding labels. Existing hierarchy leaves/synonyms win; only then is
+    /// the deliberately small built-in vocabulary considered. Prior accept or
+    /// reject decisions survive re-indexing.
+    pub fn replace_embedding_keyword_suggestions(
+        &self,
+        photo_id: i64,
+        labels: &[(String, f32)],
+    ) -> Result<Vec<String>, String> {
+        const MIN_SCORE: f32 = 0.35;
+        const MAX_SUGGESTIONS: usize = 5;
+        const BUILTIN: &[(&str, &[&str])] = &[
+            ("People", &["person", "people", "human", "group of people"]),
+            ("Portrait", &["portrait", "headshot", "selfie"]),
+            ("Dogs", &["dog", "dogs", "puppy", "canine"]),
+            ("Cats", &["cat", "cats", "kitten", "feline"]),
+            ("Birds", &["bird", "birds", "avian"]),
+            ("Wildlife", &["wildlife", "wild animal"]),
+            ("Landscape", &["landscape", "scenery", "scenic view"]),
+            ("Architecture", &["architecture", "building", "buildings"]),
+            ("City", &["city", "cityscape", "urban"]),
+            ("Beach", &["beach", "seashore", "coast"]),
+            ("Mountains", &["mountain", "mountains", "alpine"]),
+            ("Forest", &["forest", "woodland", "woods"]),
+            ("Water", &["water", "lake", "river", "ocean", "sea"]),
+            ("Sunset", &["sunset", "dusk"]),
+            ("Night", &["night", "nighttime"]),
+            ("Snow", &["snow", "snowy", "winter"]),
+            ("Flowers", &["flower", "flowers", "floral"]),
+            ("Food", &["food", "meal", "dish"]),
+            ("Sports", &["sport", "sports", "athletics"]),
+            ("Vehicles", &["vehicle", "vehicles", "car", "automobile"]),
+            ("Black and white", &["black and white", "monochrome"]),
+        ];
+
+        // Usage order breaks ambiguous leaf names in favor of the hierarchy
+        // the photographer already uses most often.
+        let nodes: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT n.path FROM keyword_nodes n
+                 LEFT JOIN keywords k ON k.keyword = n.path
+                 GROUP BY n.path ORDER BY COUNT(k.photo_id) DESC, n.path",
+            )
+            .and_then(|mut q| {
+                q.query_map([], |r| r.get(0))
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            })
+            .unwrap_or_default();
+        let mut existing: HashMap<String, String> = HashMap::new();
+        for path in &nodes {
+            existing
+                .entry(Self::suggestion_key(path))
+                .or_insert_with(|| path.clone());
+            existing
+                .entry(Self::suggestion_key(Self::keyword_leaf(path)))
+                .or_insert_with(|| path.clone());
+            for synonym in self.synonyms_for(path) {
+                existing
+                    .entry(Self::suggestion_key(&synonym))
+                    .or_insert_with(|| path.clone());
+            }
+        }
+        let mut builtin: HashMap<String, String> = HashMap::new();
+        for (canonical, aliases) in BUILTIN {
+            builtin.insert(Self::suggestion_key(canonical), (*canonical).to_string());
+            for alias in *aliases {
+                builtin.insert(Self::suggestion_key(alias), (*canonical).to_string());
+            }
+        }
+        let assigned: HashSet<String> = self
+            .photo_keywords(photo_id)
+            .into_iter()
+            .map(|k| k.to_lowercase())
+            .collect();
+        let mut mapped: HashMap<String, f32> = HashMap::new();
+        for (label, score) in labels {
+            if !score.is_finite() || *score < MIN_SCORE {
+                continue;
+            }
+            let key = Self::suggestion_key(label);
+            let keyword = existing.get(&key).cloned().or_else(|| {
+                let canonical = builtin.get(&key)?;
+                existing
+                    .get(&Self::suggestion_key(canonical))
+                    .cloned()
+                    .or_else(|| Some(canonical.clone()))
+            });
+            let Some(keyword) = keyword else { continue };
+            if assigned.contains(&keyword.to_lowercase()) {
+                continue;
+            }
+            mapped
+                .entry(keyword)
+                .and_modify(|old| *old = old.max(*score))
+                .or_insert(*score);
+        }
+        let mut mapped: Vec<(String, f32)> = mapped.into_iter().collect();
+        mapped.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        mapped.truncate(MAX_SUGGESTIONS);
+
+        self.conn
+            .execute(
+                "DELETE FROM keyword_suggestions WHERE photo_id = ?1 AND state = 'pending'",
+                [photo_id],
+            )
+            .map_err(|e| format!("refresh keyword suggestions: {e}"))?;
+        for (keyword, score) in &mapped {
+            self.conn
+                .execute(
+                    "INSERT INTO keyword_suggestions(photo_id, keyword, score, source, state)
+                     VALUES (?1, ?2, ?3, 'embedding', 'pending')
+                     ON CONFLICT(photo_id, keyword) DO UPDATE SET
+                       score = excluded.score, source = excluded.source
+                     WHERE keyword_suggestions.state = 'pending'",
+                    params![photo_id, keyword, *score as f64],
+                )
+                .map_err(|e| format!("save keyword suggestion: {e}"))?;
+        }
+        Ok(mapped.into_iter().map(|(keyword, _)| keyword).collect())
+    }
+
+    /// Pending proposals for a scope, excluding anything already assigned.
+    pub fn pending_keyword_suggestions(&self, photo_ids: &[i64]) -> Vec<KeywordSuggestion> {
+        if photo_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let Ok(mut query) = self.conn.prepare_cached(
+            "SELECT s.photo_id, s.keyword, s.score
+                 FROM keyword_suggestions s
+                 WHERE s.photo_id = ?1 AND s.state = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM keywords k
+                     WHERE k.photo_id = s.photo_id AND k.keyword = s.keyword COLLATE NOCASE
+                   )
+                 ORDER BY s.score DESC, s.keyword",
+        ) else {
+            return out;
+        };
+        for photo_id in photo_ids {
+            if let Ok(rows) = query.query_map([photo_id], |r| {
+                Ok(KeywordSuggestion {
+                    photo_id: r.get(0)?,
+                    keyword: r.get(1)?,
+                    score: r.get::<_, f64>(2)? as f32,
+                })
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.keyword.cmp(&b.keyword))
+        });
+        out
+    }
+
+    /// Remember explicit decisions. Accepted suggestions become normal
+    /// keywords through the caller's metadata transaction; this method only
+    /// prevents either decision from being proposed again on a later re-index.
+    pub fn decide_keyword_suggestions(
+        &self,
+        suggestions: &[(i64, String)],
+        accepted: bool,
+    ) -> Result<usize, String> {
+        let state = if accepted { "accepted" } else { "rejected" };
+        let mut changed = 0;
+        for (photo_id, keyword) in suggestions {
+            changed += self
+                .conn
+                .execute(
+                    "UPDATE keyword_suggestions SET state = ?1
+                     WHERE photo_id = ?2 AND keyword = ?3 AND state = 'pending'",
+                    params![state, photo_id, keyword],
+                )
+                .map_err(|e| format!("remember keyword decision: {e}"))?;
+        }
+        Ok(changed)
     }
 
     /// V12: named keyword sets (one-click multi-apply in the rail).
@@ -5032,6 +5283,7 @@ impl Catalog {
             "sidecar_state",
             "sync_queue",
             "snapshots",
+            "keyword_suggestions",
         ] {
             let col = if table == "photos" { "id" } else { "photo_id" };
             self.conn
@@ -5494,6 +5746,7 @@ impl Catalog {
         };
         rep.orphan_edits = orphans("edits", "photo_id");
         rep.orphan_keywords = orphans("keywords", "photo_id");
+        rep.orphan_keyword_suggestions = orphans("keyword_suggestions", "photo_id");
         rep.orphan_sidecar_state = orphans("sidecar_state", "photo_id");
         rep.orphan_sync_queue = orphans("sync_queue", "photo_id");
         rep.orphan_snapshots = orphans("snapshots", "photo_id");
@@ -5553,6 +5806,7 @@ impl Catalog {
         for (table, col) in [
             ("edits", "photo_id"),
             ("keywords", "photo_id"),
+            ("keyword_suggestions", "photo_id"),
             ("sidecar_state", "photo_id"),
             ("sync_queue", "photo_id"),
             ("snapshots", "photo_id"),
@@ -7658,6 +7912,57 @@ mod tests {
         assert!(cat.list_keyword_sets()[0].1.is_empty());
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn s14_suggestions_prefer_hierarchy_and_remember_decisions() {
+        let dir = workdir("s14-keywords");
+        let db = dir.join("cat.db");
+        let cat = Catalog::open(&db, "Test", &dir).unwrap();
+        cat.ensure_keyword_node("Animals > Dogs");
+        cat.add_keyword_synonym("Animals > Dogs", "canine");
+
+        let labels = vec![
+            ("dog".to_string(), 0.94),
+            ("sunset".to_string(), 0.81),
+            ("unmapped concept".to_string(), 0.99),
+            ("night".to_string(), 0.12),
+        ];
+        cat.replace_embedding_keyword_suggestions(1, &labels)
+            .unwrap();
+        let pending = cat.pending_keyword_suggestions(&[1]);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].keyword, "Animals > Dogs");
+        assert_eq!(pending[1].keyword, "Sunset");
+
+        cat.decide_keyword_suggestions(&[(1, "Animals > Dogs".to_string())], false)
+            .unwrap();
+        cat.replace_embedding_keyword_suggestions(1, &labels)
+            .unwrap();
+        assert_eq!(
+            cat.pending_keyword_suggestions(&[1])
+                .into_iter()
+                .map(|s| s.keyword)
+                .collect::<Vec<_>>(),
+            vec!["Sunset".to_string()]
+        );
+
+        cat.decide_keyword_suggestions(&[(1, "Sunset".to_string())], true)
+            .unwrap();
+        cat.set_keywords(1, &["Sunset".to_string()]).unwrap();
+        cat.replace_embedding_keyword_suggestions(1, &labels)
+            .unwrap();
+        assert!(cat.pending_keyword_suggestions(&[1]).is_empty());
+        drop(cat);
+
+        // Decisions and accepted assignments are catalog data, not session
+        // state, and therefore survive a reopen and future re-index.
+        let cat = Catalog::open(&db, "Test", &dir).unwrap();
+        cat.replace_embedding_keyword_suggestions(1, &labels)
+            .unwrap();
+        assert!(cat.pending_keyword_suggestions(&[1]).is_empty());
+        assert_eq!(cat.photo_keywords(1), vec!["Sunset".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

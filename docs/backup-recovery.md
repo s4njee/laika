@@ -30,9 +30,12 @@ uploaded to that destination.
 1. Preserve the damaged/current catalog before replacing anything.
 2. Use **Catalog → Restore…** with a timestamped `catalog.db`, or copy
    `catalog.db` out of a portable bundle and restore that file.
-3. Recreate the original folder tree from the remote objects named by the
-   catalog's `remote_key` values and verify each file against the manifest/catalog
-   BLAKE3 value before relinking it.
+3. For an SFTP backup, open **Backup Settings**, select the same server and
+   remote folder, test the connection, then choose **Pull missing**. Laika
+   recreates recorded parent folders and restores only missing originals from
+   their exact `remote_key` values. Each download is staged beside its
+   destination and BLAKE3-verified before installation; an existing local file
+   is never replaced.
 4. Place bundled XMP files beside their originals using the manifest mapping.
    Unknown namespaces, Adobe masks/profiles, and other foreign properties remain
    byte-identical in the bundle.
@@ -40,5 +43,7 @@ uploaded to that destination.
    necessary, then run **Check integrity** and render/export representative edited
    photos.
 
-An automated remote downloader and a recorded real-destination restore drill are
-still required before U24 can be considered complete.
+Pull restore currently covers originals stored over SFTP. Restoring remote XMP
+revisions, S3 objects, or mounted-share backups still uses the portable bundle
+and manual recovery workflow. A recorded real-destination restore drill remains
+required before U24 can be considered complete.

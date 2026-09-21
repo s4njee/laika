@@ -405,6 +405,21 @@ pub fn upload_blocking(
     }
 }
 
+/// Restore one missing original from SFTP to its catalog path. Existing
+/// destination files are never replaced, and the temporary download is only
+/// installed after its BLAKE3 matches the import-time catalog checksum.
+pub fn restore_blocking(
+    settings: &SyncSettings,
+    remote: &str,
+    destination: &Path,
+    expected_blake3: &str,
+) -> Result<u64, String> {
+    match settings.target {
+        BackupTarget::Sftp => sftp::download(settings, remote, destination, expected_blake3),
+        _ => Err("pull restore is currently available for SFTP backups only".to_string()),
+    }
+}
+
 /// Connectivity + write check for the active target.
 pub fn check_blocking(settings: &SyncSettings, secret: &str) -> Result<(), String> {
     match settings.target {
@@ -501,6 +516,15 @@ pub mod sftp {
         )
     }
 
+    /// Shell script run on the server for one download. Redirection avoids
+    /// treating a path beginning with `-` as a `cat` option.
+    pub fn download_script(final_path: &str) -> String {
+        format!(
+            "set -e; f={}; test -f \"$f\"; cat < \"$f\"",
+            quote(final_path)
+        )
+    }
+
     fn ssh_args(s: &SyncSettings) -> Vec<String> {
         let mut args: Vec<String> = [
             "-o",
@@ -511,7 +535,6 @@ pub mod sftp {
             "ServerAliveInterval=15",
             "-o",
             "StrictHostKeyChecking=accept-new",
-            "-o",
         ]
         .iter()
         .map(|a| a.to_string())
@@ -640,6 +663,159 @@ pub mod sftp {
         Ok(sent)
     }
 
+    fn install_without_overwrite(tmp: &Path, destination: &Path) -> Result<(), String> {
+        if destination.exists() {
+            return Err(format!(
+                "refusing to overwrite existing {}",
+                destination.display()
+            ));
+        }
+        // A same-filesystem hard link is atomic and fails if the destination
+        // appeared during the transfer. Some network/removable filesystems do
+        // not support hard links, so fall back to create_new + verified copy.
+        match std::fs::hard_link(tmp, destination) {
+            Ok(()) => {
+                std::fs::remove_file(tmp).ok();
+                Ok(())
+            }
+            Err(link_error) => {
+                if destination.exists() {
+                    return Err(format!(
+                        "refusing to overwrite existing {}",
+                        destination.display()
+                    ));
+                }
+                let copied = (|| -> Result<(), String> {
+                    let mut src = std::fs::File::open(tmp)
+                        .map_err(|e| format!("read {}: {e}", tmp.display()))?;
+                    let mut out = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(destination)
+                        .map_err(|e| {
+                            format!(
+                                "create restored {}: {e} (hard-link fallback: {link_error})",
+                                destination.display()
+                            )
+                        })?;
+                    std::io::copy(&mut src, &mut out)
+                        .map_err(|e| format!("restore {}: {e}", destination.display()))?;
+                    out.sync_all()
+                        .map_err(|e| format!("flush {}: {e}", destination.display()))
+                })();
+                if let Err(e) = copied {
+                    std::fs::remove_file(destination).ok();
+                    return Err(e);
+                }
+                std::fs::remove_file(tmp).ok();
+                Ok(())
+            }
+        }
+    }
+
+    /// Stream one remote backup into a sibling temporary file, verify the
+    /// catalog's import-time BLAKE3, then install without replacing anything.
+    pub fn download(
+        s: &SyncSettings,
+        key: &str,
+        destination: &Path,
+        expected_blake3: &str,
+    ) -> Result<u64, String> {
+        if expected_blake3.trim().is_empty() {
+            return Err("catalog has no checksum for this original".to_string());
+        }
+        if destination.exists() {
+            return Err(format!(
+                "refusing to overwrite existing {}",
+                destination.display()
+            ));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| format!("{} has no parent folder", destination.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        let name = destination
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("original");
+        let tmp = parent.join(format!(".{name}.laika-restore-{}.part", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+
+        let remote = remote_path(&s.sftp_path, key);
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_args(s))
+            .arg(download_script(&remote))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                std::fs::remove_file(&tmp).ok();
+                return Err(format!("start ssh: {e}"));
+            }
+        };
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0u64;
+        let mut buf = vec![0u8; 1 << 20];
+        let streamed = (|| -> Result<(), String> {
+            loop {
+                let n = stdout
+                    .read(&mut buf)
+                    .map_err(|e| format!("download {remote}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                out.write_all(&buf[..n])
+                    .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+                bytes += n as u64;
+            }
+            out.sync_all()
+                .map_err(|e| format!("flush {}: {e}", tmp.display()))
+        })();
+        drop(stdout);
+        drop(out);
+        if let Err(e) = streamed {
+            child.kill().ok();
+            child.wait().ok();
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        let output = child.wait_with_output().map_err(|e| {
+            std::fs::remove_file(&tmp).ok();
+            format!("ssh: {e}")
+        })?;
+        if !output.status.success() {
+            std::fs::remove_file(&tmp).ok();
+            let error = last_line(&output.stderr);
+            return Err(if error.is_empty() {
+                format!("download {remote}: ssh exited with {}", output.status)
+            } else {
+                format!("download {remote}: {error}")
+            });
+        }
+        let got = hasher.finalize().to_hex().to_string();
+        if !got.eq_ignore_ascii_case(expected_blake3.trim()) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(format!(
+                "verify {remote}: downloaded blake3 {got} != catalog {}",
+                expected_blake3.trim()
+            ));
+        }
+        if let Err(e) = install_without_overwrite(&tmp, destination) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        Ok(bytes)
+    }
+
     /// Log in, create the base folder, and confirm it's writable.
     pub fn check(s: &SyncSettings) -> Result<(), String> {
         let base = remote_path(&s.sftp_path, "");
@@ -657,6 +833,54 @@ pub mod sftp {
             Ok(())
         } else {
             Err(format!("{} is not writable", s.sftp_path))
+        }
+    }
+
+    #[cfg(test)]
+    mod restore_tests {
+        use super::{install_without_overwrite, ssh_args};
+        use crate::sync::SyncSettings;
+
+        #[test]
+        fn ssh_options_always_have_values() {
+            let settings = SyncSettings {
+                sftp_host: "orion.local".to_string(),
+                sftp_port: "22".to_string(),
+                ..SyncSettings::default()
+            };
+            let args = ssh_args(&settings);
+            for (index, arg) in args.iter().enumerate() {
+                if arg == "-o" || arg == "-p" || arg == "-i" {
+                    assert!(
+                        args.get(index + 1).is_some_and(|value| !value.is_empty()),
+                        "SSH option {arg} at {index} has no value: {args:?}"
+                    );
+                }
+            }
+            assert_eq!(args.last().map(String::as_str), Some("orion.local"));
+        }
+
+        #[test]
+        fn verified_temp_install_never_replaces_a_file() {
+            let root =
+                std::env::temp_dir().join(format!("laika-sftp-install-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let destination = root.join("photo.nef");
+            let temp = root.join(".photo.part");
+            std::fs::write(&destination, b"existing").unwrap();
+            std::fs::write(&temp, b"restored").unwrap();
+            assert!(
+                install_without_overwrite(&temp, &destination)
+                    .unwrap_err()
+                    .contains("refusing to overwrite")
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+
+            std::fs::remove_file(&destination).unwrap();
+            install_without_overwrite(&temp, &destination).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"restored");
+            assert!(!temp.exists());
+            std::fs::remove_dir_all(&root).ok();
         }
     }
 }
@@ -807,6 +1031,13 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert!(printed.starts_with(&want), "{printed}");
+        let downloaded = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(sftp::download_script(fin.to_str().unwrap()))
+            .output()
+            .unwrap();
+        assert!(downloaded.status.success());
+        assert_eq!(downloaded.stdout, b"raw-bytes");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -862,6 +1093,21 @@ mod tests {
         assert_eq!(n, 5_000_000);
         let landed = remote_base.join("cat/2026/2026-01-01/payload.nef");
         assert_eq!(std::fs::read(&landed).unwrap().len(), 5_000_000);
+        let restored = dir.join("restored/payload.nef");
+        let hash = blake3::hash(&std::fs::read(&local).unwrap())
+            .to_hex()
+            .to_string();
+        let n = restore_blocking(&s, "cat/2026/2026-01-01/payload.nef", &restored, &hash).unwrap();
+        assert_eq!(n, 5_000_000);
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            std::fs::read(&local).unwrap()
+        );
+        assert!(
+            restore_blocking(&s, "cat/2026/2026-01-01/payload.nef", &restored, &hash,)
+                .unwrap_err()
+                .contains("refusing to overwrite")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -212,6 +212,22 @@ impl Laika {
             .child(note(
                 "English is the only language in this build; other languages will appear here when translated.",
             ))
+            .child(heading("Map"))
+            .child(
+                div()
+                    .id("pref-map-tiles")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.library.prefs.map_tiles;
+                        this.set_prefs(move |p| p.map_tiles = on, cx);
+                    }))
+                    .child(toggle::toggle(
+                        self.library.prefs.map_tiles,
+                        "Show a street map behind photo locations",
+                    )),
+            )
+            .child(note(
+                "Map tiles download from Esri's public basemap and are cached on this Mac; only the map area you view is requested. Off keeps the Map fully offline with a coordinate grid.",
+            ))
             .child(heading("Diagnostics"))
             .child(
                 div()

@@ -26,8 +26,10 @@ prototype shape. Migrations run in increasing order and are additive.
 | 11 | `lightroom_links` |
 | 12 | `develop_presets` |
 | 13 | `sidecar_baseline`, `sidecar_conflicts` |
+| 14 | Smart-collection criteria; `photo_stacks`, `photo_stack_items` |
+| 15 | `keyword_suggestions` with persistent accept/reject decisions |
 
-The current writer is version 13. A reader interested only in photos and
+The current writer is version 15. A reader interested only in photos and
 develop settings needs only `photos`, `edits`, and the rules below; all other
 tables can be ignored safely.
 
@@ -154,6 +156,9 @@ geometry and panel flags come from item `cursor - 1`; otherwise they come from
 | 12 | `develop_presets` | `id,name,grp,values_json,supports_amount,skipped_json,approx_json,source,digest,created_at`; unique `(grp,name)` |
 | 13 | `sidecar_baseline` | `photo_id PRIMARY KEY, fields_json, updated_at` |
 | 13 | `sidecar_conflicts` | `(photo_id,grp)` primary key, ours/theirs JSON, writer, detected_at |
+| 14 | `photo_stacks` | `id PRIMARY KEY, collapsed, created_at` |
+| 14 | `photo_stack_items` | `(stack_id,photo_id)` primary key, unique photo membership and position |
+| 15 | `keyword_suggestions` | `(photo_id,keyword)` primary key, score, source, state (`pending`, `accepted`, or `rejected`) |
 
-SQLite foreign-key clauses are intentionally absent in versions 0–13. IDs
+SQLite foreign-key clauses are intentionally absent in versions 0–15. IDs
 still have the relationships named above; integrity checks report orphans.
